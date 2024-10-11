@@ -1,0 +1,26 @@
+﻿[package]
+name = "buffex"
+version = "0.0.1"
+edition = "2021"
+
+authors = ["lino <lino_snsalias@outlook.com>"]
+description = "BUFFer EXtensions: ring buffer and buffer chaining."
+homepage = "https://github.com/ljsnogard/buffex"
+keywords = ["buffer", "circular buffer"]
+categories = ["algorithms", "no-std"]
+license = "MIT/Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+abs_buff = { version = "0.1" }
+asyncex = { version = "0.0.1" }
+core_malloc = { version = "0.1" }
+
+pin-project = { version = "1.1.*" }
+
+[dev-dependencies]
+env_logger = { version = "0.11.*" }
+log = { version = "0.4.*" }
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4.*" }
+rand = { version = "0.8.*" }
