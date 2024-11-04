@@ -1,103 +1,106 @@
 ﻿use core::{
     borrow::{Borrow, BorrowMut},
     future::{Future, IntoFuture},
-    marker::PhantomData,
     mem::MaybeUninit,
     pin::Pin,
     task::{Context, Poll},
 };
-use pin_project::{pin_project, pinned_drop};
+
+use pin_project::pin_project;
 use pin_utils::pin_mut;
 
-use abs_buff::{IoSliceRef, NoReclaim, TrBuffPeeker, TrBuffReader};
-use abs_sync::{cancellation::*, x_deps::pin_utils};
-use atomex::{
-    x_deps::funty,
-    TrAtomicData, TrCmpxchOrderings,
+use abs_buff::{
+    TrBuffIterPeek, TrBuffIterRead, TrBuffIterTryPeek, TrBuffIterTryRead,
 };
+use abs_sync::{cancellation::*, x_deps::pin_utils};
 use asyncex::x_deps::{abs_sync, atomex};
+use atomex::TrCmpxchOrderings;
 
 use super::{
-    buffer_::{RingBuffer, RxError, SliceRef},
+    buffer_::{DemandCtx, RingBuffer, RxError},
+    reclaim_::ReclSliceRef,
     peeker_::*,
     sync_::*,
-    TrAsyncRingBuffPeeker, TrAsyncRingBuffReader
+    Dual,
 };
 
-pub struct Reader<B, P, T, D, O>(B, PhantomData<RingBuffer<P, T, D, O>>)
+pub struct BuffRead<B, P, T, O>(DemandCtx<B, P, T, O>)
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings;
 
-impl<B, P, T, D, O> Reader<B, P, T, D, O>
+impl<B, P, T, O> BuffRead<B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    pub(super) const fn new(buff: B) -> Self {
-        Reader(buff, PhantomData)
-    }
-
-    pub fn can_read(&mut self) -> bool {
-        self.0.borrow().can_read_()
+    pub(super) const fn new(buffer: B) -> Self {
+        BuffRead(DemandCtx::new(buffer))
     }
 
     pub fn try_read(
         &mut self,
         length: usize,
-    ) -> Result<SliceRef<'_, P, T, D, O>, RxError<D>> {
-        self.0.borrow().try_read_(length)
+    ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
+        self.0.buffer().try_read_(length)
     }
 
     pub fn read_async(
         &mut self,
         length: usize,
-    ) -> ReadAsync<'_, B, P, T, D, O> {
-        ReadAsync::new(self.0.borrow(), length)
+    ) -> ReadAsync<'_, B, P, T, O> {
+        ReadAsync::new(&mut self.0, length)
     }
 
-    pub fn into_peeker(self) -> Peeker<B, P, T, D, O> {
+    fn try_peek_(
+        &mut self,
+    ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
+        self.0.buffer().try_peek_()
+    }
+
+    fn peek_async_(&mut self) -> PeekAsync<'_, B, P, T, O> {
+        PeekAsync::new(&mut self.0)
+    }
+
+    pub fn into_peeker(self) -> BuffPeek<B, P, T, O> {
         let mut m = MaybeUninit::new(self);
-        let b = unsafe { &mut m.assume_init_mut().0 as *mut B};
-        Peeker::new(unsafe { b.read() })
+        BuffPeek::<B, P, T, O>::new(unsafe {
+            m.assume_init_mut().0.buffer()
+        })
     }
 
     #[inline(always)]
-    pub fn buffer(&self) -> &RingBuffer<P, T, D, O> {
+    pub fn buffer(&self) -> &RingBuffer<P, T, O> {
         self.borrow()
     }
 }
 
-impl<B, P, T, D, O> From<Peeker<B, P, T, D, O>> for Reader<B, P, T, D, O>
+impl<B, P, T, O> From<BuffPeek<B, P, T, O>> for BuffRead<B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    fn from(value: Peeker<B, P, T, D, O>) -> Self {
+    fn from(value: BuffPeek<B, P, T, O>) -> Self {
         // Disable drop
         let m: MaybeUninit<_> = MaybeUninit::new(value);
         // Get field pointer
         let b = unsafe { m.assume_init_ref().as_ref() as *const B };
         // Manually move field
-        Reader::new(unsafe { b.read() })
+        BuffRead::new(unsafe { b.read() })
     }
 }
 
-impl<B, P, T, D, O> Drop for Reader<B, P, T, D, O>
+impl<B, P, T, O> Drop for BuffRead<B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     fn drop(&mut self) {
@@ -105,68 +108,57 @@ where
     }
 }
 
-impl<B, P, T, D, O> TrBuffReader<T> for Reader<B, P, T, D, O>
+impl<B, P, T, O> TrBuffIterRead<T> for BuffRead<B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    type BuffRef<'a> = SliceRef<'a, P, T, D, O> where Self: 'a;
-    type Error = RxError<D>;
-    type ReadAsync<'a> = ReadAsync<'a, B, P, T, D, O> where Self: 'a;
+    type SliceRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
+    type BuffIter<'a> = Dual<Self::SliceRef<'a>> where Self: 'a;
+    type Err = RxError<usize>;
+    type ReadAsync<'a> = ReadAsync<'a, B, P, T, O> where Self: 'a;
 
-    #[inline(always)]
-    fn can_read(&mut self) -> bool {
-        Reader::can_read(self)
-    }
-
-    #[inline(always)]
+    #[inline]
     fn read_async(&mut self, length: usize) -> Self::ReadAsync<'_> {
-        Reader::read_async(self, length)
+        BuffRead::read_async(self, length)
     }
 }
 
-impl<B, P, T, D, O> TrAsyncRingBuffReader<T> for Reader<B, P, T, D, O>
+impl<B, P, T, O> TrBuffIterTryRead<T> for BuffRead<B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    type RingBuffer = RingBuffer<P, T, D, O>;
-    type Peeker = Self;
-
-    #[inline(always)]
+    #[inline]
     fn try_read(&mut self, length: usize) -> Result<
-        <Self as TrBuffReader<T>>::BuffRef<'_>,
-        <Self as TrBuffReader<T>>::Error,
+        <Self as TrBuffIterRead<T>>::BuffIter<'_>,
+        <Self as TrBuffIterRead<T>>::Err,
     > {
-        Reader::try_read(self, length)
+        BuffRead::try_read(self, length)
     }
 }
 
-impl<B, P, T, D, O> Borrow<RingBuffer<P, T, D, O>> for Reader<B, P, T, D, O>
+impl<B, P, T, O> Borrow<RingBuffer<P, T, O>> for BuffRead<B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    fn borrow(&self) -> &RingBuffer<P, T, D, O> {
+    fn borrow(&self) -> &RingBuffer<P, T, O> {
         self.0.borrow()
     }
 }
 
-impl<B, P, T, D, O> AsRef<Self> for Reader<B, P, T, D, O>
+impl<B, P, T, O> AsRef<Self> for BuffRead<B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     fn as_ref(&self) -> &Self {
@@ -174,12 +166,11 @@ where
     }
 }
 
-impl<B, P, T, D, O> AsMut<Self> for Reader<B, P, T, D, O>
+impl<B, P, T, O> AsMut<Self> for BuffRead<B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     fn as_mut(&mut self) -> &mut Self {
@@ -187,12 +178,11 @@ where
     }
 }
 
-impl<B, P, T, D, O> AsRef<B> for Reader<B, P, T, D, O>
+impl<B, P, T, O> AsRef<B> for BuffRead<B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     fn as_ref(&self) -> &B {
@@ -200,80 +190,68 @@ where
     }
 }
 
-impl<B, P, T, D, O> TrBuffPeeker<T> for Reader<B, P, T, D, O>
+impl<B, P, T, O> TrBuffIterPeek<T> for BuffRead<B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    type BuffRef<'a> = IoSliceRef<'a, T, NoReclaim<T>> where Self: 'a;
-    type PeekAsync<'a> = PeekAsync<'a, B, P, T, D, O> where Self: 'a;
-    type Error = RxError<D>;
-
-    #[inline(always)]
-    fn can_peek(&mut self, skip: usize) -> bool {
-        self.0.borrow().can_peek_(skip)
-    }
+    type SliceRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
+    type BuffIter<'a> = Dual<Self::SliceRef<'a>> where Self: 'a;
+    type Err = RxError<usize>;
+    type PeekAsync<'a> = PeekAsync<'a, B, P, T, O> where Self: 'a;
 
     #[inline(always)]
     fn peek_async(
         &mut self,
-        skip: usize,
     ) -> Self::PeekAsync<'_> {
         PeekAsync::new(self.0.borrow(), skip)
     }
 }
 
-impl<B, P, T, D, O> TrAsyncRingBuffPeeker<T> for Reader<B, P, T, D, O>
+impl<B, P, T, O> TrBuffIterTryPeek<T> for BuffRead<B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    type RingBuffer = RingBuffer<P, T, D, O>;
-    type Reader = Self;
-
-    fn try_peek(&mut self, skip: usize) -> Result<
-        <Self as TrBuffPeeker<T>>::BuffRef<'_>,
-        <Self as TrBuffPeeker<T>>::Error,
+    #[inline]
+    fn try_peek(
+        &mut self,
+    ) -> Result<
+        <Self as TrBuffIterPeek<T>>::BuffIter<'_>,
+        <Self as TrBuffIterPeek<T>>::Err,
     > {
-        self.0.borrow().try_peek_(skip)
+        self.0.borrow().try_peek_()
     }
 }
 
-pub struct ReadAsync<'a, B, P, T, D, O>
+pub struct ReadAsync<'a, B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    _reader: PhantomData<&'a mut Reader<B, P, T, D, O>>,
-    buffer_: &'a RingBuffer<P, T, D, O>,
+    context_: &'a mut DemandCtx<B, P, T, O>,
     length_: usize,
 }
 
-impl<'a, B, P, T, D, O> ReadAsync<'a, B, P, T, D, O>
+impl<'a, B, P, T, O> ReadAsync<'a, B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    #[inline(always)]
-    pub(super) fn new(
-        buffer: &'a RingBuffer<P, T, D, O>,
+    pub(super) const fn new(
+        context: &'a mut DemandCtx<B, P, T, O>,
         length: usize,
     ) -> Self {
         ReadAsync {
-            _reader: PhantomData,
-            buffer_: buffer,
+            context_: context,
             length_: length,
         }
     }
@@ -282,38 +260,35 @@ where
     pub fn may_cancel_with<C>(
         self,
         cancel: Pin<&'a mut C>,
-    ) -> ReadFuture<'a, C, B, P, T, D, O>
+    ) -> ReadFuture<'a, C, B, P, T, O>
     where
         C: TrCancellationToken,
     {
-        ReadFuture::new(self.buffer_, self.length_, cancel)
+        ReadFuture::new(self.reader_, self.length_, cancel)
     }
 }
 
-impl<'a, B, P, T, D, O> IntoFuture for ReadAsync<'a, B, P, T, D, O>
+impl<'a, B, P, T, O> IntoFuture for ReadAsync<'a, B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    type IntoFuture = ReadFuture<'a, NonCancellableToken, B, P, T, D, O>;
+    type IntoFuture = ReadFuture<'a, NonCancellableToken, B, P, T, O>;
     type Output = <Self::IntoFuture as Future>::Output;
 
     fn into_future(self) -> Self::IntoFuture {
         let cancel = NonCancellableToken::pinned();
-        ReadFuture::new(self.buffer_, self.length_, cancel)
+        ReadFuture::new(self.reader_, self.length_, cancel)
     }
 }
 
-impl<'a, B, P, T, D, O> TrIntoFutureMayCancel<'a>
-for ReadAsync<'a, B, P, T, D, O>
+impl<'a, B, P, T, O> TrIntoFutureMayCancel<'a> for ReadAsync<'a, B, P, T, O>
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     type MayCancelOutput =
@@ -332,50 +307,44 @@ where
 }
 
 #[pin_project(PinnedDrop)]
-pub struct ReadFuture<'a, C, B, P, T, D, O>
+pub struct ReadFuture<'a, C, B, P, T, O>
 where
     C: TrCancellationToken,
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    buffer_: &'a RingBuffer<P, T, D, O>,
+    #[pin]reader_: &'a mut BuffRead<B, P, T, O>,
     length_: usize,
     cancel_: Pin<&'a mut C>,
-    #[pin]demand_: Option<Demand<D, O>>,
-    _use_b_: PhantomData<&'a mut Reader<B, P, T, D, O>>,
 }
 
-impl<'a, C, B, P, T, D, O> ReadFuture<'a, C, B, P, T, D, O>
+impl<'a, C, B, P, T, O> ReadFuture<'a, C, B, P, T, O>
 where
     C: TrCancellationToken,
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     fn new(
-        buffer: &'a RingBuffer<P, T, D, O>,
+        reader: &'a mut BuffRead<B, P, T, O>,
         length: usize,
         cancel: Pin<&'a mut C>,
     ) -> Self {
         ReadFuture {
-            buffer_: buffer,
+            reader_: reader,
             length_: length,
             cancel_: cancel,
-            demand_: Option::None,
-            _use_b_: PhantomData,
         }
     }
 
     async fn read_async_(
         self: Pin<&mut Self>,
-    ) -> Result<SliceRef<'a, P, T, D, O>, RxError<D>> {
+    ) -> Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>> {
         let mut this = self.project();
-        let try_read = this.buffer_.try_read_(*this.length_);
+        let try_read = this.reader_.buffer().try_read_(*this.length_);
         let Result::Err(read_err) = try_read else {
             return try_read;
         };
@@ -417,41 +386,19 @@ where
     }
 }
 
-impl<'a, C, B, P, T, D, O> Future
-for ReadFuture<'a, C, B, P, T, D, O>
+impl<'a, C, B, P, T, O> Future for ReadFuture<'a, C, B, P, T, O>
 where
     C: TrCancellationToken,
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    type Output = Result<SliceRef<'a, P, T, D, O>, RxError<D>>;
+    type Output = Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let f = self.read_async_();
         pin_mut!(f);
         f.poll(cx)
-    }
-}
-
-#[pinned_drop]
-impl<C, B, P, T, D, O> PinnedDrop for ReadFuture<'_, C, B, P, T, D, O>
-where
-    C: TrCancellationToken,
-    B: Borrow<RingBuffer<P, T, D, O>>,
-    P: BorrowMut<[T]>,
-    T: Clone,
-    D: TrAtomicData + funty::Unsigned,
-    O: TrCmpxchOrderings,
-{
-    fn drop(self: Pin<&mut Self>) {
-        let mut this = self.project();
-        let opt = unsafe { this.demand_.as_mut().get_unchecked_mut() };
-        let Option::Some(demand) = opt else {
-            return;
-        };
-        this.buffer_.state().dequeue_consumer(demand);
     }
 }

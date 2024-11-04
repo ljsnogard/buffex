@@ -1,25 +1,26 @@
 ﻿use core::borrow::{Borrow, BorrowMut};
 
-use abs_buff::utils::{ReaderAsChunkFiller, ChunkWriter};
+use abs_buff_chunk_utils::{BuffReadAsChunkFiller, BuffWriteAsChunkLoader};
 use atomex::{
     x_deps::funty,
-    TrAtomicData, TrCmpxchOrderings,
+    TrCmpxchOrderings,
 };
 use core_malloc::CoreAlloc;
 use mm_ptr::{Shared, Owned};
-use asyncex::x_deps::{atomex, mm_ptr};
+
+use asyncex::x_deps::{abs_sync, atomex, mm_ptr};
+
 use crate::ring_buffer::*;
 
-async fn chunk_writer_<B, P, T, D, O>(writer: Writer<B, P, T, D, O>)
+async fn chunk_writer_<B, P, T, O>(writer: BuffWrite<B, P, T, O>)
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: funty::Unsigned + TryFrom<usize> + Copy,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     let capacity = writer.buffer().capacity();
-    let mut copier = ChunkWriter::new(writer);
+    let mut loader = BuffWriteAsChunkLoader::new(writer);
     let mut span_length = 1usize;
     let init_each = |u| {
         let Result::Ok(x) = T::try_from(u) else { panic!() };
@@ -34,7 +35,7 @@ where
             init_each,
             CoreAlloc::new(),
         );
-        let w = copier.write_async(&source).await;
+        let w = loader.load_async(&source).await;
         if let Result::Err(report) = w {
             log::error!("[chunk_::chunk_writer_] span_len({span_length}) err: {report:?}");
             break;
@@ -47,16 +48,15 @@ where
     log::info!("chunk writer exits");
 }
 
-async fn reader_filler_<B, P, T, D, O>(reader: Reader<B, P, T, D, O>)
+async fn reader_filler_<B, P, T, O>(reader: BuffRead<B, P, T, O>)
 where
-    B: Borrow<RingBuffer<P, T, D, O>>,
+    B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: funty::Unsigned + TryInto<usize> + Copy,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     let capacity = reader.buffer().capacity();
-    let mut filler = ReaderAsChunkFiller::new(reader);
+    let mut filler = BuffReadAsChunkFiller::new(reader);
     let mut span_length = 1usize;
     loop {
         if span_length > capacity {

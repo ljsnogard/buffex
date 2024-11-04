@@ -12,13 +12,16 @@ license = "MIT/Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-abs_buff = { version = "0.1" }
-asyncex = { version = "0.0.1" }
-core_malloc = { version = "0.1" }
+abs_buff = { path = "../abs_buff" }
+asyncex = { path = "../asyncex" }
+mm_ptr = { path = "../mm_ptr" }
 
+smallvec = { version = "1.13", features = [] }
 pin-project = { version = "1.1.*" }
 
 [dev-dependencies]
+core_malloc = { version = "0.1" }
+abs_buff_chunk_utils = { path = "../abs_buff_chunk_utils" }
 env_logger = { version = "0.11.*" }
 log = { version = "0.4.*" }
 tokio = { version = "1", features = ["full"] }

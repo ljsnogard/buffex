@@ -1,62 +1,23 @@
-﻿use abs_buff::{TrBuffPeeker, TrBuffReader, TrBuffWriter};
+﻿use abs_buff::{TrBuffIterTryRead, TrBuffIterTryWrite};
 
-pub trait TrAsyncRingBuffer<T: Clone = u8> {
-    type Writer<'a>: 'a + TrAsyncRingBuffWriter<T, RingBuffer = Self>
-    where
-        Self: 'a;
+/// A fixed size buffer that serves a pair of producer and a consumer, offering
+/// a conceptually infinite sized buffer, by internally linking the head and the
+/// tail of the buffer.
+pub trait TrRingBuffer<T = u8>
+where
+    T: Clone,
+{
+    type Input<'a>: 'a + TrBuffIterTryWrite<T> where Self: 'a;
+    type Output<'a>: 'a + TrBuffIterTryRead<T> where Self: 'a;
 
-    type Reader<'a>: 'a + TrAsyncRingBuffReader<T, RingBuffer = Self>
-    where
-        Self: 'a;
-
+    /// The number of units that the buffer is capable of.
     fn capacity(&self) -> usize;
 
+    /// A snapshot of the number of units that the buffer currently stored.
     fn data_size(&self) -> usize;
 
-    fn writer(&mut self) -> Self::Writer<'_>;
-
-    fn reader(&mut self) -> Self::Reader<'_>;
-}
-
-pub trait TrAsyncRingBuffPeeker<T: Clone = u8>
-where
-    Self: TrBuffPeeker<T>
-        + core::borrow::Borrow<Self::RingBuffer>
-        + core::convert::AsMut<Self::Reader>,
-{
-    type RingBuffer: TrAsyncRingBuffer<T>;
-    type Reader: TrAsyncRingBuffReader<T>;
-
-    fn try_peek(&mut self, skip: usize) -> Result<
-        <Self as TrBuffPeeker<T>>::BuffRef<'_>,
-        <Self as TrBuffPeeker<T>>::Error,
-    >;
-}
-
-pub trait TrAsyncRingBuffReader<T: Clone = u8>
-where
-    Self: TrBuffReader<T>
-        + core::borrow::Borrow<Self::RingBuffer>
-        + core::convert::AsMut<Self::Peeker>,
-{
-    type RingBuffer: TrAsyncRingBuffer<T>;
-    type Peeker: TrAsyncRingBuffPeeker<T>;
-
-    fn try_read(&mut self, length: usize) -> Result<
-        <Self as TrBuffReader<T>>::BuffRef<'_>,
-        <Self as TrBuffReader<T>>::Error,
-    >;
-}
-
-pub trait TrAsyncRingBuffWriter<T: Clone = u8>
-where
-    Self: TrBuffWriter<T>
-        + core::borrow::Borrow<Self::RingBuffer>,
-{
-    type RingBuffer: TrAsyncRingBuffer<T>;
-
-    fn try_write(&mut self, length: usize) -> Result<
-        <Self as TrBuffWriter<T>>::BuffMut<'_>,
-        <Self as TrBuffWriter<T>>::Error,
-    >;
+    /// Try to split the buffer into a write half and a read half.
+    fn try_split_io(
+        &mut self,
+    ) -> Option<(Self::Input<'_>, Self::Output<'_>)>;
 }

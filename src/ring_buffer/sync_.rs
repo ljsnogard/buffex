@@ -1,180 +1,150 @@
 ﻿use core::{
-    borrow::BorrowMut,
+    borrow::{Borrow, BorrowMut},
     cell::UnsafeCell,
     cmp,
     fmt::{self, Debug},
-    marker::PhantomData,
+    marker::{PhantomData, PhantomPinned},
     ops::{Deref, DerefMut},
     ptr::{self, NonNull},
-    sync::atomic::AtomicPtr,
+    sync::atomic::{AtomicPtr, AtomicUsize},
 };
 
 use atomex::{
     x_deps::funty,
-    AtomexPtr, CmpxchResult, PhantomAtomicPtr, StrictOrderings,
-    TrAtomicCell, TrAtomicData, TrAtomicFlags, TrCmpxchOrderings,
+    AtomexPtrOwned, CmpxchResult, PhantomAtomicPtr, StrictOrderings,
+    TrAtomicFlags, TrCmpxchOrderings,
 };
 use asyncex::{
     channel::oneshot::Oneshot,
     x_deps::atomex,
 };
-use super::buffer_::{RxError, TxError};
 
-pub(super) type FnCheckState<D, O> = dyn FnMut(&RwState<D, O>) -> bool;
-pub(super) type AtomicDemandPtr<D, O> = AtomexPtr<
-    Demand<D, O>,
-    AtomicPtr<Demand<D, O>>,
-    O,
->;
+use super::{RxError, TxError, Dual};
+
+pub(super) type FnCheckState<O> = dyn FnMut(&RwState<O>) -> bool;
+pub(super) type AtomicDemandPtr<O> = AtomexPtrOwned<Demand<O>, O>;
 
 #[derive(Debug)]
-pub(super) struct CheckStateFn<D, O>(NonNull<FnCheckState<D, O>>)
+pub(super) struct CheckStateFn<O>(NonNull<FnCheckState<O>>)
 where
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings;
 
-impl<D, O> CheckStateFn<D, O>
+impl<O> CheckStateFn<O>
 where
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    pub fn new(f: &mut FnCheckState<D, O>) -> Self {
-        let p = unsafe { NonNull::new_unchecked(f as *mut _) };
+    pub fn new(f: &mut FnCheckState<O>) -> Self {
+        let p = unsafe { NonNull::new_unchecked(f) };
         CheckStateFn(p)
-    }
-
-    pub fn call(&mut self, state: &RwState<D, O>) -> bool {
-        let f = unsafe { self.0.as_mut() };
-        f(state)
     }
 }
 
-unsafe impl<D, O> Send for CheckStateFn<D, O>
+impl<O> Deref for CheckStateFn<O>
 where
-    D: TrAtomicData + funty::Unsigned,
+    O: TrCmpxchOrderings,
+{
+    type Target = FnCheckState<O>;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.0.as_ref() }
+    }
+}
+
+unsafe impl<O> Send for CheckStateFn<O>
+where
     O: TrCmpxchOrderings,
 {}
 
-unsafe impl<D, O> Sync for CheckStateFn<D, O>
+unsafe impl<O> Sync for CheckStateFn<O>
 where
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {}
 
 #[derive(Debug)]
-pub(super) struct Demand<D, O>
+pub(super) struct Demand<O>
 where
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    pub chk_fn: CheckStateFn<D, O>,
+    pub chk_fn: CheckStateFn<O>,
     pub signal: Oneshot<(), O>,
 }
 
-impl<D, O> Demand<D, O>
+impl<O> Demand<O>
 where
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    pub fn new(check: &mut FnCheckState<D, O>) -> Self {
+    pub fn new(check: &mut FnCheckState<O>) -> Self {
         Demand {
             chk_fn: CheckStateFn::new(check),
             signal: Oneshot::new(),
         }
     }
 
-    pub fn producer_check(state: &RwState<D, O>) -> bool {
-        let (_, _, _, a) = state.load_state();
-        a > D::ZERO
+    pub fn producer_check(state: &RwState<O>) -> bool {
+        let i = state.load_state();
+        i.writer_length > 0usize
     }
 
-    pub fn consumer_check(state: &RwState<D, O>) -> bool {
-        let (_, _, l, _) = state.load_state();
-        l > D::ZERO
+    pub fn consumer_check(state: &RwState<O>) -> bool {
+        let i = state.load_state();
+        i.reader_length > 0usize
     }
 }
 
-pub(super) struct BuffState<P, T = u8, D = usize, O = StrictOrderings>
+pub(super) struct BuffState<B, T = u8, O = StrictOrderings>
 where
-    P: BorrowMut<[T]>,
+    B: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    _using_t_: PhantomData<[T]>,
-    rw_state_: RwState<D, O>,
+    _unuse_t_: PhantomData<[T]>,
+
+    _pinned_: PhantomPinned,
 
     /// The slot stores the checked but not signaled demand.
-    unsignal_: AtomicDemandPtr<D, O>,
+    unsignal_: AtomicDemandPtr<O>,
 
     /// The slot stores the enqueued consumer demand.
-    consumer_: AtomicDemandPtr<D, O>,
+    consumer_: AtomicDemandPtr<O>,
 
     /// The slot stores the enqueued producer demand.
-    producer_: AtomicDemandPtr<D, O>,
+    producer_: AtomicDemandPtr<O>,
 
-    /// The slice stores the payload of the buffer.
-    buf_cell_: UnsafeCell<P>,
+    rw_state_: RwState<O>,
+
+    buf_cell_: UnsafeCell<B>,
 }
 
-impl<P, T, D, O> BuffState<P, T, D, O>
+impl<B, T, O> BuffState<B, T, O>
 where
-    P: BorrowMut<[T]>,
+    B: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    pub const fn new(
-        rw_state: RwState<D, O>,
-        buf_data: P,
-    ) -> Self {
-        BuffState {
-            _using_t_: PhantomData,
-            rw_state_: rw_state,
+    pub fn try_new(buffer: B) -> Result<Self, usize> {
+        let s = buffer.borrow().len();
+        if s >= RwState::<O>::POS_MAX {
+            return Result::Err(s);
+        }
+        Result::Ok(BuffState {
+            _unuse_t_: PhantomData,
+            _pinned_: PhantomPinned,
             unsignal_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
             consumer_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
             producer_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
-            buf_cell_: UnsafeCell::new(buf_data),
-        }
+            rw_state_: RwState::new(buffer.borrow().len()),
+            buf_cell_: UnsafeCell::new(buffer)
+        })
     }
 
-    pub fn try_new(buffer: P) -> Result<Self, usize> {
-        let capacity = buffer.borrow().len();
-        if capacity == 0usize {
-            return Result::Err(capacity);
-        }
-        let Result::Ok(cap) = D::try_from(capacity) else {
-            return Result::Err(capacity);
-        };
-        if cap >= RwState::<D, O>::POS_MAX() {
-            return Result::Err(capacity);
-        }
-        let cell = <<D as TrAtomicData>::AtomicCell as TrAtomicCell>
-            ::new(D::ZERO);
-        Result::Ok(BuffState::new(
-            RwState::new(cell, cap),
-            buffer,
-        ))
-    }
-
-    #[inline(always)]
-    pub fn capacity(&self) -> D {
+    #[inline]
+    pub fn capacity(&self) -> usize {
         self.rw_state_.capacity()
     }
 
     #[inline(always)]
-    pub fn capacity_usize(&self) -> usize {
-        d_to_usize(self.capacity(), "[BuffState::capacity_usize]")
-    }
-
-    #[inline(always)]
-    pub fn data_size(&self) -> D {
+    pub fn data_size(&self) -> usize {
         self.rw_state_.data_size()
-    }
-
-    #[inline(always)]
-    pub fn data_size_usize(&self) -> usize {
-        d_to_usize(self.data_size(), "[BuffState::data_size_usize]")
     }
 
     pub fn is_closing(&self) -> bool {
@@ -182,57 +152,57 @@ where
     }
 
     #[inline(always)]
-    const fn closed_demand_ptr_() -> *mut Demand<D, O> {
+    const fn closed_demand_ptr_() -> *mut Demand<O> {
         usize::MAX as *mut _
     }
 
     #[inline(always)]
-    fn is_closed_(a: &AtomicDemandPtr<D, O>) -> bool {
+    fn is_closed_(a: &AtomicDemandPtr<O>) -> bool {
         ptr::eq(a.pointer(), Self::closed_demand_ptr_())
     }
 
-    pub fn can_peek(&self, skip: usize) -> bool {
-        self.try_peek(skip).is_ok()
-    }
-
-    pub fn try_peek(&self, skip: usize) -> Result<NonNull<[T]>, RxError<D>> {
-        let s = self.rw_state_.value();
-        let (r, _, l, _) = self.rw_state_.load_positions_(s);
-        let skip_d = D::try_from(skip).unwrap_or(self.capacity());
-        if l < skip_d || (skip_d == D::ZERO && l == skip_d) {
+    pub fn try_peek(
+        &self,
+    ) -> Result<Dual<NonNull<[T]>>, RxError<usize>> {
+        let state = self.rw_state_.load_state();
+        if state.reader_length == 0usize {
             let e = if self.is_closing() {
                 RxError::Closing
             } else {
-                RxError::Drained(r)
+                RxError::Drained(state.reader_offset)
             };
-            return Result::Err(e);
-        };
-        let offset = (r + skip_d) % self.capacity();
-        let length = l - skip_d;
-        let x = self.pack_slice_(offset, length, self.capacity_usize());
-        Result::Ok(x)
+            Result::Err(e)
+        } else {
+            let length = self.capacity();
+            Result::Ok(self.pack_slice_read_(&state, length))
+        }
     }
 
     pub fn can_read(&self) -> bool {
         self.try_read(0).is_ok()
     }
 
-    pub fn try_read(&self, length: usize) -> Result<NonNull<[T]>, RxError<D>> {
-        let s = self.rw_state_.value();
-        let (r, _, l, _) = self.rw_state_.load_positions_(s);
-        if l == D::ZERO {
+    pub fn try_read(
+        &self,
+        length: usize,
+    ) -> Result<Dual<NonNull<[T]>>, RxError<usize>> {
+        let state = self.rw_state_.load_state();
+        if state.reader_length == 0usize {
             let e = if self.is_closing() {
                 RxError::Closing
             } else {
-                RxError::Drained(r)
+                RxError::Drained(state.reader_offset)
             };
-            return Result::Err(e);
-        };
-        let x = self.pack_slice_(r, l, length);
-        Result::Ok(x)
+            Result::Err(e)
+        } else {
+            Result::Ok(self.pack_slice_read_(&state, length))
+        }
     }
 
-    pub fn reader_forward(&self, length: usize) -> Result<usize, RxError<D>> {
+    pub fn reader_forward(
+        &self,
+        length: usize,
+    ) -> Result<usize, RxError<usize>> {
         let r = self
             .reader_checked_inc_pos_(length)
             .map(|delta| delta.map_to_usize().amount);
@@ -245,10 +215,10 @@ where
     fn reader_checked_inc_pos_(
         &self,
         length: usize,
-    ) -> Result<BuffIoDelta<D>, RxError<D>> {
+    ) -> Result<BuffIoDelta<usize>, RxError<usize>> {
         let s = self.rw_state_.value();
         let (r, _, l, _) = self.rw_state_.load_positions_(s);
-        if l == D::ZERO {
+        if l == 0usize {
             let e = if self.is_closing() {
                 RxError::Closing
             } else {
@@ -256,33 +226,31 @@ where
             };
             return Result::Err(e);
         };
-        let dst_len = D::try_from(length).unwrap_or(l);
+        let dst_len = usize::try_from(length).unwrap_or(l);
         self.rw_state_.try_inc_reader_pos(dst_len)
-    }
-
-    pub fn can_write(&self) -> bool {
-        self.try_write(0).is_ok()
     }
 
     pub fn try_write(
         &self,
         length: usize,
-    ) -> Result<NonNull<[T]>, TxError<D>> {
-        let s = self.rw_state_.value();
-        let (_, w, _, a) = self.rw_state_.load_positions_(s);
-        if a == D::ZERO {
+    ) -> Result<Dual<NonNull<[T]>>, TxError<usize>> {
+        let s = self.rw_state_.load_state();
+        if s.writer_length == 0usize {
             let e = if self.is_closing() {
                 TxError::Closing
             } else {
-                TxError::Stuffed(w)
+                TxError::Stuffed(s.writer_offset)
             };
-            return Result::Err(e);
+            Result::Err(e)
+        } else {
+            Result::Ok(self.pack_slice_write_(&s, length))
         }
-        let x = self.pack_slice_(w, a, length);
-        Result::Ok(x)
     }
 
-    pub fn writer_forward(&self, length: usize) -> Result<usize, TxError<D>> {
+    pub fn writer_forward(
+        &self,
+        length: usize,
+    ) -> Result<usize, TxError<usize>> {
         let r = self
             .writer_checked_inc_pos_(length)
             .map(|delta| delta.map_to_usize().amount);
@@ -295,38 +263,38 @@ where
     fn writer_checked_inc_pos_(
         &self,
         length: usize,
-    ) -> Result<BuffIoDelta<D>, TxError<D>> {
-        let s = self.rw_state_.value();
-        let (_, w, _, a) = self.rw_state_.load_positions_(s);
-        if a == D::ZERO {
+    ) -> Result<BuffIoDelta<usize>, TxError<usize>> {
+        let state = self.rw_state_.load_state();
+        if state.writer_length == 0usize {
             let e = if self.is_closing() {
                 TxError::Closing
             } else {
-                TxError::Stuffed(w)
+                TxError::Stuffed(state.writer_offset)
             };
             return Result::Err(e);
         }
-        let src_len = D::try_from(length).unwrap_or(a);
+        let src_len = if length > state.writer_length {
+            state.writer_length
+        } else {
+            length
+        };
         self.rw_state_.try_inc_writer_pos(src_len)
     }
 
-    fn pack_slice_(
+    fn pack_slice_write_(
         &self,
-        offset: D,
-        length: D,
-        demand: usize,
-    ) -> NonNull<[T]> {
-        debug_assert!(
-            offset + length <= self.capacity(),
-            "offset({offset}) + length({length}) <= {}", self.capacity(),
-        );
-        let o = d_to_usize(offset, "[BuffState::pack_slice_] o");
-        let l = d_to_usize(length, "[BuffState::pack_slice_] l");
-        let len = cmp::min(l, demand);
-        debug_assert!(len > 0);
-        let buff = unsafe { self.get_buff_mut_().as_mut() };
-        let buff = &mut buff[o..o + len];
-        unsafe { NonNull::new_unchecked(buff) }
+        state: &RwStateInfo<usize>,
+        length: usize,
+    ) -> Dual<NonNull<[T]>> {
+        todo!()
+    }
+
+    fn pack_slice_read_(
+        &self,
+        state: &RwStateInfo<usize>,
+        length: usize,
+    ) -> Dual<NonNull<[T]>> {
+        todo!()
     }
 
     #[inline(always)]
@@ -344,32 +312,32 @@ where
     }
 
     fn mark_closed_(
-        cell: &AtomicDemandPtr<D, O>,
-    ) -> CmpxchResult<*mut Demand<D, O>> {
-        let expect = |p: *mut Demand<D, O>| p.is_null();
+        cell: &AtomicDemandPtr<O>,
+    ) -> CmpxchResult<*mut Demand<O>> {
+        let expect = |p: *mut Demand<O>| p.is_null();
         let desire = |_| Self::closed_demand_ptr_();
         cell.try_spin_compare_exchange_weak(expect, desire)
     }
 
     #[inline(always)]
-    pub fn enqueue_consumer(&self, demand: &Demand<D, O>) -> bool {
+    pub fn enqueue_consumer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
         log::trace!("[BuffState::enqueue_consumer] {:p}", demand);
         Self::enqueue_demand_(&self.consumer_, demand)
     }
 
     #[inline(always)]
-    pub fn enqueue_producer(&self, demand: &Demand<D, O>) -> bool {
+    pub fn enqueue_producer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
         log::trace!("[BuffState::enqueue_producer] {:p}", demand);
         Self::enqueue_demand_(&self.producer_, demand)
     }
 
     fn enqueue_demand_(
-        cell: &AtomicDemandPtr<D, O>,
-        demand: &Demand<D, O>,
+        cell: &AtomicDemandPtr<O>,
+        demand: &Demand<O>,
     ) -> bool {
-        let expect = |p: *mut Demand<D, O>| p.is_null();
+        let expect = |p: *mut Demand<O>| p.is_null();
         let desire = |_| demand as *const _ as *mut _;
         cell.try_spin_compare_exchange_weak(expect, desire)
             .is_succ()
@@ -378,7 +346,7 @@ where
     /// Tries to invoke `chk_fn` of demand in enqueued consumer cell, and move
     /// the demand to the `unsignal_` slot if it will not activate at this time.
     #[inline(always)]
-    pub fn check_consumer(&self, demand: &Demand<D, O>) -> bool {
+    pub fn check_consumer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
         log::trace!("[BuffState::check_consumer] {:p}", demand);
         self.check_demand_(&self.consumer_, demand)
@@ -387,7 +355,7 @@ where
     /// Tries to invoke `chk_fn` of demand in enqueued producer cell, and move
     /// the demand to the `unsignal_` slot if it will not activate at this time.
     #[inline(always)]
-    pub fn check_producer(&self, demand: &Demand<D, O>) -> bool {
+    pub fn check_producer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
         log::trace!("[BuffState::check_producer] {:p}", demand);
         self.check_demand_(&self.producer_, demand)
@@ -395,10 +363,10 @@ where
 
     fn check_demand_(
         &self,
-        cell: &AtomicDemandPtr<D, O>,
-        demand: &Demand<D, O>,
+        cell: &AtomicDemandPtr<O>,
+        demand: &Demand<O>,
     ) -> bool {
-        let expect = |p: *mut Demand<D, O>| ptr::eq(p, demand);
+        let expect = |p: *mut Demand<O>| ptr::eq(p, demand);
         let desire = |_| ptr::null_mut();
         let r: Result<_, _> = cell
             .try_spin_compare_exchange_weak(expect, desire)
@@ -433,7 +401,7 @@ where
     /// Dequeue a (previously enqueued) consumer demand if not activated.
     /// Return if the demand is successfully dequeued.
     #[inline(always)]
-    pub fn dequeue_consumer(&self, demand: &Demand<D, O>) -> bool {
+    pub fn dequeue_consumer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
         log::trace!("[BuffState::dequeue_consumer] {:p}", demand);
         Self::dequeue_demand_(&self.consumer_, demand)
@@ -442,15 +410,15 @@ where
     /// Dequeue a (previously enqueued) producer demand if not activated.
     /// Return if the demand is successfully dequeued.
     #[inline(always)]
-    pub fn dequeue_producer(&self, demand: &Demand<D, O>) -> bool {
+    pub fn dequeue_producer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
         log::trace!("[BuffState::dequeue_producer] {:p}", demand);
         Self::dequeue_demand_(&self.producer_, demand)
     }
 
     fn dequeue_demand_(
-        cell: &AtomicDemandPtr<D, O>,
-        demand: &Demand<D, O>,
+        cell: &AtomicDemandPtr<O>,
+        demand: &Demand<O>,
     ) -> bool {
         let p = unsafe {
             NonNull::new_unchecked(demand as *const _ as * mut _)
@@ -508,19 +476,19 @@ where
         }
     }
 
-    pub fn abort_consumer(&self, demand: &Demand<D, O>) -> bool {
+    pub fn abort_consumer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
         log::trace!("[BuffState::abort_consumer]");
         self.abort_demand(demand)
     }
 
-    pub fn abort_producer(&self, demand: &Demand<D, O>) -> bool {
+    pub fn abort_producer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
         log::trace!("[BuffState::abort_producer]");
         self.abort_demand(demand)
     }
 
-    fn abort_demand(&self, demand: &Demand<D, O>) -> bool {
+    fn abort_demand(&self, demand: &Demand<O>) -> bool {
         let p = unsafe {
             NonNull::new_unchecked(demand as *const _ as  *mut _)
         };
@@ -545,11 +513,10 @@ where
     }
 }
 
-impl<P, T, D, O> fmt::Display for BuffState<P, T, D, O>
+impl<P, T, O> fmt::Display for BuffState<P, T, O>
 where
     P: BorrowMut<[T]>,
     T: Clone + Debug,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -559,115 +526,106 @@ where
     }
 }
 
-unsafe impl<P, T, D, O> Send for BuffState<P, T, D, O>
+unsafe impl<P, T, O> Send for BuffState<P, T, O>
 where
     P: BorrowMut<[T]>,
-    T: Clone,
-    D: TrAtomicData + funty::Unsigned,
+    T: Clone + Send,
     O: TrCmpxchOrderings,
 {}
 
-unsafe impl<P, T, D, O> Sync for BuffState<P, T, D, O>
+unsafe impl<P, T, O> Sync for BuffState<P, T, O>
 where
     P: BorrowMut<[T]>,
-T: Clone,
-    D: TrAtomicData + funty::Unsigned,
+    T: Clone + Send + Sync,
     O: TrCmpxchOrderings,
 {}
 
-pub(super) struct RwState<D, O>
+pub(super) struct RwStateInfo<U>
 where
-    D: TrAtomicData + funty::Unsigned,
-    O: TrCmpxchOrderings,
+    U: funty::Unsigned,
 {
-    position_: <D as TrAtomicData>::AtomicCell,
-    capacity_: D,
-    _marker_o: PhantomAtomicPtr<O>,
+    pub reader_offset: U,
+    pub writer_offset: U,
+
+    /// Number of units available for reading
+    pub reader_length: U,
+
+    /// Number of units available for writing
+    pub writer_length: U,
 }
 
-impl<D, O> RwState<D, O>
+pub(super) struct RwState<O>
 where
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    pub const fn new(
-        cell: <D as TrAtomicData>::AtomicCell,
-        capacity: D,
-    ) -> Self {
+    _use_o_: PhantomAtomicPtr<O>,
+    rw_pos_: AtomicUsize,
+    capacity_: usize,
+}
+
+impl<O> RwState<O>
+where
+    O: TrCmpxchOrderings,
+{
+    pub const fn new(capacity: usize) -> Self {
         RwState {
-            position_: cell,
+            _use_o_: PhantomData,
+            rw_pos_: AtomicUsize::new(0usize),
             capacity_: capacity,
-            _marker_o: PhantomData,
         }
     }
 
-    #[inline(always)]
-    pub fn capacity(&self) -> D {
+    #[inline]
+    pub fn capacity(&self) -> usize {
         self.capacity_
     }
-}
 
-impl<D, O> AsRef<D::AtomicCell> for RwState<D, O>
-where
-    D: TrAtomicData + funty::Unsigned,
-    O: TrCmpxchOrderings,
-{
-    fn as_ref(&self) -> &D::AtomicCell {
-        &self.position_
+    #[inline]
+    pub fn data_size(&self) -> usize {
+        self.load_state().reader_length
     }
 }
 
-impl<D, O> TrAtomicFlags<D, O> for RwState<D, O>
+impl<O> AsRef<AtomicUsize> for RwState<O>
 where
-    D: TrAtomicData + funty::Unsigned,
+    O: TrCmpxchOrderings,
+{
+    fn as_ref(&self) -> &AtomicUsize {
+        &self.rw_pos_
+    }
+}
+
+impl<O> TrAtomicFlags<usize, O> for RwState<O>
+where
     O: TrCmpxchOrderings,
 {}
 
-impl<D, O> RwState<D, O>
+impl<O> RwState<O>
 where
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     pub const FLAG_RSV_BITS: u32 = 2;
 
     /// To indicate that writer position overflows the capacity and is not
     /// greater than the reader position.
-    #[allow(non_snake_case)]
-    fn INVERT_FLAG() -> D {
-        D::ONE << (D::BITS - 1)
-    }
+    const INVERT_FLAG: usize = 1usize << (usize::BITS - 1);
 
     /// To indicate whether the buffer is locked for operation.
     #[allow(non_snake_case)]
-    fn IO_BUSY_FLAG() -> D {
-        D::ONE << (D::BITS - 2)
-    }
+    const IO_BUSY_FLAG: usize = Self::INVERT_FLAG >> 1;
 
-    const MAX_SIZE_BITS: u32 = (D::BITS - Self::FLAG_RSV_BITS) >> 1;
+    const MAX_SIZE_BITS: u32 = (usize::BITS - Self::FLAG_RSV_BITS) >> 1;
 
-    #[allow(non_snake_case)]
-    fn BUFF_SIZE_MOD() -> D {
-        D::ONE << Self::MAX_SIZE_BITS
-    }
+    const BUFF_SIZE_MOD: usize = 1usize << Self::MAX_SIZE_BITS;
 
-    #[allow(non_snake_case)]
-    fn WRITER_POS_MASK() -> D {
-        Self::BUFF_SIZE_MOD() - D::ONE
-    }
-    #[allow(non_snake_case)]
-    fn READER_POS_MASK() -> D {
-        Self::WRITER_POS_MASK() << Self::MAX_SIZE_BITS 
-    }
+    const WRITER_POS_MASK: usize = Self::BUFF_SIZE_MOD - 1;
+    const READER_POS_MASK: usize = Self::WRITER_POS_MASK << Self::MAX_SIZE_BITS;
 
-    #[inline(always)]
-    #[allow(non_snake_case)]
-    pub fn POS_MAX() -> D {
-        Self::WRITER_POS_MASK()
-    }
+    const POS_MAX: usize = Self::WRITER_POS_MASK;
 
     /// Check positions of reader and writer, and calculate the max continuous
     /// buffer size for reading and writing
-    fn load_positions_(&self, state: D) -> (D, D, D, D) {
+    fn load_positions_(&self, state: usize) -> RwStateInfo<usize> {
         let w = Self::load_writer_pos_(state);
         let r = Self::load_reader_pos_(state);
         let (l, a) = if Self::expect_invert_true_(state) {
@@ -677,14 +635,15 @@ where
             debug_assert!(w >= r,  "w({w}) >= r({r}), {self:?}");
             (w - r, self.capacity_ - w)
         };
-        (r, w, l, a)
+        RwStateInfo {
+            reader_offset: r,
+            writer_offset: w,
+            reader_length: l,
+            writer_length: a,
+        }
     }
 
-    pub fn data_size(&self) -> D {
-        self.load_positions_(self.value()).2
-    }
-
-    pub fn load_state(&self) -> (D, D, D, D) {
+    pub fn load_state(&self) -> RwStateInfo<usize> {
         self.load_positions_(self.value())
     }
 
@@ -693,10 +652,10 @@ where
     /// the state value otherwise.
     fn try_inc_writer_pos(
         &self,
-        amount: D,
-    ) -> Result<BuffIoDelta<D>, TxError<D>> {
+        amount: usize,
+    ) -> Result<BuffIoDelta<usize>, TxError<usize>> {
         let mut state = self.value();
-        let amount = amount % (self.capacity_ + D::ONE);
+        let amount = amount % (self.capacity_ + usize::ONE);
         loop {
             let r = Self::load_reader_pos_(state);
             let w = Self::load_writer_pos_(state);
@@ -710,7 +669,7 @@ where
             if Self::expect_invert_true_(state) {
                 debug_assert!(w <= r, "w({w}) >= r({r})");
                 let available = r - w;
-                if available == D::ZERO && amount > D::ZERO {
+                if available == 0usize && amount > 0usize {
                     break Result::Err(TxError::Stuffed(w));
                 }
                 delta = cmp::min(available, amount);
@@ -720,11 +679,11 @@ where
             } else {
                 debug_assert!(w >= r, "w({w}) >= r({r})");
                 let available = self.capacity_ - w + r;
-                if available == D::ZERO && amount > D::ZERO {
+                if available == 0usize && amount > 0usize {
                     break Result::Err(TxError::Stuffed(w));
                 }
                 delta = cmp::min(available, amount);
-                if delta > D::ZERO {
+                if delta > 0usize {
                     let w_new = (w + delta) % self.capacity_;
                     s_new = if w_new < r || w_new <= w {
                         let s = Self::store_writer_pos_(state, w_new);
@@ -736,7 +695,7 @@ where
                     s_new = state
                 }
             }
-            let xch_res = self.position_.compare_exchange_weak(
+            let xch_res = self.rw_pos_.compare_exchange_weak(
                 state,
                 s_new,
                 StrictOrderings::SUCC_ORDERING,
@@ -763,8 +722,8 @@ where
     /// the state value otherwise.
     fn try_inc_reader_pos(
         &self,
-        amount: D,
-    ) -> Result<BuffIoDelta<D>, RxError<D>> {
+        amount: usize,
+    ) -> Result<BuffIoDelta<usize>, RxError<usize>> {
         let mut state = self.value();
         loop {
             let r = Self::load_reader_pos_(state);
@@ -779,7 +738,7 @@ where
             if Self::expect_invert_true_(state) {
                 debug_assert!(r >= w, "r({r}) >= w({w})");
                 let available = self.capacity_ - r + w;
-                if available == D::ZERO && amount > D::ZERO {
+                if available == 0usize && amount > 0usize {
                     break Result::Err(RxError::Drained(r));
                 }
                 delta = cmp::min(available, amount);
@@ -793,14 +752,14 @@ where
             } else {
                 debug_assert!(r <= w, "r({r}) <= w({w})");
                 let available = w - r;
-                if available == D::ZERO && amount > D::ZERO {
+                if available == 0usize && amount > 0usize {
                     break Result::Err(RxError::Drained(r));
                 }
                 delta = cmp::min(available, amount);
                 // it is impossible that the increment will reset the overflow flag
                 s_new = Self::store_reader_pos_(state, r + delta);
             }
-            let xch_res = self.position_.compare_exchange_weak(
+            let xch_res = self.rw_pos_.compare_exchange_weak(
                 state,
                 s_new,
                 O::SUCC_ORDERING,
@@ -826,7 +785,7 @@ where
         Self::expect_io_busy_true_(self.value())
     }
 
-    pub fn try_set_io_busy(&self, is_busy: bool) -> CmpxchResult<D> {
+    pub fn try_set_io_busy(&self, is_busy: bool) -> CmpxchResult<usize> {
         if is_busy {
             self.try_spin_compare_exchange_weak(
                 Self::expect_io_busy_false_,
@@ -842,58 +801,57 @@ where
 
     // -- OVRFLOW_FLAG
 
-    fn expect_invert_true_(value: D) -> bool {
-        value | (!Self::INVERT_FLAG()) == D::MAX
+    fn expect_invert_true_(value: usize) -> bool {
+        value | (!Self::INVERT_FLAG) == usize::MAX
     }
 
-    fn desire_invert_false_(value: D) -> D {
-        value & (!Self::INVERT_FLAG())
+    fn desire_invert_false_(value: usize) -> usize {
+        value & (!Self::INVERT_FLAG)
     }
 
-    fn desire_invert_true_(value: D) -> D {
-        value | Self::INVERT_FLAG()
+    fn desire_invert_true_(value: usize) -> usize {
+        value | Self::INVERT_FLAG
     }
 
     // -- IO_BUSY_FLAG
 
-    fn expect_io_busy_true_(value: D) -> bool {
-        value | (!Self::IO_BUSY_FLAG()) == D::MAX
+    fn expect_io_busy_true_(value: usize) -> bool {
+        value | (!Self::IO_BUSY_FLAG) == usize::MAX
     }
 
-    fn expect_io_busy_false_(value: D) -> bool {
-        value & Self::IO_BUSY_FLAG() == D::ZERO
+    fn expect_io_busy_false_(value: usize) -> bool {
+        value & Self::IO_BUSY_FLAG == 0usize
     }
 
-    fn desire_io_busy_true_(value: D) -> D {
-        value | Self::IO_BUSY_FLAG()
+    fn desire_io_busy_true_(value: usize) -> usize {
+        value | Self::IO_BUSY_FLAG
     }
 
-    fn desire_io_busy_false_(value: D) -> D {
-        value & (!Self::IO_BUSY_FLAG())
+    fn desire_io_busy_false_(value: usize) -> usize {
+        value & (!Self::IO_BUSY_FLAG)
     }
 
     // --
 
-    fn load_writer_pos_(value: D) -> D {
-        value & Self::WRITER_POS_MASK()
+    fn load_writer_pos_(value: usize) -> usize {
+        value & Self::WRITER_POS_MASK
     }
 
-    fn store_writer_pos_(value: D, pos: D) -> D {
-        value & (!Self::WRITER_POS_MASK()) | pos
+    fn store_writer_pos_(value: usize, pos: usize) -> usize {
+        value & (!Self::WRITER_POS_MASK) | pos
     }
 
-    fn load_reader_pos_(value: D) -> D {
-        (value & Self::READER_POS_MASK()) >> Self::MAX_SIZE_BITS
+    fn load_reader_pos_(value: usize) -> usize {
+        (value & Self::READER_POS_MASK) >> Self::MAX_SIZE_BITS
     }
 
-    fn store_reader_pos_(value: D, pos: D) -> D {
-        (value & (!Self::READER_POS_MASK())) | (pos << Self::MAX_SIZE_BITS)
+    fn store_reader_pos_(value: usize, pos: usize) -> usize {
+        (value & (!Self::READER_POS_MASK)) | (pos << Self::MAX_SIZE_BITS)
     }
 }
 
-impl<D, O> fmt::Debug for RwState<D, O>
+impl<O> fmt::Debug for RwState<O>
 where
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -901,9 +859,8 @@ where
     }
 }
 
-impl<D, O> fmt::Display for RwState<D, O>
+impl<O> fmt::Display for RwState<O>
 where
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -925,26 +882,24 @@ where
     }
 }
 
-pub(super) struct RwPosIoGuard<'a, P, T, D, O>(
-    &'a BuffState<P, T, D, O>,
+pub(super) struct RwPosIoGuard<'a, P, T, O>(
+    &'a BuffState<P, T, O>,
     &'a mut [T])
 where
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings;
 
-impl<'a, P, T, D, O> RwPosIoGuard<'a, P, T, D, O>
+impl<'a, P, T, O> RwPosIoGuard<'a, P, T, O>
 where
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     fn acquire(
-        state: &'a BuffState<P, T, D, O>,
+        state: &'a BuffState<P, T, O>,
         buffer: &'a mut [T],
-    ) -> RwPosIoGuard<'a, P, T, D, O> {
+    ) -> RwPosIoGuard<'a, P, T, O> {
         loop {
             let x = state.rw_state_.try_set_io_busy(true);
             if x.is_succ() {
@@ -955,7 +910,7 @@ where
         RwPosIoGuard(state, buffer)
     }
 
-    fn release_(state: &BuffState<P, T, D, O>) {
+    fn release_(state: &BuffState<P, T, O>) {
         loop {
             let x = state.rw_state_.try_set_io_busy(false);
             if x.is_succ() {
@@ -964,16 +919,15 @@ where
         }
     }
 
-    pub fn state(&self) -> &BuffState<P, T, D, O> {
+    pub fn state(&self) -> &BuffState<P, T, O> {
         self.0
     }
 }
 
-impl<'a, P, T, D, O> Drop for RwPosIoGuard<'a, P, T, D, O>
+impl<'a, P, T, O> Drop for RwPosIoGuard<'a, P, T, O>
 where
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     fn drop(&mut self) {
@@ -981,11 +935,10 @@ where
     }
 }
 
-impl<'a, P, T, D, O> Deref for RwPosIoGuard<'a, P, T, D, O>
+impl<'a, P, T, O> Deref for RwPosIoGuard<'a, P, T, O>
 where
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     type Target = [T];
@@ -995,11 +948,10 @@ where
     }
 }
 
-impl<'a, P, T, D, O> DerefMut for RwPosIoGuard<'a, P, T, D, O>
+impl<'a, P, T, O> DerefMut for RwPosIoGuard<'a, P, T, O>
 where
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
@@ -1048,7 +1000,7 @@ mod tests_ {
     };
     use atomex::{
         x_deps::funty,
-        StrictOrderings, TrAtomicData, TrAtomicFlags, TrCmpxchOrderings,
+        StrictOrderings, TrAtomicFlags, TrCmpxchOrderings,
     };
     use core_malloc::CoreAlloc;
     use mm_ptr::Owned;
@@ -1060,16 +1012,13 @@ mod tests_ {
     #[test]
     fn rw_state_smoke() {
         const BUFF_SIZE: usize = 16usize;
-        let rw = RwState::<usize, StrictOrderings>::new(
-            AtomicUsize::new(0),
-            BUFF_SIZE,
-        );
+        let rw = RwState::<StrictOrderings>::new(BUFF_SIZE);
         let s = rw.value();
         assert_eq!(s, 0);
         assert_eq!(rw.capacity(), BUFF_SIZE);
         assert_eq!(rw.data_size(), 0usize);
         assert!(!rw.is_io_busy());
-        assert!(!RwState::<usize, StrictOrderings>::expect_invert_true_(s));
+        assert!(!RwState::<StrictOrderings>::expect_invert_true_(s));
         let (r, w, l, a) = rw.load_positions_(s);
         assert_eq!(r, 0);
         assert_eq!(w, 0);
@@ -1138,11 +1087,10 @@ mod tests_ {
         assert!(buff.reader_forward(buf.len()).is_ok());
     }
 
-    fn writer_<P, T, D, O>(s: Arc<BuffState<P, T, D, O>>)
+    fn writer_<P, T, O>(s: Arc<BuffState<P, T, O>>)
     where
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryFrom<usize> + Copy,
-        D: TrAtomicData + funty::Unsigned,
         O: TrCmpxchOrderings,
     {
         let capacity = s.capacity_usize();
@@ -1192,11 +1140,10 @@ mod tests_ {
         log::trace!("writer exits")
     }
 
-    fn reader_<P, T, D, O>(s: Arc<BuffState<P, T, D, O>>)
+    fn reader_<P, T, O>(s: Arc<BuffState<P, T, O>>)
     where
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryInto<usize> + Copy,
-        D: TrAtomicData + funty::Unsigned,
         O: TrCmpxchOrderings,
     {
         let capacity = s.capacity_usize();

@@ -1,15 +1,14 @@
 ﻿use core::{
     borrow::{Borrow, BorrowMut},
+    error::Error,
+    fmt,
+    marker::PhantomData,
     ops::Deref,
     ptr::NonNull,
 };
 
-use abs_buff::{IoSliceMut, IoSliceRef, NoReclaim};
-use atomex::{
-    x_deps::funty,
-    StrictOrderings, TrAtomicData, TrCmpxchOrderings,
-};
 use abs_mm::mem_alloc::TrMalloc;
+use atomex::{StrictOrderings, TrCmpxchOrderings};
 use mm_ptr::{
     x_deps::{abs_mm, atomex},
     Shared,
@@ -17,13 +16,11 @@ use mm_ptr::{
 use asyncex::x_deps::mm_ptr;
 
 use super::{
-    reader_::Reader,
+    reader_::BuffRead,
+    reclaim_::{ReaderForwardFn, ReclSliceMut, ReclSliceRef, WriterForwardFn},
     sync_::*,
-    writer_::Writer,
-    TrAsyncRingBuffer,
+    writer_::BuffWrite, Dual, TrRingBuffer
 };
-
-pub use super::reclaim_::Reclaim;
 
 #[derive(Debug)]
 pub enum RxError<T> {
@@ -32,6 +29,24 @@ pub enum RxError<T> {
     Drained(T),
 }
 
+impl<T> fmt::Display for RxError<T>
+where
+    T: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RxError::Argument => write!(f, "RxError::Argument"),
+            RxError::Closing => write!(f, "RxError::Closing"),
+            RxError::Drained(t) => write!(f, "RxError::Drained({t:?})"),
+        }
+    }
+}
+
+impl<T> Error for RxError<T>
+where
+    T: fmt::Debug,
+{}
+
 #[derive(Debug)]
 pub enum TxError<T> {
     Argument,
@@ -39,30 +54,38 @@ pub enum TxError<T> {
     Stuffed(T),
 }
 
-type WriterReader<B, P, T, D, O> = (
-    Writer<B, P, T, D, O>,
-    Reader<B, P, T, D, O>,
-);
-type TrySplitResult<B, P, T, D, O> = Result<WriterReader<B, P, T, D, O>, B>;
+impl<T> fmt::Display for TxError<T>
+where
+    T: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TxError::Argument => write!(f, "TxError::Argument"),
+            TxError::Closing => write!(f, "TxError::Closing"),
+            TxError::Stuffed(t) => write!(f, "TxError::Stuffed({t:?})"),
+        }
+    }
+}
 
-pub struct RingBuffer<
-    P,
-    T = u8,
-    D = usize,
-    O = StrictOrderings,
->(BuffState<P, T, D, O>)
+impl<T> Error for TxError<T>
+where
+    T: fmt::Debug,
+{}
+
+type IoPair<B, P, T, O> = (BuffWrite<B, P, T, O>, BuffRead<B, P, T, O>);
+type TrySplitResult<B, P, T, O> = Result<IoPair<B, P, T, O>, B>;
+
+pub struct RingBuffer<P, T = u8, O = StrictOrderings>(BuffState<P, T, O>)
 where
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings;
 
 // Public APIs for RingBuffer
-impl<P, T, D, O> RingBuffer<P, T, D, O>
+impl<P, T, O> RingBuffer<P, T, O>
 where
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     pub fn try_new(buffer: P) -> Result<Self, usize> {
@@ -71,18 +94,21 @@ where
 
     pub fn split(
         ring_buff: &mut Self,
-    ) -> WriterReader<&'_ mut Self, P, T, D, O> {
+    ) -> IoPair<&'_ mut Self, P, T, O> {
         unsafe { 
             let mut p = NonNull::new_unchecked(ring_buff);
-            let writer = Writer::new(p.as_mut());
-            let reader = Reader::new(p.as_mut());
+            let writer = BuffWrite::new(p.as_mut());
+            let reader = BuffRead::new(p.as_mut());
             (writer, reader)
         }
     }
 
     pub fn try_split_from_shared<A: TrMalloc + Clone>(
         ring_buff: Shared<Self, A>,
-    ) -> TrySplitResult<Shared<Self, A>, P, T, D, O> {
+    ) -> TrySplitResult<Shared<Self, A>, P, T, O>
+    where
+        T: Send + Sync,
+    {
         Self::try_split_from(
             ring_buff,
             Shared::strong_count,
@@ -99,7 +125,7 @@ where
         ring_buff: S,
         strong_count: impl FnOnce(&S) -> usize,
         weak_count: impl FnOnce(&S) -> usize,
-    ) -> TrySplitResult<S, P, T, D, O>
+    ) -> TrySplitResult<S, P, T, O>
     where
         S: Borrow<Self> + Deref<Target = Self> + Clone + Send + Sync,
     {
@@ -107,94 +133,92 @@ where
         if x {
             Result::Err(ring_buff)
         } else {
-            let writer = Writer::new(ring_buff.clone());
-            let reader = Reader::new(ring_buff);
+            let writer = BuffWrite::new(ring_buff.clone());
+            let reader = BuffRead::new(ring_buff);
             Result::Ok((writer, reader))
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn capacity(&self) -> usize {
-        self.0.capacity_usize()
+        self.0.capacity()
     }
 
     #[inline(always)]
     pub fn data_size(&self) -> usize {
-        self.0.data_size_usize()
+        self.0.data_size()
     }
 
-    pub fn writer(&mut self) -> Writer<&'_ mut Self, P, T, D, O> {
-        Writer::new(self)
+    pub fn writer(&mut self) -> BuffWrite<&'_ mut Self, P, T, O> {
+        BuffWrite::new(self)
     }
 
-    pub fn reader(&mut self) -> Reader<&'_ mut Self, P, T, D, O> {
-        Reader::new(self)
+    pub fn reader(&mut self) -> BuffRead<&'_ mut Self, P, T, O> {
+        BuffRead::new(self)
     }
 }
 
 // pub(super) APIs for RingBuffer and its Reader/Writer/Peeker
 
-impl<P, T, D, O> RingBuffer<P, T, D, O>
+impl<P, T, O> RingBuffer<P, T, O>
 where
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    #[inline(always)]
-    pub(super) fn can_read_(&self) -> bool {
-        self.0.can_read()
-    }
-
-    #[inline(always)]
-    pub(super) fn can_write_(&self) -> bool {
-        self.0.can_write()
-    }
-
-    #[inline(always)]
-    pub(super) fn can_peek_(&self, skip: usize) -> bool {
-        self.0.can_peek(skip)
-    }
-
     pub(super) fn try_read_(
         &self,
         length: usize,
-    ) -> Result<SliceRef<'_, P, T, D, O>, RxError<D>> {
-        let slice_ptr = self.0.try_read(length)?;
-        let slice_ref = unsafe { slice_ptr.as_ref() };
-        let reclaimer = Reclaim::new(self);
-        Result::Ok(IoSliceRef::new_with_reclaimer(slice_ref, reclaimer))
+    ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
+        let make_slice = |slice| ReclSliceRef::new(
+            slice,
+            Option::Some(ReaderForwardFn::new(self))
+        );
+        self.0
+            .try_read(length)?
+            .into_iter()
+            .map(|p| unsafe { p.as_ref() })
+            .map(make_slice)
+            .collect()
     }
 
     pub(super) fn try_peek_(
         &self,
-        skip: usize,
-    ) -> Result<IoSliceRef<'_, T, NoReclaim<T>>, RxError<D>> {
-        let slice = self.0.try_peek(skip)?;
-        let slice = unsafe { slice.as_ref() };
-        Result::Ok(IoSliceRef::new(slice))
+    ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
+        let make_slice = |slice| ReclSliceRef::new(slice, Option::None);
+        self.0
+            .try_peek()?
+            .into_iter()
+            .map(|p| unsafe { p.as_ref() })
+            .map(make_slice)
+            .collect()
     }
 
     pub(super) fn try_write_(
         &self,
         length: usize,
-    ) -> Result<SliceMut<'_, P, T, D, O>, TxError<D>> {
-        let mut slice_ptr = self.0.try_write(length)?;
-        let slice_mut = unsafe { slice_ptr.as_mut() };
-        let reclaimer = Reclaim::new(self);
-        Result::Ok(IoSliceMut::new_with_reclaimer(slice_mut, reclaimer))
+    ) -> Result<Dual<ReclSliceMut<'_, P, T, O>>, TxError<usize>> {
+        let make_slice = |slice_mut: &mut [T]| ReclSliceMut::new(
+            slice_mut,
+            Option::Some(WriterForwardFn::new(self)),
+        );
+        self.0
+            .try_write(length)?
+            .into_iter()
+            .map(|mut p| unsafe { p.as_mut() })
+            .map(make_slice)
+            .collect()
     }
 
-    pub(super) fn state(&self) -> &BuffState<P, T, D, O> {
+    pub(super) fn state(&self) -> &BuffState<P, T, O> {
         &self.0
     }
 }
 
-impl<P, T, D, O> AsRef<[T]> for RingBuffer<P, T, D, O>
+impl<P, T, O> AsRef<[T]> for RingBuffer<P, T, O>
 where
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
     fn as_ref(&self) -> &[T] {
@@ -202,39 +226,78 @@ where
     }
 }
 
-impl<P, T, D, O> TrAsyncRingBuffer<T> for RingBuffer<P, T, D, O>
+impl<P, T, O> TrRingBuffer<T> for RingBuffer<P, T, O>
 where
     P: BorrowMut<[T]>,
     T: Clone,
-    D: TrAtomicData + funty::Unsigned,
     O: TrCmpxchOrderings,
 {
-    type Writer<'a> = Writer<&'a mut Self, P, T, D, O> where Self: 'a;
-    type Reader<'a> = Reader<&'a mut Self, P, T, D, O> where Self: 'a;
+    type Input<'a> = BuffWrite<&'a mut Self, P, T, O> where Self: 'a;
+    type Output<'a> = BuffRead<&'a mut Self, P, T, O> where Self: 'a;
 
-    #[inline(always)]
+    #[inline]
     fn capacity(&self) -> usize {
         RingBuffer::capacity(self)
     }
 
-    #[inline(always)]
+    #[inline]
     fn data_size(&self) -> usize {
         RingBuffer::data_size(self)
     }
 
-    #[inline(always)]
-    fn writer(&mut self) -> Self::Writer<'_> {
-        RingBuffer::writer(self)
-    }
-
-    #[inline(always)]
-    fn reader(&mut self) -> Self::Reader<'_> {
-        RingBuffer::reader(self)
+    #[inline]
+    fn try_split_io(
+        &mut self,
+    ) -> Option<(Self::Input<'_>, Self::Output<'_>)> {
+        Option::Some(Self::split(self))
     }
 }
 
-pub type SliceRef<'a, P, T, D, O> = IoSliceRef<'a, T, Reclaim<'a, P, T, D, O>>;
-pub type SliceMut<'a, P, T, D, O> = IoSliceMut<'a, T, Reclaim<'a, P, T, D, O>>;
+pub(super) struct DemandCtx<B, P, T, O>
+where
+    B: Borrow<RingBuffer<P, T, O>>,
+    P: BorrowMut<[T]>,
+    T: Clone,
+    O: TrCmpxchOrderings,
+{
+    _use_p_: PhantomData<P>,
+    _use_t_: PhantomData<[T]>,
+    buffer_: B,
+    demand_: Option<Demand<O>>,
+}
+
+impl<B, P, T, O> DemandCtx<B, P, T, O>
+where
+    B: Borrow<RingBuffer<P, T, O>>,
+    P: BorrowMut<[T]>,
+    T: Clone,
+    O: TrCmpxchOrderings,
+{
+    pub const fn new(buffer: B) -> Self {
+        DemandCtx {
+            _use_p_: PhantomData,
+            _use_t_: PhantomData,
+            buffer_: buffer,
+            demand_: Option::None,
+        }
+    }
+
+    pub fn buffer(&self) -> &RingBuffer<P, T, O> {
+        self.buffer_.borrow()
+    }
+}
+
+impl<B, P, T, O> AsMut<B> for DemandCtx<B, P, T, O>
+where
+    B: Borrow<RingBuffer<P, T, O>>,
+    P: BorrowMut<[T]>,
+    T: Clone,
+    O: TrCmpxchOrderings,
+{
+    fn as_mut(&mut self) -> &mut B {
+        &mut self.buffer_
+    }
+}
 
 #[cfg(test)]
 mod tests_ {
@@ -249,12 +312,11 @@ mod tests_ {
     use asyncex::x_deps::{mm_ptr, atomex};
     use crate::ring_buffer::*;
 
-    async fn writer_<B, P, T, D, O>(mut writer: Writer<B, P, T, D, O>)
+    async fn writer_<B, P, T, O>(mut writer: BuffWrite<B, P, T, O>)
     where
-        B: Borrow<RingBuffer<P, T, D, O>>,
+        B: Borrow<RingBuffer<P, T, O>>,
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryFrom<usize> + Copy,
-        D: TrAtomicData + funty::Unsigned,
         O: TrCmpxchOrderings,
     {
         let capacity = writer.buffer().capacity();
@@ -302,9 +364,9 @@ mod tests_ {
         log::trace!("writer exits")
     }
 
-    async fn reader_<B, P, T, D, O>(mut reader: Reader<B, P, T, D, O>)
+    async fn reader_<B, P, T, O>(mut reader: BuffRead<B, P, T, O>)
     where
-        B: Borrow<RingBuffer<P, T, D, O>>,
+        B: Borrow<RingBuffer<P, T, O>>,
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryInto<usize> + Copy,
         D: TrAtomicData + funty::Unsigned,
