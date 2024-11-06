@@ -1,5 +1,5 @@
 ﻿use core::{
-    borrow::{Borrow, BorrowMut},
+    borrow::BorrowMut,
     cell::UnsafeCell,
     cmp,
     fmt::{self, Debug},
@@ -36,6 +36,28 @@ where
     pub fn new(f: &mut FnCheckState<O>) -> Self {
         let p = unsafe { NonNull::new_unchecked(f) };
         CheckStateFn(p)
+    }
+}
+
+impl<O> FnOnce<(&RwState<O>, )> for CheckStateFn<O>
+where
+    O: TrCmpxchOrderings,
+{
+    type Output = bool;
+
+    extern "rust-call" fn call_once(mut self, args: (&RwState<O>,)) -> Self::Output {
+        let f = unsafe { self.0.as_mut() };
+        f(args.0)
+    }
+}
+
+impl<O> FnMut<(&RwState<O>,)> for CheckStateFn<O>
+where
+    O: TrCmpxchOrderings,
+{
+    extern "rust-call" fn call_mut(&mut self, args: (&RwState<O>,)) -> Self::Output {
+        let f = unsafe { self.0.as_mut() };
+        f(args.0)
     }
 }
 
@@ -178,10 +200,6 @@ where
         }
     }
 
-    pub fn can_read(&self) -> bool {
-        self.try_read(0).is_ok()
-    }
-
     pub fn try_read(
         &self,
         length: usize,
@@ -216,18 +234,16 @@ where
         &self,
         length: usize,
     ) -> Result<BuffIoDelta<usize>, RxError<usize>> {
-        let s = self.rw_state_.value();
-        let (r, _, l, _) = self.rw_state_.load_positions_(s);
-        if l == 0usize {
+        let info = self.rw_state_.load_state();
+        if info.reader_length == 0usize {
             let e = if self.is_closing() {
                 RxError::Closing
             } else {
-                RxError::Drained(r)
+                RxError::Drained(info.reader_offset)
             };
             return Result::Err(e);
         };
-        let dst_len = usize::try_from(length).unwrap_or(l);
-        self.rw_state_.try_inc_reader_pos(dst_len)
+        self.rw_state_.try_inc_reader_pos(length)
     }
 
     pub fn try_write(
@@ -380,7 +396,8 @@ where
         let Option::Some(demand) = opt_demand else {
             unreachable!()
         };
-        if !demand.chk_fn.call(&self.rw_state_) {
+        let check_fn = &mut demand.chk_fn;
+        if !check_fn(&self.rw_state_) {
             #[cfg(test)]
             log::trace!("[BuffState::check_demand_] demand denied");
             let init = unsafe { NonNull::new_unchecked(demand as *mut _) };
@@ -455,7 +472,8 @@ where
             // we should have avoided null_ptr when cmpxch
             unreachable!("[BuffState::try_signal_] unexpected null demand");
         };
-        if !demand.chk_fn.call(&self.rw_state_) {
+        let check_fn = &mut demand.chk_fn;
+        if !check_fn(&self.rw_state_) {
             #[cfg(test)]
             log::trace!("[BuffState::try_signal_] demand denied");
             return;
@@ -655,7 +673,7 @@ where
         amount: usize,
     ) -> Result<BuffIoDelta<usize>, TxError<usize>> {
         let mut state = self.value();
-        let amount = amount % (self.capacity_ + usize::ONE);
+        let amount = amount % (self.capacity_ + 1usize);
         loop {
             let r = Self::load_reader_pos_(state);
             let w = Self::load_writer_pos_(state);
@@ -924,7 +942,7 @@ where
     }
 }
 
-impl<'a, P, T, O> Drop for RwPosIoGuard<'a, P, T, O>
+impl<P, T, O> Drop for RwPosIoGuard<'_, P, T, O>
 where
     P: BorrowMut<[T]>,
     T: Clone,
@@ -935,7 +953,7 @@ where
     }
 }
 
-impl<'a, P, T, O> Deref for RwPosIoGuard<'a, P, T, O>
+impl<P, T, O> Deref for RwPosIoGuard<'_, P, T, O>
 where
     P: BorrowMut<[T]>,
     T: Clone,
@@ -948,7 +966,7 @@ where
     }
 }
 
-impl<'a, P, T, O> DerefMut for RwPosIoGuard<'a, P, T, O>
+impl<P, T, O> DerefMut for RwPosIoGuard<'_, P, T, O>
 where
     P: BorrowMut<[T]>,
     T: Clone,
@@ -996,7 +1014,7 @@ pub(super) fn d_to_usize<D: funty::Unsigned>(d: D,  m: &'static str) -> usize {
 mod tests_ {
     use std::{
         borrow::*,
-        sync::{atomic::AtomicUsize, Arc},
+        sync::Arc,
     };
     use atomex::{
         x_deps::funty,
@@ -1019,11 +1037,11 @@ mod tests_ {
         assert_eq!(rw.data_size(), 0usize);
         assert!(!rw.is_io_busy());
         assert!(!RwState::<StrictOrderings>::expect_invert_true_(s));
-        let (r, w, l, a) = rw.load_positions_(s);
-        assert_eq!(r, 0);
-        assert_eq!(w, 0);
-        assert_eq!(l, 0);
-        assert_eq!(a, BUFF_SIZE); 
+        let info = rw.load_positions_(s);
+        assert_eq!(info.reader_offset, 0);
+        assert_eq!(info.writer_offset, 0);
+        assert_eq!(info.reader_length, 0);
+        assert_eq!(info.writer_length, BUFF_SIZE); 
 
         assert!(rw.try_set_io_busy(true).is_succ());
         assert!(rw.is_io_busy());
@@ -1046,13 +1064,15 @@ mod tests_ {
         loop {
             if c >= BUFF_SIZE { break; }
             match buff.try_write(BUFF_SIZE - c) {
-                Result::Ok(mut p) => {
-                    let target = unsafe { p.as_mut() };
-                    let len = target.len();
-                    assert!(len <= BUFF_SIZE - c);
-                    c += len;
-                    let x = buff.writer_forward(len);
-                    assert!(x.is_ok());
+                Result::Ok(dual) => {
+                    for mut p in dual.into_iter() {
+                        let target = unsafe { p.as_mut() };
+                        let len = target.len();
+                        assert!(len <= BUFF_SIZE - c);
+                        c += len;
+                        let x = buff.writer_forward(len);
+                        assert!(x.is_ok());
+                    }
                     continue;
                 },
                 Result::Err(TxError::Stuffed(_)) => continue,
@@ -1064,14 +1084,16 @@ mod tests_ {
         loop {
             if c >= BUFF_SIZE - 1 { break; }
             match buff.try_read(BUFF_SIZE - c) {
-                Result::Ok(p) => {
-                    let src = unsafe { p.as_ref() };
-                    let len = src.len();
-                    assert!(len <= BUFF_SIZE - c);
-                    // we don't actually read the content, just drop it
-                    c += len;
-                    let x = buff.reader_forward(len);
-                    assert!(x.is_ok());
+                Result::Ok(dual) => {
+                    for p in dual.into_iter() {
+                        let src = unsafe { p.as_ref() };
+                        let len = src.len();
+                        assert!(len <= BUFF_SIZE - c);
+                        // we don't actually read the content, just drop it
+                        c += len;
+                        let x = buff.reader_forward(len);
+                        assert!(x.is_ok());
+                    }
                     continue;
                 },
                 Result::Err(RxError::Drained(_)) => continue,
@@ -1093,7 +1115,7 @@ mod tests_ {
         T: funty::Unsigned + TryFrom<usize> + Copy,
         O: TrCmpxchOrderings,
     {
-        let capacity = s.capacity_usize();
+        let capacity = s.capacity();
         let mut step = 1usize;
         let mut c = 0usize;
         loop {
@@ -1110,15 +1132,17 @@ mod tests_ {
                 let split = source.split_at(wrote_len);
                 let src = split.1;
                 match s.try_write(src.len()) {
-                    Result::Ok(mut p) => {
-                        let dst = unsafe { p.as_mut() };
-                        let len = dst.len();
-                        assert!(len <= src.len());
-                        dst.clone_from_slice(src.split_at(len).0);
-                        wrote_len += len;
-                        c += len;
-                        let x = s.writer_forward(len);
-                        assert!(x.is_ok());
+                    Result::Ok(dual) => {
+                        for mut p in dual.into_iter() {
+                            let dst = unsafe { p.as_mut() };
+                            let len = dst.len();
+                            assert!(len <= src.len());
+                            dst.clone_from_slice(src.split_at(len).0);
+                            wrote_len += len;
+                            c += len;
+                            let x = s.writer_forward(len);
+                            assert!(x.is_ok());
+                        }
                         if wrote_len == source.len() {
                             // std::println!("writer #{step}: {:?} ({})", source.as_ref(), *s);
                             break;
@@ -1146,7 +1170,7 @@ mod tests_ {
         T: funty::Unsigned + TryInto<usize> + Copy,
         O: TrCmpxchOrderings,
     {
-        let capacity = s.capacity_usize();
+        let capacity = s.capacity();
         let mut step = capacity;
         let mut c = 0usize;
         let mut span_length = 1usize;
@@ -1165,15 +1189,17 @@ mod tests_ {
                 let split = target.split_at_mut(read_len);
                 let dst: &mut [T] = split.1;
                 match s.try_read(dst.len()) {
-                    Result::Ok(p) => {
-                        let src = unsafe { p.as_ref() };
-                        let len = src.len();
-                        assert!(len <= dst.len());
-                        dst[..len].clone_from_slice(src);
-                        read_len += len;
-                        c += len;
-                        let x = s.reader_forward(len);
-                        assert!(x.is_ok());
+                    Result::Ok(dual) => {
+                        for p in dual.into_iter() {
+                            let src = unsafe { p.as_ref() };
+                            let len = src.len();
+                            assert!(len <= dst.len());
+                            dst[..len].clone_from_slice(src);
+                            read_len += len;
+                            c += len;
+                            let x = s.reader_forward(len);
+                            assert!(x.is_ok());
+                        }
                         if read_len == target.len() { break; }
                     },
                     Result::Err(RxError::Drained(_)) => continue,

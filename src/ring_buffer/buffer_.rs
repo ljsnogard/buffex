@@ -2,8 +2,9 @@
     borrow::{Borrow, BorrowMut},
     error::Error,
     fmt,
-    marker::PhantomData,
+    marker::{PhantomData, PhantomPinned},
     ops::Deref,
+    pin::Pin,
     ptr::NonNull,
 };
 
@@ -174,40 +175,46 @@ where
             slice,
             Option::Some(ReaderForwardFn::new(self))
         );
-        self.0
+        let dual = self
+            .0
             .try_read(length)?
             .into_iter()
             .map(|p| unsafe { p.as_ref() })
             .map(make_slice)
-            .collect()
+            .collect();
+        Result::Ok(dual)
     }
 
     pub(super) fn try_peek_(
         &self,
     ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
         let make_slice = |slice| ReclSliceRef::new(slice, Option::None);
-        self.0
+        let dual = self
+            .0
             .try_peek()?
             .into_iter()
             .map(|p| unsafe { p.as_ref() })
             .map(make_slice)
-            .collect()
+            .collect();
+        Result::Ok(dual)
     }
 
     pub(super) fn try_write_(
         &self,
         length: usize,
     ) -> Result<Dual<ReclSliceMut<'_, P, T, O>>, TxError<usize>> {
-        let make_slice = |slice_mut: &mut [T]| ReclSliceMut::new(
+        let make_slice = |slice_mut| ReclSliceMut::new(
             slice_mut,
             Option::Some(WriterForwardFn::new(self)),
         );
-        self.0
+        let dual = self
+            .0
             .try_write(length)?
             .into_iter()
             .map(|mut p| unsafe { p.as_mut() })
             .map(make_slice)
-            .collect()
+            .collect();
+        Result::Ok(dual)
     }
 
     pub(super) fn state(&self) -> &BuffState<P, T, O> {
@@ -260,6 +267,7 @@ where
     T: Clone,
     O: TrCmpxchOrderings,
 {
+    _pinned: PhantomPinned,
     _use_p_: PhantomData<P>,
     _use_t_: PhantomData<[T]>,
     buffer_: B,
@@ -275,6 +283,7 @@ where
 {
     pub const fn new(buffer: B) -> Self {
         DemandCtx {
+            _pinned: PhantomPinned,
             _use_p_: PhantomData,
             _use_t_: PhantomData,
             buffer_: buffer,
@@ -284,6 +293,27 @@ where
 
     pub fn buffer(&self) -> &RingBuffer<P, T, O> {
         self.buffer_.borrow()
+    }
+
+    #[inline]
+    pub fn demand(&self) -> Option<&Demand<O>> {
+        self.demand_.as_ref()
+    }
+
+    pub fn try_init_demand(
+        self: Pin<&mut Self>,
+        demand: Demand<O>,
+    ) -> Result<&Demand<O>, Demand<O>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        if this.demand_.is_none() {
+            this.demand_ = Option::Some(demand);
+            let Option::Some(demand_ref) = &this.demand_ else {
+                unreachable!()
+            };
+            Result::Ok(demand_ref)
+        } else {
+            Result::Err(demand)
+        }
     }
 }
 
@@ -305,60 +335,59 @@ mod tests_ {
 
     use atomex::{
         x_deps::funty,
-        TrAtomicData, TrCmpxchOrderings,
+        TrCmpxchOrderings,
     };
     use core_malloc::CoreAlloc;
     use mm_ptr::{Shared, Owned};
     use asyncex::x_deps::{mm_ptr, atomex};
     use crate::ring_buffer::*;
 
-    async fn writer_<B, P, T, O>(mut writer: BuffWrite<B, P, T, O>)
+    /// 向 buffer 中写入 [1][1,2][1,2,3]...[1,2,..,max_step - 1, max_step]
+    async fn write_seq_<B, P, T, O>(
+        mut buffer: BuffWrite<B, P, T, O>,
+        max_len: usize,
+    )
     where
         B: Borrow<RingBuffer<P, T, O>>,
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryFrom<usize> + Copy,
         O: TrCmpxchOrderings,
     {
-        let capacity = writer.buffer().capacity();
-        let mut step = 1usize;
-        let mut c = 0usize;
+        let mut seq_len = 1usize;
         loop {
-            if step > capacity {
+            if seq_len > max_len {
                 break;
             }
             let source = Owned::new_slice(
-                step,
+                seq_len,
                 |u| {
-                    let Result::Ok(x) = T::try_from(u) else { panic!() };
+                    let Result::Ok(x) = T::try_from(u) else { panic!("unable conver from {u}") };
                     x
                 },
                 CoreAlloc::new(),
             );
+            // The number of items that has been written into.
             let mut wrote_len = 0usize;
+            // 每一次循环都会把完整的 source 写进 buffer
             loop {
-                let split = source.split_at(wrote_len);
-                let src = split.1;
-                match writer.write_async(src.len()).await {
-                    Result::Ok(mut dst) => {
-                        let len = dst.len();
-                        assert!(len <= src.len());
-                        dst.clone_from_slice(src.split_at(len).0);
-                        wrote_len += len;
-                        c += len;
-                        if wrote_len == source.len() {
-                            // std::println!("writer #{step}: {:?} ({})", source.as_ref(), *s);
-                            break;
-                        }
-                    },
-                    Result::Err(e) => panic!(
-                        "writer_: step({step}), {:?} - {:?}\n{e:?}",
-                        split.0, split.1
-                    ),
+                let req_size = source.len() - wrote_len;
+                if req_size == 0 {
+                    seq_len += 1;
+                    break;
                 }
-            }
-            if c >= step {
-                step += 1;
-                c = 0usize;
+                let try_write = buffer.write_async(req_size).await;
+                let Result::Ok(dst_iter) = try_write else {
+                    let e = try_write.err().unwrap();
+                    panic!("writer_: step({seq_len}), wrote_len({wrote_len}), req_size({req_size}), e({e:?})")
+                };
+                for mut dst in dst_iter.into_iter() {
+                    let split = source.split_at(wrote_len);
+                    let src = split.1;
+                    let len = dst.len();
+                    assert!(len <= src.len());
+                    dst.clone_from_slice(src.split_at(len).0);
+                    wrote_len += len;
+                }
             }
         }
         log::trace!("writer exits")
@@ -369,7 +398,6 @@ mod tests_ {
         B: Borrow<RingBuffer<P, T, O>>,
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryInto<usize> + Copy,
-        D: TrAtomicData + funty::Unsigned,
         O: TrCmpxchOrderings,
     {
         let capacity = reader.buffer().capacity();
@@ -391,12 +419,16 @@ mod tests_ {
                 let split = target.split_at_mut(read_len);
                 let dst: &mut [T] = split.1;
                 match reader.read_async(dst.len()).await {
-                    Result::Ok(src) => {
-                        let len = src.len();
-                        assert!(len <= dst.len());
-                        dst[..len].clone_from_slice(&src);
-                        read_len += len;
-                        c += len;
+                    Result::Ok(dual) => {
+                        let mut dst_w = 0usize;
+                        for src in dual.into_iter() {
+                            let len = src.len();
+                            assert!(len <= dst.len());
+                            dst[dst_w..len].clone_from_slice(&src);
+                            dst_w += len;
+                        }
+                        read_len += dst_w;
+                        c += dst_w;
                         if read_len == target.len() { break; }
                     },
                     Result::Err(RxError::Closing) => break,
@@ -448,7 +480,7 @@ mod tests_ {
         else {
             panic!("[tests_::u8_read_write_async_smoke] try_split_shared");
         };
-        let writer_handle = tokio::task::spawn(writer_(writer));
+        let writer_handle = tokio::task::spawn(write_seq_(writer, BUFF_SIZE as usize));
         let reader_handle = tokio::task::spawn(reader_(reader));
         assert!(writer_handle.await.is_ok());
         assert!(reader_handle.await.is_ok());
@@ -476,10 +508,10 @@ mod tests_ {
         else {
             panic!("[tests_::u16_read_write_async_smoke] try_split_shared");
         };
-        let writer_handle = tokio::task::spawn(writer_(writer));
-        let reader_handle = tokio::task::spawn(reader_(reader));
-        assert!(writer_handle.await.is_ok());
-        assert!(reader_handle.await.is_ok());
+        let whndl = tokio::task::spawn(write_seq_(writer, BUFF_SIZE as usize));
+        let rhndl = tokio::task::spawn(reader_(reader));
+        assert!(whndl.await.is_ok());
+        assert!(rhndl.await.is_ok());
     }
 
     #[tokio::test]
@@ -504,7 +536,7 @@ mod tests_ {
         else {
             panic!("[tests_::u32_read_write_async_smoke] try_split_shared");
         };
-        let writer_handle = tokio::task::spawn(writer_(writer));
+        let writer_handle = tokio::task::spawn(write_seq_(writer, BUFF_SIZE as usize));
         let reader_handle = tokio::task::spawn(reader_(reader));
         assert!(writer_handle.await.is_ok());
         assert!(reader_handle.await.is_ok());

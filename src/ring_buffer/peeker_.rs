@@ -1,10 +1,11 @@
 ﻿use core::{
     borrow::{Borrow, BorrowMut},
     future::{Future, IntoFuture},
-    mem::MaybeUninit,
     pin::Pin,
+    ptr::NonNull,
     task::{Context, Poll},
 };
+
 use pin_project::pin_project;
 use pin_utils::pin_mut;
 
@@ -18,8 +19,8 @@ use atomex::TrCmpxchOrderings;
 use super::{
     buffer_::{DemandCtx, RingBuffer, RxError},
     reclaim_::ReclSliceRef,
-    reader_::{BuffRead, ReadAsync},
-    sync_::*,
+    reader_::ReadAsync,
+    sync_::{Demand, RwState},
     Dual,
 };
 
@@ -49,14 +50,13 @@ where
     }
 
     #[inline]
-    pub fn peek_async(
-        &mut self,
-    ) -> PeekAsync<'_, B, P, T, O> {
-        PeekAsync::new(&mut self.0)
+    pub fn peek_async(&mut self) -> PeekAsync<'_, B, P, T, O> {
+        // Safe because DemandCtx is !Unpin
+        PeekAsync::new(unsafe { Pin::new_unchecked(&mut self.0) })
     }
 
     #[inline]
-    fn try_read_(
+    pub fn try_read(
         &mut self,
         length: usize,
     ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
@@ -64,24 +64,10 @@ where
     }
 
     #[inline]
-    fn read_async_(&mut self, length: usize) -> ReadAsync<'_, B, P, T, O> {
-        ReadAsync::new(&mut self.0, length)
-    }
-}
-
-impl<B, P, T, O> From<BuffRead<B, P, T, O>> for BuffPeek<B, P, T, O>
-where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    fn from(value: BuffRead<B, P, T, O>) -> Self {
-        let m: MaybeUninit<_> = MaybeUninit::new(value);
-        let b = unsafe {
-            m.assume_init_ref().as_ref() as *const B
-        };
-        BuffPeek::new(unsafe { b.read() })
+    pub fn read_async(&mut self, length: usize) -> ReadAsync<'_, B, P, T, O> {
+        // Safe because DemandCtx is !Unpin
+        let context = unsafe { Pin::new_unchecked(&mut self.0) };
+        ReadAsync::new(context, length)
     }
 }
 
@@ -133,7 +119,7 @@ where
 
     #[inline]
     fn read_async(&mut self, length: usize) -> Self::ReadAsync<'_> {
-        ReadAsync::new(&mut self.0, length)
+        BuffPeek::read_async(self, length)
     }
 }
 
@@ -148,7 +134,7 @@ where
         <Self as TrBuffIterRead<T>>::BuffIter<'_>,
         <Self as TrBuffIterRead<T>>::Err,
     > {
-        BuffPeek::try_read_(self, length)
+        BuffPeek::try_read(self, length)
     }
 }
 
@@ -164,31 +150,7 @@ where
     }
 }
 
-impl<B, P, T, O> AsRef<Self> for BuffPeek<B, P, T, O>
-where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    fn as_ref(&self) -> &Self {
-        self
-    }
-}
-
-impl<B, P, T, O> AsMut<Self> for BuffPeek<B, P, T, O>
-where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    fn as_mut(&mut self) -> &mut Self {
-        self
-    }
-}
-
-pub struct PeekAsync<'a, B, P, T, O>(&'a mut DemandCtx<B, P, T, O>)
+pub struct PeekAsync<'a, B, P, T, O>(Pin<&'a mut DemandCtx<B, P, T, O>>)
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
@@ -203,7 +165,7 @@ where
     O: TrCmpxchOrderings,
 {
     #[inline(always)]
-    pub(super) fn new(context: &'a mut DemandCtx<B, P, T, O>) -> Self {
+    pub(super) fn new(context: Pin<&'a mut DemandCtx<B, P, T, O>>) -> Self {
         PeekAsync(context)
     }
 
@@ -266,7 +228,7 @@ where
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    #[pin]context_: &'a mut DemandCtx<B, P, T, O>,
+    dm_ctx_: Pin<&'a mut DemandCtx<B, P, T, O>>,
     cancel_: Pin<&'a mut C>,
 }
 
@@ -279,33 +241,41 @@ where
     O: TrCmpxchOrderings,
 {
     fn new(
-        context: &'a mut DemandCtx<B, P, T, O>,
+        context: Pin<&'a mut DemandCtx<B, P, T, O>>,
         cancel: Pin<&'a mut C>,
     ) -> Self {
         PeekFuture {
-            context_: context,
+            dm_ctx_: context,
             cancel_: cancel,
         }
     }
 
     async fn peek_async_(self: Pin<&mut Self>) -> <Self as Future>::Output {
-        let mut this = self.project();
-        let skip_len = *this.skip_;
-        let try_peek = this.buffer_.try_peek_(skip_len);
+        let this = self.project();
+        let mut p_ctx = unsafe {
+            let ptr = this.dm_ctx_.as_mut().get_unchecked_mut();
+            NonNull::new_unchecked(ptr)
+        };
+        let p_ring_buf = unsafe { 
+            let ring_buf = p_ctx.as_ref().buffer();
+            let ptr = ring_buf as *const _ as *mut RingBuffer<P, T, O>;
+            NonNull::new_unchecked(ptr)
+        };
+        let try_peek = unsafe { p_ring_buf.as_ref().try_peek_() };
         let Result::Err(peek_err) = try_peek else {
             return try_peek;
         };
         let RxError::Drained(_) = peek_err else {
             return Result::Err(peek_err);
         };
-        let mut check = move |s: &RwState<D, O>| {
-            let (_, _, l, _) = s.load_state();
-            let l = d_to_usize(l, "");
-            l > skip_len
+        let mut check = move |s: &RwState<O>| {
+            let i = s.load_state();
+            i.reader_length > 0
         };
         loop {
-            if let Option::Some(demand) = this.demand_.as_ref().get_ref() {
-                let x = this.buffer_.state().check_consumer(demand);
+            let ring_buf = unsafe { p_ring_buf.as_ref() };
+            if let Option::Some(demand) = this.dm_ctx_.demand() {
+                let x = ring_buf.state().check_consumer(demand);
                 assert!(x, "[PeekFuture::peek_async_] check_consumer");
                 let signal_recv = demand.signal.peeker();
                 pin_mut!(signal_recv);
@@ -313,21 +283,20 @@ where
                     .peek_async()
                     .may_cancel_with(this.cancel_.as_mut())
                     .await;
-                let _ = this.buffer_.state().abort_consumer(demand);
+                let _ = ring_buf.state().abort_consumer(demand);
                 return if x.is_ok() {
-                    this.buffer_.try_peek_(skip_len)
+                    unsafe { p_ring_buf.as_ref().try_peek_() }
                 } else {
-                    Result::Err(RxError::Drained(D::ZERO))
+                    Result::Err(RxError::Drained(0usize))
                 }
             } else {
-                let opt = unsafe { this.demand_.as_mut().get_unchecked_mut() };
                 let demand = Demand::new(&mut check);
-                let replaced = opt.replace(demand);
-                assert!(replaced.is_none());
-                let Option::Some(demand) = opt.as_mut() else {
-                    unreachable!("[PeekFuture::peek_async_] opt")
+                let try_init = unsafe {
+                    let ctx_pin = Pin::new_unchecked(p_ctx.as_mut());
+                    ctx_pin.try_init_demand(demand)
                 };
-                let x = this.buffer_.state().enqueue_consumer(demand);
+                let Result::Ok(demand_ref) = try_init else { continue; };
+                let x = ring_buf.state().enqueue_consumer(demand_ref);
                 assert!(x)
             }
         }
