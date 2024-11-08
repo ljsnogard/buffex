@@ -3,6 +3,7 @@
     future::{Future, IntoFuture},
     marker::PhantomData,
     pin::Pin,
+    ptr::NonNull,
     task::{Context, Poll},
 };
 
@@ -15,42 +16,48 @@ use asyncex::x_deps::{abs_sync, atomex};
 use atomex::TrCmpxchOrderings;
 
 use super::{
-    buffer_::{RingBuffer, TxError},
+    buffer_::{IoCtx, RingBuffer, TxError},
     reclaim_::ReclSliceMut,
     sync_::*,
     Dual,
 };
 
-pub struct BuffWrite<B, P, T, O>(B, PhantomData<RingBuffer<P, T, O>>)
+pub struct BuffWrite<X, B, P, T, O>(X, PhantomData<IoCtx<B, P, T, O>>)
 where
+    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
     O: TrCmpxchOrderings;
 
-impl<B, P, T, O> BuffWrite<B, P, T, O>
+impl<X, B, P, T, O> BuffWrite<X, B, P, T, O>
 where
+    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    pub(super) const fn new(buff: B) -> Self {
-        BuffWrite(buff, PhantomData)
+    pub(super) const fn new(ctx: X) -> Self {
+        BuffWrite(ctx, PhantomData)
     }
 
     pub fn try_write(
         &mut self,
         length: usize,
     ) -> Result<Dual<ReclSliceMut<'_, P, T, O>>, TxError<usize>> {
-        self.0.borrow().try_write_(length)
+        self.0.borrow_mut().buffer().try_write_(length)
     }
 
     pub fn write_async(
         &mut self,
         length: usize,
     ) -> WriteAsync<'_, B, P, T, O> {
-        WriteAsync::new(self.0.borrow(), length)
+        let io_ctx = unsafe {
+            let mut pointer = NonNull::new_unchecked(self.0.borrow_mut());
+            Pin::new_unchecked(pointer.as_mut())
+        };
+        WriteAsync::new(io_ctx, length)
     }
 
     #[inline(always)]
@@ -59,32 +66,38 @@ where
     }
 }
 
-impl<B, P, T, O> Drop for BuffWrite<B, P, T, O>
+impl<X, B, P, T, O> Drop for BuffWrite<X, B, P, T, O>
 where
+    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
     O: TrCmpxchOrderings,
 {
     fn drop(&mut self) {
-        self.0.borrow().state().mark_producer_closed()
+        let ctx = self.0.borrow_mut();
+        if ctx.use_count().dec() == 1usize {
+            ctx.buffer().state().mark_producer_closed();
+        }
     }
 }
 
-impl<B, P, T, O> Borrow<RingBuffer<P, T, O>> for BuffWrite<B, P, T, O>
+impl<X, B, P, T, O> Borrow<RingBuffer<P, T, O>> for BuffWrite<X, B, P, T, O>
 where
+    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
     O: TrCmpxchOrderings,
 {
     fn borrow(&self) -> &RingBuffer<P, T, O> {
-        self.0.borrow()
+        self.0.borrow().buffer()
     }
 }
 
-impl<B, P, T, O> TrBuffIterWrite<T> for BuffWrite<B, P, T, O>
+impl<X, B, P, T, O> TrBuffIterWrite<T> for BuffWrite<X, B, P, T, O>
 where
+    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
@@ -101,8 +114,9 @@ where
     }
 }
 
-impl<B, P, T, O> TrBuffIterTryWrite<T> for BuffWrite<B, P, T, O>
+impl<X, B, P, T, O> TrBuffIterTryWrite<T> for BuffWrite<X, B, P, T, O>
 where
+    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
@@ -124,8 +138,7 @@ where
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    _writer: PhantomData<&'a mut BuffWrite<B, P, T, O>>,
-    buffer_: &'a RingBuffer<P, T, O>,
+    io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
     length_: usize,
 }
 
@@ -138,12 +151,11 @@ where
 {
     #[inline(always)]
     pub(super) fn new(
-        buffer: &'a RingBuffer<P, T, O>,
+        io_ctx: Pin<&'a mut IoCtx<B, P, T, O>>,
         length: usize,
     ) -> Self {
         WriteAsync {
-            _writer: PhantomData,
-            buffer_: buffer,
+            io_ctx_: io_ctx,
             length_: length,
         }
     }
@@ -156,7 +168,7 @@ where
     where
         C: TrCancellationToken,
     {
-        WriteFuture::new(self.buffer_, cancel, self.length_)
+        WriteFuture::new(self.io_ctx_, self.length_, cancel)
     }
 }
 
@@ -172,7 +184,7 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         let cancel = NonCancellableToken::pinned();
-        WriteFuture::new(self.buffer_, cancel, self.length_)
+        WriteFuture::new(self.io_ctx_, self.length_, cancel)
     }
 }
 
@@ -207,82 +219,13 @@ where
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    buffer_: &'a RingBuffer<P, T, O>,
+    io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
     cancel_: Pin<&'a mut C>,
     length_: usize,
     #[pin]demand_: Option<Demand<O>>,
-    _use_b_: PhantomData<&'a mut BuffWrite<B, P, T, O>>,
 }
 
-impl<'a, C, B, P, T, O> WriteFuture<'a, C, B, P, T, O>
-where
-    C: TrCancellationToken,
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    fn new(
-        buffer: &'a RingBuffer<P, T, O>,
-        cancel: Pin<&'a mut C>,
-        length: usize,
-    ) -> Self {
-        WriteFuture {
-            buffer_: buffer,
-            cancel_: cancel,
-            length_: length,
-            demand_: Option::None,
-            _use_b_: PhantomData,
-        }
-    }
-
-    async fn write_async_(
-        self: Pin<&mut Self>,
-    ) -> Result<Dual<ReclSliceMut<'a, P, T, O>>, TxError<usize>> {
-        let mut this = self.project();
-        let length = *this.length_;
-        let try_write = this.buffer_.try_write_(length);
-        let Result::Err(write_err) = try_write else {
-            return try_write;
-        };
-        let TxError::Stuffed(_) = write_err else {
-            return Result::Err(write_err);
-        };
-        loop {
-            if let Option::Some(demand) = this.demand_.as_ref().get_ref() {
-                let x = this.buffer_.state().check_producer(demand);
-                assert!(x, "[WriteFuture::write_async_] check_producer");
-                let sign_recv = demand.signal.peeker();
-                pin_mut!(sign_recv);
-                let x = sign_recv
-                    .peek_async()
-                    .may_cancel_with(this.cancel_.as_mut())
-                    .await;
-                let _ = this.buffer_.state().abort_producer(demand);
-                return if x.is_ok() {
-                    this.buffer_.try_write_(length)
-                } else {
-                    
-                    Result::Err(TxError::Stuffed(0usize))
-                }
-            } else {
-                let opt = unsafe { this.demand_.as_mut().get_unchecked_mut() };
-                let demand = Demand::new(
-                    &mut |s| Demand::producer_check(s),
-                );
-                let replaced = opt.replace(demand);
-                assert!(replaced.is_none());
-                let Option::Some(demand) = opt.as_mut() else {
-                    unreachable!("[WriteFuture::write_async_] opt")
-                };
-                let x = this.buffer_.state().enqueue_producer(demand);
-                assert!(x)
-            }
-        }
-    }
-}
-
-impl<'a, C, B, P, T, O> Future  for WriteFuture<'a, C, B, P, T, O>
+impl<'a, C, B, P, T, O> Future for WriteFuture<'a, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
@@ -296,5 +239,84 @@ where
         let f = self.write_async_();
         pin_mut!(f);
         f.poll(cx)
+    }
+}
+
+impl<'a, C, B, P, T, O> WriteFuture<'a, C, B, P, T, O>
+where
+    C: TrCancellationToken,
+    B: Borrow<RingBuffer<P, T, O>>,
+    P: BorrowMut<[T]>,
+    T: Clone,
+    O: TrCmpxchOrderings,
+{
+    fn new(
+        io_ctx: Pin<&'a mut IoCtx<B, P, T, O>>,
+        length: usize,
+        cancel: Pin<&'a mut C>,
+    ) -> Self {
+        WriteFuture {
+            io_ctx_: io_ctx,
+            cancel_: cancel,
+            length_: length,
+            demand_: Option::None,
+        }
+    }
+
+    async fn write_async_(
+        self: Pin<&mut Self>,
+    ) -> Result<Dual<ReclSliceMut<'a, P, T, O>>, TxError<usize>> {
+        let this = self.project();
+        let mut p_ctx = unsafe {
+            let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
+            NonNull::new_unchecked(ptr)
+        };
+        let p_ring_buf = unsafe { 
+            let ring_buf = p_ctx.as_ref().buffer();
+            let ptr = ring_buf as *const _ as *mut RingBuffer<P, T, O>;
+            NonNull::new_unchecked(ptr)
+        };
+        let try_write = unsafe {
+            p_ring_buf.as_ref().try_write_(*this.length_)
+        };
+        let Result::Err(write_err) = try_write else {
+            return try_write;
+        };
+        let TxError::Stuffed(_) = write_err else {
+            return Result::Err(write_err);
+        };
+        let mut check = move |s: &RwState<O>| {
+            Demand::<O>::producer_check(s)
+        };
+        loop {
+            let buf_ref = unsafe { p_ring_buf.as_ref() };
+            if let Option::Some(demand) = this.demand_.as_ref().get_ref() {
+                let x = buf_ref.state().check_producer(demand);
+                assert!(x, "[WriteFuture::write_async_] check_producer");
+                let sign_recv = demand.signal.peeker();
+                pin_mut!(sign_recv);
+                let x = sign_recv
+                    .peek_async()
+                    .may_cancel_with(this.cancel_.as_mut())
+                    .await;
+                let _ = buf_ref.state().abort_producer(demand);
+                return if x.is_ok() {
+                    unsafe { p_ring_buf.as_ref().try_write_(*this.length_) }
+                } else {
+                    Result::Err(TxError::Stuffed(0usize))
+                }
+            } else {
+                let demand = Demand::new(&mut check);
+                let try_init = unsafe {
+                    let ctx_pin = Pin::new_unchecked(p_ctx.as_mut());
+                    ctx_pin.try_init_demand(demand)
+                };
+                let Result::Ok(demand_ref) = try_init else { continue; };
+                let x = buf_ref.state().enqueue_producer(demand_ref);
+                #[cfg(test)]
+                log::trace!("[WriteFuture::write_async_] enqueued");
+                assert!(x)
+            }
+        }
     }
 }

@@ -8,12 +8,13 @@ use atomex::{
 use core_malloc::CoreAlloc;
 use mm_ptr::{Shared, Owned};
 
-use asyncex::x_deps::{abs_sync, atomex, mm_ptr};
+use asyncex::x_deps::{atomex, mm_ptr};
 
-use crate::ring_buffer::*;
+use crate::ring_buffer::{*, buffer_::IoCtx};
 
-async fn chunk_writer_<B, P, T, O>(writer: BuffWrite<B, P, T, O>)
+async fn chunk_writer_<X, B, P, T, O>(writer: BuffWrite<X, B, P, T, O>)
 where
+    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: funty::Unsigned + TryFrom<usize> + Copy,
@@ -48,14 +49,15 @@ where
     log::info!("chunk writer exits");
 }
 
-async fn reader_filler_<B, P, T, O>(reader: BuffRead<B, P, T, O>)
+async fn reader_filler_<X, B, P, T, O>(reader: BuffRead<X, B, P, T, O>)
 where
+    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: funty::Unsigned + TryInto<usize> + Copy,
     O: TrCmpxchOrderings,
 {
-    let capacity = reader.buffer().capacity();
+    let capacity = reader.as_ref().capacity();
     let mut filler = BuffReadAsChunkFiller::new(reader);
     let mut span_length = 1usize;
     loop {
@@ -102,7 +104,7 @@ async fn u8_fill_copy_async_smoke() {
 
     let ring_buff = Shared::new(ring_buff, CoreAlloc::new());
     let Result::Ok((writer, reader)) = RingBuffer
-        ::try_split_from_shared(ring_buff)
+        ::try_split(ring_buff, Shared::strong_count, Shared::weak_count)
     else {
         panic!("[chunk_::u8_fill_copy_async_smoke] try_split_shared");
     };
@@ -130,7 +132,7 @@ async fn u16_fill_copy_async_smoke() {
 
     let ring_buff = Shared::new(ring_buff, CoreAlloc::new());
     let Result::Ok((writer, reader)) = RingBuffer
-        ::try_split_from_shared(ring_buff)
+        ::try_split(ring_buff, Shared::strong_count, Shared::weak_count)
     else {
         panic!("[chunk_::u16_fill_copy_async_smoke] try_split_shared");
     };
@@ -158,7 +160,7 @@ async fn u32_fill_copy_async_smoke() {
 
     let ring_buff = Shared::new(ring_buff, CoreAlloc::new());
     let Result::Ok((writer, reader)) = RingBuffer
-        ::try_split_from_shared(ring_buff)
+        ::try_split(ring_buff, Shared::strong_count, Shared::weak_count)
     else {
         panic!("[chunk_::u32_fill_copy_async_smoke] try_split_shared");
     };

@@ -6,21 +6,18 @@
     ops::Deref,
     pin::Pin,
     ptr::NonNull,
+    sync::atomic::AtomicUsize,
 };
 
-use abs_mm::mem_alloc::TrMalloc;
-use atomex::{StrictOrderings, TrCmpxchOrderings};
-use mm_ptr::{
-    x_deps::{abs_mm, atomex},
-    Shared,
-};
-use asyncex::x_deps::mm_ptr;
+use atomex::{AtomicCountOwned, StrictOrderings, TrCmpxchOrderings};
+use asyncex::x_deps::atomex;
 
 use super::{
-    reader_::BuffRead,
+    read_::BuffRead,
     reclaim_::{ReaderForwardFn, ReclSliceMut, ReclSliceRef, WriterForwardFn},
-    sync_::*,
-    writer_::BuffWrite, Dual, TrRingBuffer
+    sync_::{BuffState, Demand},
+    write_::BuffWrite,
+    Dual, TrRingBuffer,
 };
 
 #[derive(Debug)]
@@ -73,8 +70,11 @@ where
     T: fmt::Debug,
 {}
 
-type IoPair<B, P, T, O> = (BuffWrite<B, P, T, O>, BuffRead<B, P, T, O>);
-type TrySplitResult<B, P, T, O> = Result<IoPair<B, P, T, O>, B>;
+type IoPair<X, B, P, T, O> = (
+    BuffWrite<X, B, P, T, O>,
+    BuffRead<X, B, P, T, O>,
+);
+type TrySplitResult<X, B, P, T, O> = Result<IoPair<X, B, P, T, O>, B>;
 
 pub struct RingBuffer<P, T = u8, O = StrictOrderings>(BuffState<P, T, O>)
 where
@@ -95,26 +95,13 @@ where
 
     pub fn split(
         ring_buff: &mut Self,
-    ) -> IoPair<&'_ mut Self, P, T, O> {
-        unsafe { 
-            let mut p = NonNull::new_unchecked(ring_buff);
-            let writer = BuffWrite::new(p.as_mut());
-            let reader = BuffRead::new(p.as_mut());
-            (writer, reader)
+    ) -> IoPair<IoCtx<&'_ Self, P, T, O>, &'_ Self, P, T, O> {
+        unsafe {
+            let mut buffer = NonNull::new_unchecked(ring_buff);
+            let i = buffer.as_mut().input();
+            let o = buffer.as_mut().output();
+            (i, o)
         }
-    }
-
-    pub fn try_split_from_shared<A: TrMalloc + Clone>(
-        ring_buff: Shared<Self, A>,
-    ) -> TrySplitResult<Shared<Self, A>, P, T, O>
-    where
-        T: Send + Sync,
-    {
-        Self::try_split_from(
-            ring_buff,
-            Shared::strong_count,
-            Shared::weak_count,
-        )
     }
 
     /// Split a `RingBuffer` shared by the smart pointer `S`, where `S` can be
@@ -122,11 +109,11 @@ where
     /// 
     /// ## Safety
     /// * `strong_count` and `weak_count` can make a cheat.
-    pub fn try_split_from<S>(
+    pub fn try_split<S>(
         ring_buff: S,
         strong_count: impl FnOnce(&S) -> usize,
         weak_count: impl FnOnce(&S) -> usize,
-    ) -> TrySplitResult<S, P, T, O>
+    ) -> TrySplitResult<IoCtx<S, P, T, O>, S, P, T, O>
     where
         S: Borrow<Self> + Deref<Target = Self> + Clone + Send + Sync,
     {
@@ -134,9 +121,9 @@ where
         if x {
             Result::Err(ring_buff)
         } else {
-            let writer = BuffWrite::new(ring_buff.clone());
-            let reader = BuffRead::new(ring_buff);
-            Result::Ok((writer, reader))
+            let i = BuffWrite::new(IoCtx::new(ring_buff.clone()));
+            let o = BuffRead::new(IoCtx::new(ring_buff));
+            Result::Ok((i, o))
         }
     }
 
@@ -150,12 +137,12 @@ where
         self.0.data_size()
     }
 
-    pub fn writer(&mut self) -> BuffWrite<&'_ mut Self, P, T, O> {
-        BuffWrite::new(self)
+    pub fn input(&mut self) -> BuffWrite<IoCtx<&Self, P, T, O>, &Self, P, T, O> {
+        BuffWrite::new(IoCtx::new(self))
     }
 
-    pub fn reader(&mut self) -> BuffRead<&'_ mut Self, P, T, O> {
-        BuffRead::new(self)
+    pub fn output(&mut self) -> BuffRead<IoCtx<&Self, P, T, O>, &Self, P, T, O> {
+        BuffRead::new(IoCtx::new(self))
     }
 }
 
@@ -239,8 +226,8 @@ where
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    type Input<'a> = BuffWrite<&'a mut Self, P, T, O> where Self: 'a;
-    type Output<'a> = BuffRead<&'a mut Self, P, T, O> where Self: 'a;
+    type Input<'a> = BuffWrite<IoCtx<&'a Self, P, T, O>, &'a Self, P, T, O> where Self: 'a;
+    type Output<'a> = BuffRead<IoCtx<&'a Self, P, T, O>, &'a Self, P, T, O> where Self: 'a;
 
     #[inline]
     fn capacity(&self) -> usize {
@@ -260,7 +247,7 @@ where
     }
 }
 
-pub(super) struct DemandCtx<B, P, T, O>
+pub struct IoCtx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
@@ -271,36 +258,42 @@ where
     _use_p_: PhantomData<P>,
     _use_t_: PhantomData<[T]>,
     buffer_: B,
+    usecnt_: AtomicCountOwned<usize>,
     demand_: Option<Demand<O>>,
 }
 
-impl<B, P, T, O> DemandCtx<B, P, T, O>
+impl<B, P, T, O> IoCtx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    pub const fn new(buffer: B) -> Self {
-        DemandCtx {
+    pub(super) const fn new(buffer: B) -> Self {
+        IoCtx {
             _pinned: PhantomPinned,
             _use_p_: PhantomData,
             _use_t_: PhantomData,
             buffer_: buffer,
+            usecnt_: AtomicCountOwned::new(AtomicUsize::new(0usize)),
             demand_: Option::None,
         }
     }
 
-    pub fn buffer(&self) -> &RingBuffer<P, T, O> {
+    pub(super) fn buffer(&self) -> &RingBuffer<P, T, O> {
         self.buffer_.borrow()
     }
 
+    pub(super) fn use_count(&self) -> &AtomicCountOwned<usize> {
+        &self.usecnt_
+    }
+
     #[inline]
-    pub fn demand(&self) -> Option<&Demand<O>> {
+    pub(super) fn demand(&self) -> Option<&Demand<O>> {
         self.demand_.as_ref()
     }
 
-    pub fn try_init_demand(
+    pub(super) fn try_init_demand(
         self: Pin<&mut Self>,
         demand: Demand<O>,
     ) -> Result<&Demand<O>, Demand<O>> {
@@ -317,7 +310,7 @@ where
     }
 }
 
-impl<B, P, T, O> AsMut<B> for DemandCtx<B, P, T, O>
+impl<B, P, T, O> AsMut<B> for IoCtx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
@@ -337,17 +330,20 @@ mod tests_ {
         x_deps::funty,
         TrCmpxchOrderings,
     };
+
     use core_malloc::CoreAlloc;
     use mm_ptr::{Shared, Owned};
     use asyncex::x_deps::{mm_ptr, atomex};
-    use crate::ring_buffer::*;
+
+    use crate::ring_buffer::{*, buffer_::IoCtx};
 
     /// 向 buffer 中写入 [1][1,2][1,2,3]...[1,2,..,max_step - 1, max_step]
-    async fn write_seq_<B, P, T, O>(
-        mut buffer: BuffWrite<B, P, T, O>,
+    async fn write_seq_<X, B, P, T, O>(
+        mut buffer: BuffWrite<X, B, P, T, O>,
         max_len: usize,
     )
     where
+        X: BorrowMut<IoCtx<B, P, T, O>>,
         B: Borrow<RingBuffer<P, T, O>>,
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryFrom<usize> + Copy,
@@ -393,14 +389,15 @@ mod tests_ {
         log::trace!("writer exits")
     }
 
-    async fn reader_<B, P, T, O>(mut reader: BuffRead<B, P, T, O>)
+    async fn reader_<X, B, P, T, O>(mut reader: BuffRead<X, B, P, T, O>)
     where
+        X: BorrowMut<IoCtx<B, P, T, O>>,
         B: Borrow<RingBuffer<P, T, O>>,
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryInto<usize> + Copy,
         O: TrCmpxchOrderings,
     {
-        let capacity = reader.buffer().capacity();
+        let capacity = reader.as_ref().capacity();
         let mut step = capacity;
         let mut c = 0usize;
         let mut span_length = 1usize;
@@ -476,7 +473,7 @@ mod tests_ {
 
         let ring_buff = Shared::new(ring_buff, CoreAlloc::new());
         let Result::Ok((writer, reader)) = RingBuffer
-            ::try_split_from_shared(ring_buff)
+            ::try_split(ring_buff, Shared::strong_count, Shared::weak_count)
         else {
             panic!("[tests_::u8_read_write_async_smoke] try_split_shared");
         };
@@ -504,7 +501,7 @@ mod tests_ {
 
         let ring_buff = Shared::new(ring_buff, CoreAlloc::new());
         let Result::Ok((writer, reader)) = RingBuffer
-            ::try_split_from_shared(ring_buff)
+            ::try_split(ring_buff, Shared::strong_count, Shared::weak_count)
         else {
             panic!("[tests_::u16_read_write_async_smoke] try_split_shared");
         };
@@ -532,7 +529,7 @@ mod tests_ {
 
         let ring_buff = Shared::new(ring_buff, CoreAlloc::new());
         let Result::Ok((writer, reader)) = RingBuffer
-            ::try_split_from_shared(ring_buff)
+            ::try_split(ring_buff, Shared::strong_count, Shared::weak_count)
         else {
             panic!("[tests_::u32_read_write_async_smoke] try_split_shared");
         };
