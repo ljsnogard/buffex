@@ -1,7 +1,7 @@
 ﻿use core::borrow::BorrowMut;
 
+use asyncex_channel::x_deps::atomex;
 use atomex::TrCmpxchOrderings;
-use asyncex::x_deps::atomex;
 
 use crate::slices::{SliceMut, SliceRef};
 use super::buffer_::RingBuffer;

@@ -8,7 +8,7 @@ use atomex::{
 use core_malloc::CoreAlloc;
 use mm_ptr::{Shared, Owned};
 
-use asyncex::x_deps::{atomex, mm_ptr};
+use asyncex_channel::x_deps::{atomex, mm_ptr};
 
 use crate::ring_buffer::{*, buffer_::IoCtx};
 

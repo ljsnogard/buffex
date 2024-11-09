@@ -14,9 +14,9 @@ pub mod slices;
 
 pub mod x_deps {
     pub use abs_buff;
-    pub use asyncex;
+    pub use asyncex_channel;
 
-    pub use asyncex::x_deps::{abs_sync, atomex, atomic_sync};
+    pub use asyncex_channel::x_deps::{abs_sync, atomex, atomic_sync};
 
     pub use smallvec;
 }

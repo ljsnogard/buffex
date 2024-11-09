@@ -9,8 +9,8 @@
     sync::atomic::AtomicUsize,
 };
 
-use atomex::{AtomicCountOwned, StrictOrderings, TrCmpxchOrderings};
-use asyncex::x_deps::atomex;
+use atomex::{AtomicCount, StrictOrderings, TrCmpxchOrderings};
+use asyncex_channel::x_deps::atomex;
 
 use super::{
     read_::BuffRead,
@@ -20,10 +20,16 @@ use super::{
     Dual, TrRingBuffer,
 };
 
+/// Error that may occur while operating with the output end of the ring buffer.
 #[derive(Debug)]
 pub enum RxError<T> {
+    /// Illegal argument.
     Argument,
+
+    /// The input end has closed and the ring buffer is already empty.
     Closing,
+
+    /// The ring buffer is empty and thus temporarily unable to output
     Drained(T),
 }
 
@@ -45,10 +51,16 @@ where
     T: fmt::Debug,
 {}
 
+/// Error that may occur while operating with the input end of the ring buffer.
 #[derive(Debug)]
 pub enum TxError<T> {
+    /// Illegal argument.
     Argument,
+
+    /// The output end has closed and buffer is already full.
     Closing,
+
+    /// The ring buffer is full and thus temporarily unable to input.
     Stuffed(T),
 }
 
@@ -108,7 +120,8 @@ where
     /// `Arc<T>` or `Shared<T>`, and when strong count is 1 and weak count is 0.
     /// 
     /// ## Safety
-    /// * `strong_count` and `weak_count` can make a cheat.
+    /// 
+    /// * Don't cheat on `strong_count` and `weak_count`.
     pub fn try_split<S>(
         ring_buff: S,
         strong_count: impl FnOnce(&S) -> usize,
@@ -121,8 +134,14 @@ where
         if x {
             Result::Err(ring_buff)
         } else {
-            let i = BuffWrite::new(IoCtx::new(ring_buff.clone()));
-            let o = BuffRead::new(IoCtx::new(ring_buff));
+            let i = BuffWrite::new(IoCtx::new(
+                ring_buff.clone(),
+                IoCtxState::closing_flag(),
+            ));
+            let o = BuffRead::new(IoCtx::new(
+                ring_buff,
+                IoCtxState::closing_flag(),
+            ));
             Result::Ok((i, o))
         }
     }
@@ -137,12 +156,22 @@ where
         self.0.data_size()
     }
 
-    pub fn input(&mut self) -> BuffWrite<IoCtx<&Self, P, T, O>, &Self, P, T, O> {
-        BuffWrite::new(IoCtx::new(self))
+    /// Get the `BuffWrite` instance associated with this ring buffer.
+    /// Dropping it will not cause rx end receiving `RxError::Closing`.
+    pub fn input(
+        &mut self,
+    ) -> BuffWrite<IoCtx<&Self, P, T, O>, &Self, P, T, O> {
+        let ctx_st = IoCtxState::no_close_flag();
+        BuffWrite::new(IoCtx::new(self, ctx_st))
     }
 
-    pub fn output(&mut self) -> BuffRead<IoCtx<&Self, P, T, O>, &Self, P, T, O> {
-        BuffRead::new(IoCtx::new(self))
+    /// Get the `BuffRead` instance associated with this ring buffer.
+    /// Dropping it will not cause tx end receiving `RxError::Closing`.
+    pub fn output(
+        &mut self,
+    ) -> BuffRead<IoCtx<&Self, P, T, O>, &Self, P, T, O> {
+        let ctx_st = IoCtxState::no_close_flag();
+        BuffRead::new(IoCtx::new(self, ctx_st))
     }
 }
 
@@ -258,7 +287,7 @@ where
     _use_p_: PhantomData<P>,
     _use_t_: PhantomData<[T]>,
     buffer_: B,
-    usecnt_: AtomicCountOwned<usize>,
+    ctx_st_: IoCtxState,
     demand_: Option<Demand<O>>,
 }
 
@@ -269,13 +298,13 @@ where
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    pub(super) const fn new(buffer: B) -> Self {
+    pub(super) const fn new(buffer: B, ctx_st: IoCtxState) -> Self {
         IoCtx {
             _pinned: PhantomPinned,
             _use_p_: PhantomData,
             _use_t_: PhantomData,
             buffer_: buffer,
-            usecnt_: AtomicCountOwned::new(AtomicUsize::new(0usize)),
+            ctx_st_: ctx_st,
             demand_: Option::None,
         }
     }
@@ -284,8 +313,8 @@ where
         self.buffer_.borrow()
     }
 
-    pub(super) fn use_count(&self) -> &AtomicCountOwned<usize> {
-        &self.usecnt_
+    pub(super) fn state(&self) -> &IoCtxState {
+        &self.ctx_st_
     }
 
     #[inline]
@@ -322,6 +351,85 @@ where
     }
 }
 
+pub(super) struct IoCtxState(AtomicUsize);
+
+impl IoCtxState {
+    /// Set the MSB to 1 to flag NO_CLOSE
+    const NO_CLOSE_FLAG: usize = 1usize << (usize::BITS - 1);
+
+    const fn closing_flag() -> Self {
+        Self(AtomicUsize::new(0usize))
+    }
+
+    const fn no_close_flag() -> Self {
+        Self(AtomicUsize::new(Self::NO_CLOSE_FLAG))
+    }
+
+    #[inline(always)]
+    fn atomic_count_(&self) -> AtomicCount<usize, &mut AtomicUsize> {
+        let x = self as *const _ as *mut Self;
+        unsafe { AtomicCount::new(&mut (*x).0) }
+    }
+
+    #[inline(always)]
+    fn get_use_count_(s: usize) -> usize {
+        s & (!Self::NO_CLOSE_FLAG)
+    }
+
+    /// Returns if the flag indicate the input or output end should close;
+    /// true, should close, false, no close.
+    #[inline(always)]
+    pub fn test_closing_flagged(s: usize) -> bool {
+        s | (!Self::NO_CLOSE_FLAG) != usize::MAX
+    }
+
+    pub fn incr_use_count(&self) -> IoCtrl {
+        let c = self.atomic_count_().inc();
+        IoCtrl::NoOp(Self::get_use_count_(c))
+    }
+
+    pub fn decr_use_count(&self) -> IoCtrl {
+        let s = self.atomic_count_().dec();
+        let c = Self::get_use_count_(s);
+        if c == 1 && Self::test_closing_flagged(s) {
+            IoCtrl::MarkClose(c)
+        } else {
+            IoCtrl::NoOp(c)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum IoCtrl {
+    MarkClose(usize),
+    NoOp(usize),
+}
+
+impl IoCtrl {
+    #[allow(dead_code)]
+    pub const fn use_count(&self) -> usize {
+        match self {
+            Self::MarkClose(c) => *c,
+            Self::NoOp(c) => *c,
+        }
+    }
+}
+
+impl fmt::Display for IoCtrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IoCtrl::MarkClose(c) => {
+                let c = *c;
+                write!(f, "IoCtrl::MarkClose({c})")
+            }
+            IoCtrl::NoOp(c) => {
+                let c = *c;
+                write!(f, "IoCtrl::NoOp({c})")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests_ {
     use core::borrow::{Borrow, BorrowMut};
@@ -333,11 +441,11 @@ mod tests_ {
 
     use core_malloc::CoreAlloc;
     use mm_ptr::{Shared, Owned};
-    use asyncex::x_deps::{mm_ptr, atomex};
+    use asyncex_channel::x_deps::{mm_ptr, atomex};
 
     use crate::ring_buffer::{*, buffer_::IoCtx};
 
-    /// 向 buffer 中写入 [1][1,2][1,2,3]...[1,2,..,max_step - 1, max_step]
+    /// 向 buffer 中写入 [0][0,1][0,1,2]...[0,1,..,max_step - 2, max_step - 1]
     async fn write_seq_<X, B, P, T, O>(
         mut buffer: BuffWrite<X, B, P, T, O>,
         max_len: usize,

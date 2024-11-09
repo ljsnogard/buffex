@@ -14,17 +14,18 @@ use abs_buff::{
     TrBuffIterPeek, TrBuffIterRead, TrBuffIterTryPeek, TrBuffIterTryRead,
 };
 use abs_sync::{cancellation::*, x_deps::pin_utils};
-use asyncex::x_deps::{abs_sync, atomex};
+use asyncex_channel::x_deps::{abs_sync, atomex};
 use atomex::TrCmpxchOrderings;
 
 use super::{
-    buffer_::{IoCtx, RingBuffer, RxError},
+    buffer_::{IoCtrl, IoCtx, RingBuffer, RxError},
     peek_::{BuffPeek, PeekAsync},
     reclaim_::ReclSliceRef,
     sync_::{Demand, RwState},
     Dual,
 };
 
+/// To move data from, or to put data out of, the ring buffer.
 pub struct BuffRead<X, B, P, T, O>(X, PhantomData<IoCtx<B, P, T, O>>)
 where
     X: BorrowMut<IoCtx<B, P, T, O>>,
@@ -41,7 +42,8 @@ where
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    pub(super) const fn new(ctx: X) -> Self {
+    pub(super) fn new(ctx: X) -> Self {
+        ctx.borrow().state().incr_use_count();
         BuffRead(ctx, PhantomData)
     }
 
@@ -81,7 +83,7 @@ where
         &mut self,
     ) -> BuffPeek<&mut IoCtx<B, P, T, O>, B, P, T, O> {
         let ctx = self.0.borrow_mut();
-        ctx.use_count().inc();
+        ctx.state().incr_use_count();
         BuffPeek::new(ctx)
     }
 }
@@ -96,9 +98,12 @@ where
 {
     fn drop(&mut self) {
         let ctx = self.0.borrow_mut();
-        if ctx.use_count().dec() == 1usize {
+        let ctrl = ctx.state().decr_use_count();
+        if matches!(ctrl, IoCtrl::MarkClose(_)) {
             ctx.buffer().state().mark_consumer_closed()
         }
+        #[cfg(test)]
+        log::trace!("[BuffRead::Drop] ctrl({ctrl})");
     }
 }
 
@@ -292,6 +297,23 @@ where
     cancel_: Pin<&'a mut C>,
 }
 
+impl<'a, C, B, P, T, O> Future for ReadFuture<'a, C, B, P, T, O>
+where
+    C: TrCancellationToken,
+    B: Borrow<RingBuffer<P, T, O>>,
+    P: BorrowMut<[T]>,
+    T: Clone,
+    O: TrCmpxchOrderings,
+{
+    type Output = Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let f = self.read_async_();
+        pin_mut!(f);
+        f.poll(cx)
+    }
+}
+
 impl<'a, C, B, P, T, O> ReadFuture<'a, C, B, P, T, O>
 where
     C: TrCancellationToken,
@@ -300,7 +322,7 @@ where
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    fn new(
+    pub(super) const fn new(
         io_ctx: Pin<&'a mut IoCtx<B, P, T, O>>,
         length: usize,
         cancel: Pin<&'a mut C>,
@@ -339,16 +361,16 @@ where
         };
         loop {
             let ring_buf = unsafe { p_ring_buf.as_ref() };
-            if let Option::Some(demand) = this.io_ctx_.demand() {
-                let x = ring_buf.state().check_consumer(demand);
+            if let Option::Some(demand_ref) = this.io_ctx_.demand() {
+                let x = ring_buf.state().check_consumer(demand_ref);
                 assert!(x, "[ReadFuture::read_async_] check_consumer");
-                let sign_recv = demand.signal.peeker();
+                let sign_recv = demand_ref.signal.peeker();
                 pin_mut!(sign_recv);
                 let x = sign_recv
                     .peek_async()
                     .may_cancel_with(this.cancel_.as_mut())
                     .await;
-                let _ = ring_buf.state().abort_consumer(demand);
+                let _ = ring_buf.state().abort_consumer(demand_ref);
                 return if x.is_ok() {
                     unsafe { p_ring_buf.as_ref().try_read_(*this.length_) }
                 } else {
@@ -367,22 +389,5 @@ where
                 assert!(x)
             }
         }
-    }
-}
-
-impl<'a, C, B, P, T, O> Future for ReadFuture<'a, C, B, P, T, O>
-where
-    C: TrCancellationToken,
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    type Output = Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let f = self.read_async_();
-        pin_mut!(f);
-        f.poll(cx)
     }
 }

@@ -12,16 +12,17 @@ use pin_utils::pin_mut;
 
 use abs_buff::{TrBuffIterWrite, TrBuffIterTryWrite};
 use abs_sync::{cancellation::*, x_deps::pin_utils};
-use asyncex::x_deps::{abs_sync, atomex};
+use asyncex_channel::x_deps::{abs_sync, atomex};
 use atomex::TrCmpxchOrderings;
 
 use super::{
-    buffer_::{IoCtx, RingBuffer, TxError},
+    buffer_::{IoCtrl, IoCtx, RingBuffer, TxError},
     reclaim_::ReclSliceMut,
     sync_::*,
     Dual,
 };
 
+/// To move data into, or to put data into, the buffer.
 pub struct BuffWrite<X, B, P, T, O>(X, PhantomData<IoCtx<B, P, T, O>>)
 where
     X: BorrowMut<IoCtx<B, P, T, O>>,
@@ -38,7 +39,8 @@ where
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    pub(super) const fn new(ctx: X) -> Self {
+    pub(super) fn new(ctx: X) -> Self {
+        ctx.borrow().state().incr_use_count();
         BuffWrite(ctx, PhantomData)
     }
 
@@ -76,9 +78,12 @@ where
 {
     fn drop(&mut self) {
         let ctx = self.0.borrow_mut();
-        if ctx.use_count().dec() == 1usize {
+        let ctrl = ctx.state().decr_use_count();
+        if matches!(ctrl, IoCtrl::MarkClose(_)) {
             ctx.buffer().state().mark_producer_closed();
         }
+        #[cfg(test)]
+        log::trace!("[BuffWrite::Drop] ctrl({ctrl})");
     }
 }
 
@@ -188,8 +193,7 @@ where
     }
 }
 
-impl<'a, B, P, T, O> TrIntoFutureMayCancel<'a>
-for WriteAsync<'a, B, P, T, O>
+impl<'a, B, P, T, O> TrIntoFutureMayCancel<'a> for WriteAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
@@ -250,7 +254,7 @@ where
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    fn new(
+    pub(super) const fn new(
         io_ctx: Pin<&'a mut IoCtx<B, P, T, O>>,
         length: usize,
         cancel: Pin<&'a mut C>,

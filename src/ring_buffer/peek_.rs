@@ -12,16 +12,17 @@ use pin_utils::pin_mut;
 
 use abs_buff::{TrBuffIterPeek, TrBuffIterTryPeek};
 use abs_sync::{cancellation::*, x_deps::pin_utils};
-use asyncex::x_deps::{abs_sync, atomex};
+use asyncex_channel::x_deps::{abs_sync, atomex};
 use atomex::TrCmpxchOrderings;
 
 use super::{
-    buffer_::{IoCtx, RingBuffer, RxError},
+    buffer_::{IoCtrl, IoCtx, RingBuffer, RxError},
     reclaim_::ReclSliceRef,
     sync_::{Demand, RwState},
     Dual,
 };
 
+/// To copy data from, or to peek data stored in, the ring buffer.
 pub struct BuffPeek<X, B, P, T, O>(X, PhantomData<IoCtx<B, P, T, O>>)
 where
     X: BorrowMut<IoCtx<B, P, T, O>>,
@@ -38,18 +39,17 @@ where
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    pub(super) const fn new(ctx: X) -> Self {
+    pub(super) fn new(ctx: X) -> Self {
+        ctx.borrow().state().incr_use_count();
         BuffPeek(ctx, PhantomData)
     }
 
-    #[inline]
     pub fn try_peek(
         &mut self,
     ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
         self.0.borrow().buffer().try_peek_() 
     }
 
-    #[inline]
     pub fn peek_async(&mut self) -> PeekAsync<'_, B, P, T, O> {
         // Safe because IoCtx is !Unpin
         let io_ctx = unsafe {
@@ -70,9 +70,12 @@ where
 {
     fn drop(&mut self) {
         let ctx = self.0.borrow_mut();
-        if ctx.use_count().dec() == 1usize {
+        let ctrl = ctx.state().decr_use_count();
+        if matches!(ctrl, IoCtrl::MarkClose(_)) {
             ctx.buffer().state().mark_consumer_closed()
         }
+        #[cfg(test)]
+        log::trace!("[BuffPeek::Drop] ctrl({ctrl})");
     }
 }
 
@@ -216,7 +219,7 @@ where
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    fn new(
+    pub(super) const fn new(
         context: Pin<&'a mut IoCtx<B, P, T, O>>,
         cancel: Pin<&'a mut C>,
     ) -> Self {
@@ -246,7 +249,7 @@ where
         };
         let mut check = move |s: &RwState<O>| {
             let i = s.load_state();
-            i.reader_length > 0
+            i.rlen > 0
         };
         loop {
             let ring_buf = unsafe { p_ring_buf.as_ref() };

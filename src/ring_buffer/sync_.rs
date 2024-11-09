@@ -9,14 +9,14 @@
     sync::atomic::{AtomicPtr, AtomicUsize},
 };
 
+use asyncex_channel::{
+    oneshot::Oneshot,
+    x_deps::atomex,
+};
 use atomex::{
     x_deps::funty,
     AtomexPtrOwned, CmpxchResult, PhantomAtomicPtr, StrictOrderings,
     TrAtomicFlags, TrCmpxchOrderings,
-};
-use asyncex::{
-    channel::oneshot::Oneshot,
-    x_deps::atomex,
 };
 
 use super::{RxError, TxError, Dual};
@@ -104,12 +104,12 @@ where
 
     pub fn producer_check(state: &RwState<O>) -> bool {
         let i = state.load_state();
-        i.writer_length > 0usize
+        i.wlen > 0usize
     }
 
     pub fn consumer_check(state: &RwState<O>) -> bool {
         let i = state.load_state();
-        i.reader_length > 0usize
+        i.rlen > 0usize
     }
 }
 
@@ -186,17 +186,17 @@ where
     pub fn try_peek(
         &self,
     ) -> Result<Dual<NonNull<[T]>>, RxError<usize>> {
-        let state = self.rw_state_.load_state();
-        if state.reader_length == 0usize {
+        let info = self.rw_state_.load_state();
+        if info.rlen == 0usize {
             let e = if self.is_closing() {
                 RxError::Closing
             } else {
-                RxError::Drained(state.reader_offset)
+                RxError::Drained(info.roff)
             };
             Result::Err(e)
         } else {
             let length = self.capacity();
-            Result::Ok(self.pack_slice_read_(&state, length))
+            Result::Ok(self.pack_slice_read_(&info, length))
         }
     }
 
@@ -204,16 +204,16 @@ where
         &self,
         length: usize,
     ) -> Result<Dual<NonNull<[T]>>, RxError<usize>> {
-        let state = self.rw_state_.load_state();
-        if state.reader_length == 0usize {
+        let info = self.rw_state_.load_state();
+        if info.rlen == 0usize {
             let e = if self.is_closing() {
                 RxError::Closing
             } else {
-                RxError::Drained(state.reader_offset)
+                RxError::Drained(info.roff)
             };
             Result::Err(e)
         } else {
-            Result::Ok(self.pack_slice_read_(&state, length))
+            Result::Ok(self.pack_slice_read_(&info, length))
         }
     }
 
@@ -235,11 +235,11 @@ where
         length: usize,
     ) -> Result<BuffIoDelta<usize>, RxError<usize>> {
         let info = self.rw_state_.load_state();
-        if info.reader_length == 0usize {
+        if info.rlen == 0usize {
             let e = if self.is_closing() {
                 RxError::Closing
             } else {
-                RxError::Drained(info.reader_offset)
+                RxError::Drained(info.roff)
             };
             return Result::Err(e);
         };
@@ -251,11 +251,11 @@ where
         length: usize,
     ) -> Result<Dual<NonNull<[T]>>, TxError<usize>> {
         let s = self.rw_state_.load_state();
-        if s.writer_length == 0usize {
+        if s.wlen == 0usize {
             let e = if self.is_closing() {
                 TxError::Closing
             } else {
-                TxError::Stuffed(s.writer_offset)
+                TxError::Stuffed(s.woff)
             };
             Result::Err(e)
         } else {
@@ -281,16 +281,16 @@ where
         length: usize,
     ) -> Result<BuffIoDelta<usize>, TxError<usize>> {
         let state = self.rw_state_.load_state();
-        if state.writer_length == 0usize {
+        if state.wlen == 0usize {
             let e = if self.is_closing() {
                 TxError::Closing
             } else {
-                TxError::Stuffed(state.writer_offset)
+                TxError::Stuffed(state.woff)
             };
             return Result::Err(e);
         }
-        let src_len = if length > state.writer_length {
-            state.writer_length
+        let src_len = if length > state.wlen {
+            state.wlen
         } else {
             length
         };
@@ -299,28 +299,80 @@ where
 
     fn pack_slice_write_(
         &self,
-        state: &RwStateInfo<usize>,
+        i: &RwStateInfo<usize>,
         length: usize,
     ) -> Dual<NonNull<[T]>> {
-        todo!()
+        debug_assert!(i.wlen > 0usize);
+        let mut dual = Dual::new();
+        let mut buf_ptr = self.get_buff_non_null_();
+        unsafe {
+            let buf_mut: &mut [T] = buf_ptr.as_mut();
+
+            // Make sure the 1st slice will not exceed the amount needed.
+            let l0 = cmp::min(i.wlen, length);
+            let s0 = &mut buf_mut[i.woff..i.woff + l0];
+            dual.push(NonNull::new_unchecked(s0));
+
+            #[cfg(test)]
+            log::trace!("[BuffState::pack_slice_write_] i({i:?}), l0({l0})");
+
+            // length.saturating_sub(l0) is equivalent to:
+            // if l0 < length { length - l0 } else { 0 }
+            let l1 = length.saturating_sub(l0);
+            if l1 == 0usize || i.woff < i.roff {
+                return dual;
+            }
+            debug_assert!(i.woff >= i.roff);
+            debug_assert!(i.woff + l0 == buf_mut.len());
+            // Make sure the 2nd slice will not exceed the reader position;
+            let l1 = cmp::min(i.roff, length - l0);
+            let s1 = &mut buf_mut[..l1];
+            dual.push(NonNull::new_unchecked(s1));
+        }
+        dual
     }
 
     fn pack_slice_read_(
         &self,
-        state: &RwStateInfo<usize>,
+        i: &RwStateInfo<usize>,
         length: usize,
     ) -> Dual<NonNull<[T]>> {
-        todo!()
+        debug_assert!(i.rlen > 0usize);
+        let mut dual = Dual::new();
+        let mut buf_ptr = self.get_buff_non_null_();
+        unsafe {
+            let buf_mut: &mut [T] = buf_ptr.as_mut();
+
+            // Make sure the 1st slice will not exceed the tail of the buffer.
+            let l0 = cmp::min(i.rlen, length);
+            let s0 = &mut buf_mut[i.roff..i.roff + l0];
+            dual.push(NonNull::new_unchecked(s0));
+
+            #[cfg(test)]
+            log::trace!("[BuffState::pack_slice_read_] i({i:?}), l0({l0})");
+
+            // length.saturating_sub(l0) is equivalent to:
+            // if l0 < length { length - l0 } else { 0 }
+            let l1 = length.saturating_sub(l0);
+            if l1 == 0usize || i.roff < i.woff {
+                return dual;
+            }
+            debug_assert!(i.roff >= i.woff);
+            debug_assert!(i.roff + l0 == buf_mut.len());
+            // Make sure the 2nd slice will not exceed the writer position
+            let l1 = cmp::min(length - l0, i.woff);
+            let s1 = &mut buf_mut[..l1];
+            dual.push(NonNull::new_unchecked(s1));
+        }
+        dual
     }
 
-    #[inline(always)]
     pub fn mark_consumer_closed(&self) {
         let x = Self::mark_closed_(&self.consumer_);
         assert!(x.is_succ());
         self.try_signal_producer();
     }
 
-    #[inline(always)]
     pub fn mark_producer_closed(&self) {
         let x = Self::mark_closed_(&self.producer_);
         assert!(x.is_succ());
@@ -335,14 +387,12 @@ where
         cell.try_spin_compare_exchange_weak(expect, desire)
     }
 
-    #[inline(always)]
     pub fn enqueue_consumer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
         log::trace!("[BuffState::enqueue_consumer] {:p}", demand);
         Self::enqueue_demand_(&self.consumer_, demand)
     }
 
-    #[inline(always)]
     pub fn enqueue_producer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
         log::trace!("[BuffState::enqueue_producer] {:p}", demand);
@@ -361,7 +411,6 @@ where
 
     /// Tries to invoke `chk_fn` of demand in enqueued consumer cell, and move
     /// the demand to the `unsignal_` slot if it will not activate at this time.
-    #[inline(always)]
     pub fn check_consumer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
         log::trace!("[BuffState::check_consumer] {:p}", demand);
@@ -370,7 +419,6 @@ where
 
     /// Tries to invoke `chk_fn` of demand in enqueued producer cell, and move
     /// the demand to the `unsignal_` slot if it will not activate at this time.
-    #[inline(always)]
     pub fn check_producer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
         log::trace!("[BuffState::check_producer] {:p}", demand);
@@ -515,7 +563,7 @@ where
             .is_ok()
     }
 
-    fn get_buff_mut_(&self) -> NonNull<[T]> {
+    fn get_buff_non_null_(&self) -> NonNull<[T]> {
         let as_mut = unsafe { self.buf_cell_.get().as_mut() };
         let Option::Some(b) = as_mut else {
             unreachable!("[BuffState::get_buff_mut_] b")
@@ -527,7 +575,7 @@ where
     }
 
     pub fn buffer_data(&self) -> &[T] {
-        unsafe { self.get_buff_mut_().as_ref() }
+        unsafe { self.get_buff_non_null_().as_ref() }
     }
 }
 
@@ -538,7 +586,7 @@ where
     O: TrCmpxchOrderings,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let a = unsafe { self.get_buff_mut_().as_mut() };
+        let a = unsafe { self.get_buff_non_null_().as_mut() };
         let g = RwPosIoGuard::acquire(self, a);
         write!(f, "{}|{:?}", &self.rw_state_, g.deref())
     }
@@ -558,18 +606,22 @@ where
     O: TrCmpxchOrderings,
 {}
 
+#[derive(Debug)]
 pub(super) struct RwStateInfo<U>
 where
     U: funty::Unsigned,
 {
-    pub reader_offset: U,
-    pub writer_offset: U,
+    /// reader offset
+    pub roff: U,
 
-    /// Number of units available for reading
-    pub reader_length: U,
+    /// writer offset
+    pub woff: U,
 
-    /// Number of units available for writing
-    pub writer_length: U,
+    /// Max number of continuous units available for reading from offset
+    pub rlen: U,
+
+    /// Max number of continuous units available for writing from offset
+    pub wlen: U,
 }
 
 pub(super) struct RwState<O>
@@ -600,7 +652,7 @@ where
 
     #[inline]
     pub fn data_size(&self) -> usize {
-        self.load_state().reader_length
+        self.load_state().rlen
     }
 }
 
@@ -654,10 +706,10 @@ where
             (w - r, self.capacity_ - w)
         };
         RwStateInfo {
-            reader_offset: r,
-            writer_offset: w,
-            reader_length: l,
-            writer_length: a,
+            roff: r,
+            woff: w,
+            rlen: l,
+            wlen: a,
         }
     }
 
@@ -1022,7 +1074,7 @@ mod tests_ {
     };
     use core_malloc::CoreAlloc;
     use mm_ptr::Owned;
-    use asyncex::x_deps::{mm_ptr, atomex};
+    use asyncex_channel::x_deps::{mm_ptr, atomex};
     use crate::ring_buffer::{RxError, TxError};
 
     use super::{BuffState, RwState};
@@ -1038,10 +1090,10 @@ mod tests_ {
         assert!(!rw.is_io_busy());
         assert!(!RwState::<StrictOrderings>::expect_invert_true_(s));
         let info = rw.load_positions_(s);
-        assert_eq!(info.reader_offset, 0);
-        assert_eq!(info.writer_offset, 0);
-        assert_eq!(info.reader_length, 0);
-        assert_eq!(info.writer_length, BUFF_SIZE); 
+        assert_eq!(info.roff, 0);
+        assert_eq!(info.woff, 0);
+        assert_eq!(info.rlen, 0);
+        assert_eq!(info.wlen, BUFF_SIZE); 
 
         assert!(rw.try_set_io_busy(true).is_succ());
         assert!(rw.is_io_busy());
@@ -1109,129 +1161,126 @@ mod tests_ {
         assert!(buff.reader_forward(buf.len()).is_ok());
     }
 
-    fn writer_<P, T, O>(s: Arc<BuffState<P, T, O>>)
+    /// Write [0..1][0..2]..[0..max_len - 1]
+    fn writer_<P, T, O>(
+        s: Arc<BuffState<P, T, O>>,
+        max_len: usize,
+    )
     where
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryFrom<usize> + Copy,
         O: TrCmpxchOrderings,
     {
-        let capacity = s.capacity();
-        let mut step = 1usize;
-        let mut c = 0usize;
+        let mut seq_len = 1usize;
         loop {
-            if step > capacity {
+            if seq_len > max_len {
                 break;
             }
+            // generate [0..seq_len - 1]
             let source = Owned::new_slice(
-                step,
+                seq_len,
                 |u| { let Result::Ok(x) = T::try_from(u) else { panic!() }; x },
                 CoreAlloc::new(),
             );
             let mut wrote_len = 0usize;
+            // write all in [0..seq_len] into buffer
             loop {
                 let split = source.split_at(wrote_len);
                 let src = split.1;
                 match s.try_write(src.len()) {
                     Result::Ok(dual) => {
+                        let mut wc = 0usize;
                         for mut p in dual.into_iter() {
                             let dst = unsafe { p.as_mut() };
-                            let len = dst.len();
-                            assert!(len <= src.len());
-                            dst.clone_from_slice(src.split_at(len).0);
-                            wrote_len += len;
-                            c += len;
-                            let x = s.writer_forward(len);
+                            assert!(wc + dst.len() <= src.len());
+                            dst.clone_from_slice(&src[wc..wc + dst.len()]);
+                            wc += dst.len();
+                            let x = s.writer_forward(dst.len());
                             assert!(x.is_ok());
                         }
+                        wrote_len += wc;
                         if wrote_len == source.len() {
-                            // std::println!("writer #{step}: {:?} ({})", source.as_ref(), *s);
+                            log::trace!("writer #{seq_len}: {:?} ({})", source.as_ref(), *s);
                             break;
                         }
                     },
                     Result::Err(TxError::Stuffed(_)) => continue,
                     Result::Err(e) => panic!(
-                        "writer_: step({step}), {:?} - {:?}\n{e:?}",
+                        "writer_: step({seq_len}), {:?} - {:?}\n{e:?}",
                         split.0, split.1
                     ),
                 }
             }
-            if c >= step {
-                step += 1;
-                c = 0usize;
-            }
+            seq_len += 1;
         }
         s.mark_producer_closed();
         log::trace!("writer exits")
     }
 
-    fn reader_<P, T, O>(s: Arc<BuffState<P, T, O>>)
+    /// Read [0..1][0..2] with size-decreasing buffers, from max_len to 1
+    fn reader_<P, T, O>(
+        s: Arc<BuffState<P, T, O>>,
+        max_len: usize,
+    )
     where
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryInto<usize> + Copy,
         O: TrCmpxchOrderings,
     {
-        let capacity = s.capacity();
-        let mut step = capacity;
-        let mut c = 0usize;
-        let mut span_length = 1usize;
-        let mut span_offset = 0usize;
+        let mut seq_len = 1usize;
         loop {
-            if step == 0usize {
+            if seq_len > max_len {
                 break;
             }
+            // generate [0..seq_len - 1]
             let mut target = Owned::new_slice(
-                step,
+                seq_len,
                 |_| T::ZERO,
                 CoreAlloc::new(),
             );
             let mut read_len = 0usize;
+            // read [0..seq_len] from the buffer
             loop {
                 let split = target.split_at_mut(read_len);
-                let dst: &mut [T] = split.1;
+                let dst = split.1;
                 match s.try_read(dst.len()) {
                     Result::Ok(dual) => {
+                        let mut rc = 0usize;
                         for p in dual.into_iter() {
                             let src = unsafe { p.as_ref() };
-                            let len = src.len();
-                            assert!(len <= dst.len());
-                            dst[..len].clone_from_slice(src);
-                            read_len += len;
-                            c += len;
-                            let x = s.reader_forward(len);
+                            assert!(rc + src.len() <= dst.len());
+                            let tgt = &mut dst[rc..rc + src.len()];
+                            tgt.clone_from_slice(src);
+                            rc += src.len();
+                            let x = s.reader_forward(rc);
                             assert!(x.is_ok());
                         }
-                        if read_len == target.len() { break; }
+                        read_len += rc;
+                        if read_len == target.len() {
+                            log::trace!("reader #{seq_len}: {:?} ({})", target.as_ref(), *s);
+                            break;
+                        }
                     },
                     Result::Err(RxError::Drained(_)) => continue,
-                    Result::Err(RxError::Closing) => break,
                     Result::Err(e) => panic!(
-                        "reader_: step({step}), {:?} - {:?}\n{e:?}",
-                        split.0, split.1,
+                        "reader: step({seq_len}), {:?} - {:?}\n{e:?}",
+                        split.0, dst,
                     ),
                 }
             }
-            // std::println!("reader #{step}: {:?} ({})", target, *s);
-            for (u, x) in target.iter().enumerate() {
-                let v = span_offset;
-                let Result::Ok(x) = (*x).try_into() else {
+            for (u, v) in target.iter().enumerate() {
+                let Result::Ok(a) = TryInto::<usize>::try_into(*v) else {
                     panic!()
                 };
-                assert_eq!(v, x, "#{u}: v({v}) != x({x})");
-                span_offset += 1;
-                if span_offset == span_length {
-                    // std::println!("reader done validating span_length({span_length})");
-                    span_length += 1;
-                    span_offset = 0;
-                }
+                assert_eq!(u, a)
             }
-            if c >= step {
-                step -= 1;
-                c = 0usize;
-            }
+            seq_len += 1;
         }
         s.mark_consumer_closed();
         log::trace!("reader exits")
     }
+
+    const TEST_MAX_LEN: usize = 255;
 
     #[test]
     fn u8_read_write_concurrent_smoke() {
@@ -1249,8 +1298,8 @@ mod tests_ {
         };
         let s = Arc::new(state);
         let s_cloned = s.clone();
-        let writer_handle = std::thread::spawn(move || writer_(s_cloned));
-        let reader_handle = std::thread::spawn(move || reader_(s));
+        let writer_handle = std::thread::spawn(move || writer_(s_cloned, TEST_MAX_LEN));
+        let reader_handle = std::thread::spawn(move || reader_(s, TEST_MAX_LEN));
         let w = writer_handle.join();
         let r = reader_handle.join();
         assert!(w.is_ok());
@@ -1273,8 +1322,8 @@ mod tests_ {
         };
         let s = Arc::new(state);
         let s_cloned = s.clone();
-        let writer_handle = std::thread::spawn(move || writer_(s_cloned));
-        let reader_handle = std::thread::spawn(move || reader_(s));
+        let writer_handle = std::thread::spawn(move || writer_(s_cloned, TEST_MAX_LEN));
+        let reader_handle = std::thread::spawn(move || reader_(s, TEST_MAX_LEN));
         let w = writer_handle.join();
         let r = reader_handle.join();
         assert!(w.is_ok());
@@ -1297,8 +1346,8 @@ mod tests_ {
         };
         let s = Arc::new(state);
         let s_cloned = s.clone();
-        let writer_handle = std::thread::spawn(move || writer_(s_cloned));
-        let reader_handle = std::thread::spawn(move || reader_(s));
+        let writer_handle = std::thread::spawn(move || writer_(s_cloned, TEST_MAX_LEN));
+        let reader_handle = std::thread::spawn(move || reader_(s, TEST_MAX_LEN));
         let w = writer_handle.join();
         let r = reader_handle.join();
         assert!(w.is_ok());
