@@ -351,9 +351,13 @@ where
             p_ring_buf.as_ref().try_read_(*this.length_)
         };
         let Result::Err(read_err) = try_read else {
+            #[cfg(test)]
+            log::trace!("[ReadFuture::read_async_] try_read ok");
             return try_read;
         };
         let RxError::Drained(_) = read_err else {
+            #[cfg(test)]
+            log::trace!("[ReadFuture::read_async_] {read_err}");
             return Result::Err(read_err);
         };
         let mut check = move |s: &RwState<O>| {
@@ -362,18 +366,20 @@ where
         loop {
             let ring_buf = unsafe { p_ring_buf.as_ref() };
             if let Option::Some(demand_ref) = this.io_ctx_.demand() {
-                let x = ring_buf.state().check_consumer(demand_ref);
-                assert!(x, "[ReadFuture::read_async_] check_consumer");
                 let sign_recv = demand_ref.signal.peeker();
                 pin_mut!(sign_recv);
                 let x = sign_recv
                     .peek_async()
                     .may_cancel_with(this.cancel_.as_mut())
                     .await;
-                let _ = ring_buf.state().abort_consumer(demand_ref);
+                let _ = ring_buf.state().dequeue_consumer(demand_ref);
                 return if x.is_ok() {
+                    #[cfg(test)]
+                    log::trace!("[ReadFuture::read_async_] sig recv ok");
                     unsafe { p_ring_buf.as_ref().try_read_(*this.length_) }
                 } else {
+                    #[cfg(test)]
+                    log::trace!("[ReadFuture::read_async_] sig recv err");
                     Result::Err(RxError::Drained(0usize))
                 }
             } else {

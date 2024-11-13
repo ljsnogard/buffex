@@ -271,12 +271,12 @@ where
         self: Pin<&mut Self>,
     ) -> Result<Dual<ReclSliceMut<'a, P, T, O>>, TxError<usize>> {
         let this = self.project();
-        let mut p_ctx = unsafe {
+        let mut p_io_ctx = unsafe {
             let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
             NonNull::new_unchecked(ptr)
         };
         let p_ring_buf = unsafe { 
-            let ring_buf = p_ctx.as_ref().buffer();
+            let ring_buf = p_io_ctx.as_ref().buffer();
             let ptr = ring_buf as *const _ as *mut RingBuffer<P, T, O>;
             NonNull::new_unchecked(ptr)
         };
@@ -294,16 +294,14 @@ where
         };
         loop {
             let buf_ref = unsafe { p_ring_buf.as_ref() };
-            if let Option::Some(demand) = this.demand_.as_ref().get_ref() {
-                let x = buf_ref.state().check_producer(demand);
-                assert!(x, "[WriteFuture::write_async_] check_producer");
-                let sign_recv = demand.signal.peeker();
+            if let Option::Some(demand_ref) = this.demand_.as_ref().get_ref() {
+                let sign_recv = demand_ref.signal.peeker();
                 pin_mut!(sign_recv);
                 let x = sign_recv
                     .peek_async()
                     .may_cancel_with(this.cancel_.as_mut())
                     .await;
-                let _ = buf_ref.state().abort_producer(demand);
+                let _ = buf_ref.state().dequeue_producer(demand_ref);
                 return if x.is_ok() {
                     unsafe { p_ring_buf.as_ref().try_write_(*this.length_) }
                 } else {
@@ -312,7 +310,7 @@ where
             } else {
                 let demand = Demand::new(&mut check);
                 let try_init = unsafe {
-                    let ctx_pin = Pin::new_unchecked(p_ctx.as_mut());
+                    let ctx_pin = Pin::new_unchecked(p_io_ctx.as_mut());
                     ctx_pin.try_init_demand(demand)
                 };
                 let Result::Ok(demand_ref) = try_init else { continue; };

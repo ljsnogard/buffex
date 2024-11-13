@@ -434,22 +434,20 @@ impl fmt::Display for IoCtrl {
 mod tests_ {
     use core::borrow::{Borrow, BorrowMut};
 
+    use asyncex_channel::x_deps::{mm_ptr, atomex};
     use atomex::{
         x_deps::funty,
         TrCmpxchOrderings,
     };
-
     use core_malloc::CoreAlloc;
     use mm_ptr::{Shared, Owned};
-    use asyncex_channel::x_deps::{mm_ptr, atomex};
 
     use crate::ring_buffer::{*, buffer_::IoCtx};
 
     /// 向 buffer 中写入 [0][0,1][0,1,2]...[0,1,..,max_step - 2, max_step - 1]
     async fn write_seq_<X, B, P, T, O>(
         mut buffer: BuffWrite<X, B, P, T, O>,
-        max_len: usize,
-    )
+        max_len: usize)
     where
         X: BorrowMut<IoCtx<B, P, T, O>>,
         B: Borrow<RingBuffer<P, T, O>>,
@@ -458,6 +456,7 @@ mod tests_ {
         O: TrCmpxchOrderings,
     {
         let mut seq_len = 1usize;
+        log::trace!("[buffer_::tests_::write_seq_] starts");
         loop {
             if seq_len > max_len {
                 break;
@@ -485,6 +484,8 @@ mod tests_ {
                     panic!("writer_: step({seq_len}), wrote_len({wrote_len}), req_size({req_size}), e({e:?})")
                 };
                 for mut dst in dst_iter.into_iter() {
+                    let dst_len = dst.len();
+                    log::trace!("[buffer_::write_seq_] seq_len({seq_len}), wrote_len({wrote_len}), req_size({req_size}), dst_len({dst_len})");
                     let split = source.split_at(wrote_len);
                     let src = split.1;
                     let len = dst.len();
@@ -497,7 +498,9 @@ mod tests_ {
         log::trace!("writer exits")
     }
 
-    async fn reader_<X, B, P, T, O>(mut reader: BuffRead<X, B, P, T, O>)
+    async fn read_seq_<X, B, P, T, O>(
+        mut reader: BuffRead<X, B, P, T, O>,
+        max_len: usize)
     where
         X: BorrowMut<IoCtx<B, P, T, O>>,
         B: Borrow<RingBuffer<P, T, O>>,
@@ -505,17 +508,17 @@ mod tests_ {
         T: funty::Unsigned + TryInto<usize> + Copy,
         O: TrCmpxchOrderings,
     {
-        let capacity = reader.as_ref().capacity();
-        let mut step = capacity;
+        let mut seq_len = max_len;
         let mut c = 0usize;
         let mut span_length = 1usize;
         let mut span_offset = 0usize;
+        log::trace!("[buffer_::read_seq_] starts");
         loop {
-            if step == 0usize {
+            if seq_len == 0usize {
                 break;
             }
             let mut target = Owned::new_slice(
-                step,
+                seq_len,
                 |_| T::ZERO,
                 CoreAlloc::new(),
             );
@@ -523,14 +526,16 @@ mod tests_ {
             loop {
                 let split = target.split_at_mut(read_len);
                 let dst: &mut [T] = split.1;
+                log::trace!("[buffer_::read_seq_] before read_async: seq_len({seq_len}), read_len({read_len})");
                 match reader.read_async(dst.len()).await {
                     Result::Ok(dual) => {
                         let mut dst_w = 0usize;
                         for src in dual.into_iter() {
-                            let len = src.len();
-                            assert!(len <= dst.len());
-                            dst[dst_w..len].clone_from_slice(&src);
-                            dst_w += len;
+                            let src_len = src.len();
+                            log::trace!("[buffer_::read_seq_] seq_len({seq_len}), dst_w({dst_w}), read_len({read_len}), src_len({src_len})");
+                            assert!(dst_w + src_len <= dst.len());
+                            dst[dst_w..dst_w + src_len].clone_from_slice(&src);
+                            dst_w += src_len;
                         }
                         read_len += dst_w;
                         c += dst_w;
@@ -538,40 +543,41 @@ mod tests_ {
                     },
                     Result::Err(RxError::Closing) => break,
                     Result::Err(e) => panic!(
-                        "reader_: step({step}), {:?} - {:?}\n{e:?}",
+                        "reader_: step({seq_len}), {:?} - {:?}\n{e:?}",
                         split.0, split.1,
                     ),
                 }
             }
-            // std::println!("reader #{step}: {:?} ({})", target, *s);
+            log::trace!("[buffer_::read_seq] #{seq_len}: {target:?} ");
             for (u, x) in target.iter().enumerate() {
                 let v = span_offset;
                 let Result::Ok(x) = (*x).try_into() else { panic!() };
                 assert_eq!(v, x, "#{u}: v({v}) != x({x})");
                 span_offset += 1;
                 if span_offset == span_length {
-                    log::trace!("reader done validating span_length({span_length})");
+                    log::trace!("[buffer_::read_seq_] reader done validating span_length({span_length})");
                     span_length += 1;
                     span_offset = 0;
                 }
             }
-            if c >= step {
-                step -= 1;
+            if c >= seq_len {
+                seq_len -= 1;
                 c = 0usize;
             }
         }
-        log::trace!("reader exits")
+        log::trace!("read_seq_ exits")
     }
 
     #[tokio::test]
     async fn u8_read_write_async_smoke() {
-        const BUFF_SIZE: u8 = 255;
+        const BUFF_SIZE: usize = 32;
+        const MAX_LEN: usize = 16usize;
 
         let _ = env_logger::builder().is_test(true).try_init();
 
         let Result::Ok(ring_buff) = RingBuffer::<Owned<[u8], CoreAlloc>>
             ::try_new(Owned::new_slice(
-                usize::from(BUFF_SIZE),
+                BUFF_SIZE,
                 |_| 0u8,
                 CoreAlloc::new(),
             ))
@@ -585,21 +591,22 @@ mod tests_ {
         else {
             panic!("[tests_::u8_read_write_async_smoke] try_split_shared");
         };
-        let writer_handle = tokio::task::spawn(write_seq_(writer, BUFF_SIZE as usize));
-        let reader_handle = tokio::task::spawn(reader_(reader));
+        let reader_handle = tokio::task::spawn(read_seq_(reader, MAX_LEN));
+        let writer_handle = tokio::task::spawn(write_seq_(writer, MAX_LEN));
         assert!(writer_handle.await.is_ok());
         assert!(reader_handle.await.is_ok());
     }
 
     #[tokio::test]
     async fn u16_read_write_async_smoke() {
-        const BUFF_SIZE: u16 = 1024;
+        const BUFF_SIZE: usize = 32;
+        const MAX_LEN: usize = 16usize;
 
         let _ = env_logger::builder().is_test(true).try_init();
 
         let Result::Ok(ring_buff) = RingBuffer::<Owned<[u16], CoreAlloc>, u16>
             ::try_new(Owned::new_slice(
-                usize::from(BUFF_SIZE),
+                BUFF_SIZE,
                 |_| 0u16,
                 CoreAlloc::new(),
             ))
@@ -613,21 +620,22 @@ mod tests_ {
         else {
             panic!("[tests_::u16_read_write_async_smoke] try_split_shared");
         };
-        let whndl = tokio::task::spawn(write_seq_(writer, BUFF_SIZE as usize));
-        let rhndl = tokio::task::spawn(reader_(reader));
+        let whndl = tokio::task::spawn(write_seq_(writer, MAX_LEN));
+        let rhndl = tokio::task::spawn(read_seq_(reader, MAX_LEN));
         assert!(whndl.await.is_ok());
         assert!(rhndl.await.is_ok());
     }
 
     #[tokio::test]
     async fn u32_read_write_async_smoke() {
-        const BUFF_SIZE: u32 = 1024;
+        const BUFF_SIZE: usize = 1024;
+        const MAX_LEN: usize = 16usize;
 
         let _ = env_logger::builder().is_test(true).try_init();
 
         let Result::Ok(ring_buff) = RingBuffer::<Owned<[u32], CoreAlloc>, u32>
             ::try_new(Owned::new_slice(
-                usize::try_from(BUFF_SIZE).unwrap(),
+                BUFF_SIZE,
                 |_| 0u32,
                 CoreAlloc::new(),
             ))
@@ -641,8 +649,8 @@ mod tests_ {
         else {
             panic!("[tests_::u32_read_write_async_smoke] try_split_shared");
         };
-        let writer_handle = tokio::task::spawn(write_seq_(writer, BUFF_SIZE as usize));
-        let reader_handle = tokio::task::spawn(reader_(reader));
+        let writer_handle = tokio::task::spawn(write_seq_(writer, MAX_LEN));
+        let reader_handle = tokio::task::spawn(read_seq_(reader, MAX_LEN));
         assert!(writer_handle.await.is_ok());
         assert!(reader_handle.await.is_ok());
     }

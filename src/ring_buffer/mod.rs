@@ -9,8 +9,11 @@ mod write_;
 #[cfg(test)]
 mod chunk_;
 
+#[cfg(test)]
+mod tests_;
+
 pub use abs_::TrRingBuffer;
-pub use buffer_::{RingBuffer, RxError, TxError};
+pub use buffer_::{IoCtx, RingBuffer, RxError, TxError};
 pub use peek_::{BuffPeek, PeekAsync};
 pub use read_::{BuffRead, ReadAsync};
 pub use write_::{BuffWrite, WriteAsync};

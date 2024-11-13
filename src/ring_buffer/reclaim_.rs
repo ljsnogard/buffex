@@ -73,8 +73,8 @@ where
         self,
         args: (&mut ReclSliceMut<'a, P, T, O>,),
     ) -> Self::Output {
-        let slice_ref = args.0;
-        let x = self.0.state().writer_forward(slice_ref.len());
+        let slice_mut = args.0;
+        let x = self.0.state().writer_forward(slice_mut.len());
         assert!(x.is_ok())
     }
 }

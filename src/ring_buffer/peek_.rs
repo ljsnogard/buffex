@@ -254,15 +254,13 @@ where
         loop {
             let ring_buf = unsafe { p_ring_buf.as_ref() };
             if let Option::Some(demand) = this.io_ctx_.demand() {
-                let x = ring_buf.state().check_consumer(demand);
-                assert!(x, "[PeekFuture::peek_async_] check_consumer");
                 let signal_recv = demand.signal.peeker();
                 pin_mut!(signal_recv);
                 let x = signal_recv
                     .peek_async()
                     .may_cancel_with(this.cancel_.as_mut())
                     .await;
-                let _ = ring_buf.state().abort_consumer(demand);
+                let _ = ring_buf.state().dequeue_consumer(demand);
                 return if x.is_ok() {
                     unsafe { p_ring_buf.as_ref().try_peek_() }
                 } else {

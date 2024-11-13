@@ -104,11 +104,15 @@ where
 
     pub fn producer_check(state: &RwState<O>) -> bool {
         let i = state.load_state();
+        #[cfg(test)]
+        log::trace!("[Demand::producer_check] {i:?}");
         i.wlen > 0usize
     }
 
     pub fn consumer_check(state: &RwState<O>) -> bool {
         let i = state.load_state();
+        #[cfg(test)]
+        log::trace!("[Demand::consumer_check] {i:?}");
         i.rlen > 0usize
     }
 }
@@ -122,9 +126,6 @@ where
     _unuse_t_: PhantomData<[T]>,
 
     _pinned_: PhantomPinned,
-
-    /// The slot stores the checked but not signaled demand.
-    unsignal_: AtomicDemandPtr<O>,
 
     /// The slot stores the enqueued consumer demand.
     consumer_: AtomicDemandPtr<O>,
@@ -151,7 +152,6 @@ where
         Result::Ok(BuffState {
             _unuse_t_: PhantomData,
             _pinned_: PhantomPinned,
-            unsignal_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
             consumer_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
             producer_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
             rw_state_: RwState::new(buffer.borrow().len()),
@@ -234,12 +234,14 @@ where
         &self,
         length: usize,
     ) -> Result<BuffIoDelta<usize>, RxError<usize>> {
-        let info = self.rw_state_.load_state();
-        if info.rlen == 0usize {
+        let i = self.rw_state_.load_state();
+        #[cfg(test)]
+        log::trace!("[BuffState::reader_checked_inc_pos_] {i:?}");
+        if i.rlen == 0usize {
             let e = if self.is_closing() {
                 RxError::Closing
             } else {
-                RxError::Drained(info.roff)
+                RxError::Drained(i.roff)
             };
             return Result::Err(e);
         };
@@ -280,17 +282,19 @@ where
         &self,
         length: usize,
     ) -> Result<BuffIoDelta<usize>, TxError<usize>> {
-        let state = self.rw_state_.load_state();
-        if state.wlen == 0usize {
+        let i = self.rw_state_.load_state();
+        #[cfg(test)]
+        log::trace!("[BuffState::writer_checked_inc_pos_] {i:?}");
+        if i.wlen == 0usize {
             let e = if self.is_closing() {
                 TxError::Closing
             } else {
-                TxError::Stuffed(state.woff)
+                TxError::Stuffed(i.woff)
             };
             return Result::Err(e);
         }
-        let src_len = if length > state.wlen {
-            state.wlen
+        let src_len = if length > i.wlen {
+            i.wlen
         } else {
             length
         };
@@ -305,29 +309,31 @@ where
         debug_assert!(i.wlen > 0usize);
         let mut dual = Dual::new();
         let mut buf_ptr = self.get_buff_non_null_();
-        unsafe {
-            let buf_mut: &mut [T] = buf_ptr.as_mut();
+        let buf_mut: &mut [T] = unsafe { buf_ptr.as_mut() };
 
-            // Make sure the 1st slice will not exceed the amount needed.
-            let l0 = cmp::min(i.wlen, length);
-            let s0 = &mut buf_mut[i.woff..i.woff + l0];
-            dual.push(NonNull::new_unchecked(s0));
+        // Make sure the 1st slice will not exceed the amount needed.
+        let l0 = cmp::min(i.wlen, length);
+        let s0 = &mut buf_mut[i.woff..i.woff + l0];
+        dual.push(unsafe { NonNull::new_unchecked(s0) });
 
+        #[cfg(test)]
+        log::trace!("[BuffState::pack_slice_write_] i({i:?}), l0({l0})");
+
+        // length.saturating_sub(l0) is equivalent to:
+        // if l0 < length { length - l0 } else { 0 }
+        let l1 = length.saturating_sub(l0);
+        if l1 == 0usize || i.woff < i.roff {
+            return dual;
+        }
+        debug_assert!(i.woff >= i.roff);
+        debug_assert!(i.woff + l0 == buf_mut.len());
+        // Make sure the 2nd slice will not exceed the reader position;
+        let l1 = cmp::min(i.roff, l1);
+        if l1 > 0 {
             #[cfg(test)]
-            log::trace!("[BuffState::pack_slice_write_] i({i:?}), l0({l0})");
-
-            // length.saturating_sub(l0) is equivalent to:
-            // if l0 < length { length - l0 } else { 0 }
-            let l1 = length.saturating_sub(l0);
-            if l1 == 0usize || i.woff < i.roff {
-                return dual;
-            }
-            debug_assert!(i.woff >= i.roff);
-            debug_assert!(i.woff + l0 == buf_mut.len());
-            // Make sure the 2nd slice will not exceed the reader position;
-            let l1 = cmp::min(i.roff, length - l0);
+            log::trace!("[BuffState::pack_slice_write_] i({i:?}), l1({l1})");
             let s1 = &mut buf_mut[..l1];
-            dual.push(NonNull::new_unchecked(s1));
+            dual.push(unsafe { NonNull::new_unchecked(s1) });
         }
         dual
     }
@@ -340,29 +346,32 @@ where
         debug_assert!(i.rlen > 0usize);
         let mut dual = Dual::new();
         let mut buf_ptr = self.get_buff_non_null_();
-        unsafe {
-            let buf_mut: &mut [T] = buf_ptr.as_mut();
 
-            // Make sure the 1st slice will not exceed the tail of the buffer.
-            let l0 = cmp::min(i.rlen, length);
-            let s0 = &mut buf_mut[i.roff..i.roff + l0];
-            dual.push(NonNull::new_unchecked(s0));
+        let buf_mut: &mut [T] = unsafe { buf_ptr.as_mut() };
 
+        // Make sure the 1st slice will not exceed the tail of the buffer.
+        let l0 = cmp::min(i.rlen, length);
+        let s0 = &mut buf_mut[i.roff..i.roff + l0];
+        dual.push(unsafe { NonNull::new_unchecked(s0) });
+
+        #[cfg(test)]
+        log::trace!("[BuffState::pack_slice_read_] i({i:?}), l0({l0})");
+
+        // length.saturating_sub(l0) is equivalent to:
+        // if l0 < length { length - l0 } else { 0 }
+        let l1 = length.saturating_sub(l0);
+        if l1 == 0usize || i.roff < i.woff {
+            return dual;
+        }
+        debug_assert!(i.roff >= i.woff);
+        debug_assert!(i.roff + l0 == buf_mut.len());
+        // Make sure the 2nd slice will not exceed the writer position
+        let l1 = cmp::min(l1, i.woff);
+        if l1 > 0 {
             #[cfg(test)]
-            log::trace!("[BuffState::pack_slice_read_] i({i:?}), l0({l0})");
-
-            // length.saturating_sub(l0) is equivalent to:
-            // if l0 < length { length - l0 } else { 0 }
-            let l1 = length.saturating_sub(l0);
-            if l1 == 0usize || i.roff < i.woff {
-                return dual;
-            }
-            debug_assert!(i.roff >= i.woff);
-            debug_assert!(i.roff + l0 == buf_mut.len());
-            // Make sure the 2nd slice will not exceed the writer position
-            let l1 = cmp::min(length - l0, i.woff);
+            log::trace!("[BuffState::pack_slice_read_] i({i:?}), l1({l1})");
             let s1 = &mut buf_mut[..l1];
-            dual.push(NonNull::new_unchecked(s1));
+            dual.push(unsafe { NonNull::new_unchecked(s1) });
         }
         dual
     }
@@ -389,7 +398,7 @@ where
 
     pub fn enqueue_consumer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
-        log::trace!("[BuffState::enqueue_consumer] {:p}", demand);
+        log::trace!("[BuffState::enqueue_consumer] {demand:p}");
         Self::enqueue_demand_(&self.consumer_, demand)
     }
 
@@ -409,84 +418,25 @@ where
             .is_succ()
     }
 
-    /// Tries to invoke `chk_fn` of demand in enqueued consumer cell, and move
-    /// the demand to the `unsignal_` slot if it will not activate at this time.
-    pub fn check_consumer(&self, demand: &Demand<O>) -> bool {
+    pub fn dequeue_consumer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
-        log::trace!("[BuffState::check_consumer] {:p}", demand);
-        self.check_demand_(&self.consumer_, demand)
+        log::trace!("[BuffState::dequeue_consumer] {demand:p}");
+        self.dequeue_demand(&self.consumer_, demand)
     }
 
-    /// Tries to invoke `chk_fn` of demand in enqueued producer cell, and move
-    /// the demand to the `unsignal_` slot if it will not activate at this time.
-    pub fn check_producer(&self, demand: &Demand<O>) -> bool {
+    pub fn dequeue_producer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
-        log::trace!("[BuffState::check_producer] {:p}", demand);
-        self.check_demand_(&self.producer_, demand)
+        log::trace!("[BuffState::dequeue_producer] {demand:p}");
+        self.dequeue_demand(&self.producer_, demand)
     }
 
-    fn check_demand_(
+    fn dequeue_demand(
         &self,
         cell: &AtomicDemandPtr<O>,
         demand: &Demand<O>,
     ) -> bool {
-        let expect = |p: *mut Demand<O>| ptr::eq(p, demand);
-        let desire = |_| ptr::null_mut();
-        let r: Result<_, _> = cell
-            .try_spin_compare_exchange_weak(expect, desire)
-            .into();
-        let Result::Ok(p) = r else {
-            #[cfg(test)]
-            log::trace!("[BuffState::check_demand_] cannot check({r:?})");
-            return false;
-        };
-        let opt_demand = unsafe { p.as_mut() };
-        let Option::Some(demand) = opt_demand else {
-            unreachable!()
-        };
-        let check_fn = &mut demand.chk_fn;
-        if !check_fn(&self.rw_state_) {
-            #[cfg(test)]
-            log::trace!("[BuffState::check_demand_] demand denied");
-            let init = unsafe { NonNull::new_unchecked(demand as *mut _) };
-            let x = self.unsignal_.try_spin_init(init);
-            assert!(x.is_ok());
-            return true;
-        };
-        let x = demand.signal.send(()).wait();
-
-        #[allow(unused_variables)]
-        if let Result::Err(e) = &x {
-            #[cfg(test)]
-            log::warn!("[BuffState::check_demand_] signaling failed({e:?}");
-        }
-        x.is_ok()
-    }
-
-    /// Dequeue a (previously enqueued) consumer demand if not activated.
-    /// Return if the demand is successfully dequeued.
-    #[inline(always)]
-    pub fn dequeue_consumer(&self, demand: &Demand<O>) -> bool {
-        #[cfg(test)]
-        log::trace!("[BuffState::dequeue_consumer] {:p}", demand);
-        Self::dequeue_demand_(&self.consumer_, demand)
-    }
-
-    /// Dequeue a (previously enqueued) producer demand if not activated.
-    /// Return if the demand is successfully dequeued.
-    #[inline(always)]
-    pub fn dequeue_producer(&self, demand: &Demand<O>) -> bool {
-        #[cfg(test)]
-        log::trace!("[BuffState::dequeue_producer] {:p}", demand);
-        Self::dequeue_demand_(&self.producer_, demand)
-    }
-
-    fn dequeue_demand_(
-        cell: &AtomicDemandPtr<O>,
-        demand: &Demand<O>,
-    ) -> bool {
         let p = unsafe {
-            NonNull::new_unchecked(demand as *const _ as * mut _)
+            NonNull::new_unchecked(demand as *const _ as  *mut _)
         };
         cell.try_spin_compare_and_reset(p)
             .is_ok()
@@ -497,7 +447,7 @@ where
     pub fn try_signal_consumer(&self) {
         #[cfg(test)]
         log::trace!("[BuffState::try_signal_consumer]");
-        self.try_signal_()
+        self.try_signal_(&self.consumer_)
     }
 
     /// Send signal to the demand stored in the `unsignal_` slot. This may not
@@ -505,14 +455,17 @@ where
     pub fn try_signal_producer(&self) {
         #[cfg(test)]
         log::trace!("[BuffState::try_signal_producer]");
-        self.try_signal_()
+        self.try_signal_(&self.producer_)
     }
 
-    fn try_signal_(&self) {
-        let p = self.unsignal_.pointer();
+    fn try_signal_(
+        &self,
+        cell: &AtomicDemandPtr<O>,
+    ) {
+        let p = cell.pointer();
         if p == Self::closed_demand_ptr_() || p.is_null() {
             #[cfg(test)]
-            log::trace!("[BuffState::try_signal_] not demand({p:p})");
+            log::trace!("[BuffState::try_signal_] closed or null demand({p:p})");
             return;
         };
         let opt_demand = unsafe { p.as_mut() };
@@ -523,15 +476,17 @@ where
         let check_fn = &mut demand.chk_fn;
         if !check_fn(&self.rw_state_) {
             #[cfg(test)]
-            log::trace!("[BuffState::try_signal_] demand denied");
+            log::trace!("[BuffState::try_signal_] demand({demand:p}) denied");
             return;
         };
-        let r = self
-            .unsignal_
+        let r = cell
             .try_spin_compare_and_reset(unsafe { NonNull::new_unchecked(p) });
-        if r.is_err() {
-            #[cfg(test)]
-            log::trace!("[BuffState::try_signal_] cmpxch failed.");
+
+        #[allow(unused_variables)]
+        if let Result::Err(e) = r {
+            #[cfg(test)] log::trace!(
+                "[BuffState::try_signal_] cmpxch failed:
+                expect({demand:p}), occur({e:p})");
             return;
         }
         let x = demand.signal.send(()).wait();
@@ -540,27 +495,8 @@ where
             #[cfg(test)]
             log::warn!("[BuffState::try_signal_] signal err({e:?}");
         }
-    }
-
-    pub fn abort_consumer(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
-        log::trace!("[BuffState::abort_consumer]");
-        self.abort_demand(demand)
-    }
-
-    pub fn abort_producer(&self, demand: &Demand<O>) -> bool {
-        #[cfg(test)]
-        log::trace!("[BuffState::abort_producer]");
-        self.abort_demand(demand)
-    }
-
-    fn abort_demand(&self, demand: &Demand<O>) -> bool {
-        let p = unsafe {
-            NonNull::new_unchecked(demand as *const _ as  *mut _)
-        };
-        self.unsignal_
-            .try_spin_compare_and_reset(p)
-            .is_ok()
+        log::trace!("[BuffState::try_signal_] signaled demand({demand:p}");
     }
 
     fn get_buff_non_null_(&self) -> NonNull<[T]> {
