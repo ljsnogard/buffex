@@ -7,8 +7,8 @@ pub trait TrRingBuffer<T = u8>
 where
     T: Clone,
 {
-    type Input<'a>: 'a + TrBuffIterTryWrite<T> where Self: 'a;
-    type Output<'a>: 'a + TrBuffIterTryRead<T> where Self: 'a;
+    type Tx<'a>: 'a + TrBuffIterTryWrite<T> where Self: 'a;
+    type Rx<'a>: 'a + TrBuffIterTryRead<T> where Self: 'a;
 
     /// The number of units that the buffer is capable of.
     fn capacity(&self) -> usize;
@@ -19,5 +19,5 @@ where
     /// Try to split the buffer into a write half and a read half.
     fn try_split_io(
         &mut self,
-    ) -> Option<(Self::Input<'_>, Self::Output<'_>)>;
+    ) -> Option<(Self::Tx<'_>, Self::Rx<'_>)>;
 }

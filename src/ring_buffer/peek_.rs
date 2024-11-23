@@ -1,7 +1,6 @@
 ﻿use core::{
     borrow::{Borrow, BorrowMut},
     future::{Future, IntoFuture},
-    marker::PhantomData,
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll},
@@ -12,42 +11,40 @@ use pin_utils::pin_mut;
 
 use abs_buff::{TrBuffIterPeek, TrBuffIterTryPeek};
 use abs_sync::{cancellation::*, x_deps::pin_utils};
-use asyncex_channel::x_deps::{abs_sync, atomex};
+use spmv_oneshot::x_deps::{abs_sync, atomex};
 use atomex::TrCmpxchOrderings;
 
 use super::{
-    buffer_::{IoCtrl, IoCtx, RingBuffer, RxError},
+    buffer_::{RingBuffer, RxError},
     reclaim_::ReclSliceRef,
-    sync_::{Demand, RwState},
+    sync_::{CtrlHint, Demand, IoCtx},
     Dual,
 };
 
 /// To copy data from, or to peek data stored in, the ring buffer.
-pub struct BuffPeek<X, B, P, T, O>(X, PhantomData<IoCtx<B, P, T, O>>)
+pub struct BuffPeek<'a, B, P, T, O>(&'a mut IoCtx<B, P, T, O>)
 where
-    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
     O: TrCmpxchOrderings;
 
-impl<X, B, P, T, O> BuffPeek<X, B, P, T, O>
+impl<'a, B, P, T, O> BuffPeek<'a, B, P, T, O>
 where
-    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    pub(super) fn new(ctx: X) -> Self {
-        ctx.borrow().state().incr_use_count();
-        BuffPeek(ctx, PhantomData)
+    pub(super) fn new(ctx: &'a mut IoCtx<B, P, T, O>) -> Self {
+        ctx.state().incr_use_count();
+        BuffPeek(ctx)
     }
 
     pub fn try_peek(
         &mut self,
     ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
-        self.0.borrow().buffer().try_peek_() 
+        self.0.buffer().try_peek_() 
     }
 
     pub fn peek_async(&mut self) -> PeekAsync<'_, B, P, T, O> {
@@ -60,9 +57,8 @@ where
     }
 }
 
-impl<X, B, P, T, O> Drop for BuffPeek<X, B, P, T, O>
+impl<B, P, T, O> Drop for BuffPeek<'_, B, P, T, O>
 where
-    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
@@ -71,7 +67,7 @@ where
     fn drop(&mut self) {
         let ctx = self.0.borrow_mut();
         let ctrl = ctx.state().decr_use_count();
-        if matches!(ctrl, IoCtrl::MarkClose(_)) {
+        if matches!(ctrl, CtrlHint::MarkClose(_)) {
             ctx.buffer().state().mark_consumer_closed()
         }
         #[cfg(test)]
@@ -79,9 +75,8 @@ where
     }
 }
 
-impl<X, B, P, T, O> TrBuffIterPeek<T> for BuffPeek<X, B, P, T, O>
+impl<B, P, T, O> TrBuffIterPeek<T> for BuffPeek<'_, B, P, T, O>
 where
-    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
@@ -98,9 +93,8 @@ where
     }
 }
 
-impl<X, B, P, T, O> TrBuffIterTryPeek<T> for BuffPeek<X, B, P, T, O>
+impl<B, P, T, O> TrBuffIterTryPeek<T> for BuffPeek<'_, B, P, T, O>
 where
-    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
@@ -115,17 +109,16 @@ where
     }
 }
 
-impl<X, B, P, T, O> Borrow<RingBuffer<P, T, O>> for BuffPeek<X, B, P, T, O>
+impl<B, P, T, O> AsRef<RingBuffer<P, T, O>> for BuffPeek<'_, B, P, T, O>
 where
-    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
     O: TrCmpxchOrderings,
 {
     #[inline]
-    fn borrow(&self) -> &RingBuffer<P, T, O> {
-        self.0.borrow().buffer()
+    fn as_ref(&self) -> &RingBuffer<P, T, O> {
+        self.0.buffer()
     }
 }
 
@@ -220,11 +213,11 @@ where
     O: TrCmpxchOrderings,
 {
     pub(super) const fn new(
-        context: Pin<&'a mut IoCtx<B, P, T, O>>,
+        io_ctx: Pin<&'a mut IoCtx<B, P, T, O>>,
         cancel: Pin<&'a mut C>,
     ) -> Self {
         PeekFuture {
-            io_ctx_: context,
+            io_ctx_: io_ctx,
             cancel_: cancel,
         }
     }
@@ -247,10 +240,6 @@ where
         let RxError::Drained(_) = peek_err else {
             return Result::Err(peek_err);
         };
-        let mut check = move |s: &RwState<O>| {
-            let i = s.load_state();
-            i.rlen > 0
-        };
         loop {
             let ring_buf = unsafe { p_ring_buf.as_ref() };
             if let Option::Some(demand) = this.io_ctx_.demand() {
@@ -267,7 +256,7 @@ where
                     Result::Err(RxError::Drained(0usize))
                 }
             } else {
-                let demand = Demand::new(&mut check);
+                let demand = Demand::new(Demand::consumer_check);
                 let try_init = unsafe {
                     let ctx_pin = Pin::new_unchecked(p_ctx.as_mut());
                     ctx_pin.try_init_demand(demand)

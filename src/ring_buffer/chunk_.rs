@@ -8,13 +8,12 @@ use atomex::{
 use core_malloc::CoreAlloc;
 use mm_ptr::{Shared, Owned};
 
-use asyncex_channel::x_deps::{atomex, mm_ptr};
+use spmv_oneshot::x_deps::atomex;
 
-use crate::ring_buffer::{*, buffer_::IoCtx};
+use crate::ring_buffer::*;
 
-async fn chunk_writer_<X, B, P, T, O>(writer: BuffWrite<X, B, P, T, O>)
+async fn chunk_writer_<B, P, T, O>(writer: BuffTx<B, P, T, O>)
 where
-    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: funty::Unsigned + TryFrom<usize> + Copy,
@@ -49,9 +48,8 @@ where
     log::info!("chunk writer exits");
 }
 
-async fn reader_filler_<X, B, P, T, O>(reader: BuffRead<X, B, P, T, O>)
+async fn reader_filler_<B, P, T, O>(reader: BuffRx<B, P, T, O>)
 where
-    X: BorrowMut<IoCtx<B, P, T, O>>,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: funty::Unsigned + TryInto<usize> + Copy,
@@ -78,7 +76,9 @@ where
         log::trace!("[chunk_::reader_filler_] span_len({span_length}) filled len({fill_len})");
         assert!(fill_len == span_length);
         for (u, x) in target.iter().enumerate() {
-            let Result::Ok(x) = (*x).try_into() else { panic!() };
+            let Result::<usize, _>::Ok(x) = (*x).try_into() else {
+                panic!()
+            };
             assert_eq!(u, x, "#{span_length}: u({u}) != x({x})");
         }
         span_length += 1;

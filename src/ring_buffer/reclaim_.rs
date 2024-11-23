@@ -1,14 +1,19 @@
 ﻿use core::borrow::BorrowMut;
 
-use asyncex_channel::x_deps::atomex;
 use atomex::TrCmpxchOrderings;
+use spmv_oneshot::x_deps::atomex;
 
 use crate::slices::{SliceMut, SliceRef};
 use super::buffer_::RingBuffer;
 
-pub type ReclSliceRef<'a, P, T, O> = SliceRef<&'a [T], T, ReaderForwardFn<'a, P, T, O>>;
-pub type ReclSliceMut<'a, P, T, O> = SliceMut<&'a mut [T], T, WriterForwardFn<'a, P, T, O>>;
+pub type ReclSliceRef<'a, P, T, O> =
+    SliceRef<&'a [T], T, ReaderForwardFn<'a, P, T, O>>;
 
+pub type ReclSliceMut<'a, P, T, O> =
+    SliceMut<&'a mut [T], T, WriterForwardFn<'a, P, T, O>>;
+
+/// A wrapper around the internal function that forwards the reader position,
+/// and will be invoked when a `ReclSliceRef` drops.
 pub struct ReaderForwardFn<'a, P, T, O>(&'a RingBuffer<P, T, O>)
 where
     P: BorrowMut<[T]>,
@@ -44,6 +49,8 @@ where
     }
 }
 
+/// A wrapper around the internal function that forwards the writer position,
+/// and will be invoked when a `ReclSliceMut` drops.
 pub struct WriterForwardFn<'a, P, T, O>(&'a RingBuffer<P, T, O>)
 where
     P: BorrowMut<[T]>,

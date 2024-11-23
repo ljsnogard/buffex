@@ -2,25 +2,22 @@
     borrow::{Borrow, BorrowMut},
     error::Error,
     fmt,
-    marker::{PhantomData, PhantomPinned},
     ops::Deref,
-    pin::Pin,
     ptr::NonNull,
-    sync::atomic::AtomicUsize,
 };
 
-use atomex::{AtomicCount, StrictOrderings, TrCmpxchOrderings};
-use asyncex_channel::x_deps::atomex;
+use atomex::{StrictOrderings, TrCmpxchOrderings};
+use spmv_oneshot::x_deps::atomex;
 
 use super::{
-    read_::BuffRead,
     reclaim_::{ReaderForwardFn, ReclSliceMut, ReclSliceRef, WriterForwardFn},
-    sync_::{BuffState, Demand},
-    write_::BuffWrite,
+    sync_::{BuffState, IoCtx, IoCtxState},
+    rx_::BuffRx,
+    tx_::BuffTx,
     Dual, TrRingBuffer,
 };
 
-/// Error that may occur while operating with the output end of the ring buffer.
+/// Error that may occur while operating rx end of the ring buffer.
 #[derive(Debug)]
 pub enum RxError<T> {
     /// Illegal argument.
@@ -51,7 +48,7 @@ where
     T: fmt::Debug,
 {}
 
-/// Error that may occur while operating with the input end of the ring buffer.
+/// Error that may occur while operating tx end of the ring buffer.
 #[derive(Debug)]
 pub enum TxError<T> {
     /// Illegal argument.
@@ -82,11 +79,11 @@ where
     T: fmt::Debug,
 {}
 
-type IoPair<X, B, P, T, O> = (
-    BuffWrite<X, B, P, T, O>,
-    BuffRead<X, B, P, T, O>,
+type IoPair<B, P, T, O> = (
+    BuffTx<B, P, T, O>,
+    BuffRx<B, P, T, O>,
 );
-type TrySplitResult<X, B, P, T, O> = Result<IoPair<X, B, P, T, O>, B>;
+type TrySplitResult<B, P, T, O> = Result<IoPair<B, P, T, O>, B>;
 
 pub struct RingBuffer<P, T = u8, O = StrictOrderings>(BuffState<P, T, O>)
 where
@@ -107,11 +104,11 @@ where
 
     pub fn split(
         ring_buff: &mut Self,
-    ) -> IoPair<IoCtx<&'_ Self, P, T, O>, &'_ Self, P, T, O> {
+    ) -> IoPair<&'_ Self, P, T, O> {
         unsafe {
             let mut buffer = NonNull::new_unchecked(ring_buff);
-            let i = buffer.as_mut().input();
-            let o = buffer.as_mut().output();
+            let i = buffer.as_mut().tx();
+            let o = buffer.as_mut().rx();
             (i, o)
         }
     }
@@ -126,7 +123,7 @@ where
         ring_buff: S,
         strong_count: impl FnOnce(&S) -> usize,
         weak_count: impl FnOnce(&S) -> usize,
-    ) -> TrySplitResult<IoCtx<S, P, T, O>, S, P, T, O>
+    ) -> TrySplitResult<S, P, T, O>
     where
         S: Borrow<Self> + Deref<Target = Self> + Clone + Send + Sync,
     {
@@ -134,11 +131,11 @@ where
         if x {
             Result::Err(ring_buff)
         } else {
-            let i = BuffWrite::new(IoCtx::new(
+            let i = BuffTx::new(IoCtx::new(
                 ring_buff.clone(),
                 IoCtxState::closing_flag(),
             ));
-            let o = BuffRead::new(IoCtx::new(
+            let o = BuffRx::new(IoCtx::new(
                 ring_buff,
                 IoCtxState::closing_flag(),
             ));
@@ -158,20 +155,16 @@ where
 
     /// Get the `BuffWrite` instance associated with this ring buffer.
     /// Dropping it will not cause rx end receiving `RxError::Closing`.
-    pub fn input(
-        &mut self,
-    ) -> BuffWrite<IoCtx<&Self, P, T, O>, &Self, P, T, O> {
+    pub fn tx(&mut self) -> BuffTx<&Self, P, T, O> {
         let ctx_st = IoCtxState::no_close_flag();
-        BuffWrite::new(IoCtx::new(self, ctx_st))
+        BuffTx::new(IoCtx::new(self, ctx_st))
     }
 
     /// Get the `BuffRead` instance associated with this ring buffer.
     /// Dropping it will not cause tx end receiving `RxError::Closing`.
-    pub fn output(
-        &mut self,
-    ) -> BuffRead<IoCtx<&Self, P, T, O>, &Self, P, T, O> {
+    pub fn rx(&mut self) -> BuffRx<&Self, P, T, O> {
         let ctx_st = IoCtxState::no_close_flag();
-        BuffRead::new(IoCtx::new(self, ctx_st))
+        BuffRx::new(IoCtx::new(self, ctx_st))
     }
 }
 
@@ -255,8 +248,8 @@ where
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    type Input<'a> = BuffWrite<IoCtx<&'a Self, P, T, O>, &'a Self, P, T, O> where Self: 'a;
-    type Output<'a> = BuffRead<IoCtx<&'a Self, P, T, O>, &'a Self, P, T, O> where Self: 'a;
+    type Tx<'a> = BuffTx<&'a Self, P, T, O> where Self: 'a;
+    type Rx<'a> = BuffRx<&'a Self, P, T, O> where Self: 'a;
 
     #[inline]
     fn capacity(&self) -> usize {
@@ -271,162 +264,8 @@ where
     #[inline]
     fn try_split_io(
         &mut self,
-    ) -> Option<(Self::Input<'_>, Self::Output<'_>)> {
+    ) -> Option<(Self::Tx<'_>, Self::Rx<'_>)> {
         Option::Some(Self::split(self))
-    }
-}
-
-pub struct IoCtx<B, P, T, O>
-where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    _pinned: PhantomPinned,
-    _use_p_: PhantomData<P>,
-    _use_t_: PhantomData<[T]>,
-    buffer_: B,
-    ctx_st_: IoCtxState,
-    demand_: Option<Demand<O>>,
-}
-
-impl<B, P, T, O> IoCtx<B, P, T, O>
-where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    pub(super) const fn new(buffer: B, ctx_st: IoCtxState) -> Self {
-        IoCtx {
-            _pinned: PhantomPinned,
-            _use_p_: PhantomData,
-            _use_t_: PhantomData,
-            buffer_: buffer,
-            ctx_st_: ctx_st,
-            demand_: Option::None,
-        }
-    }
-
-    pub(super) fn buffer(&self) -> &RingBuffer<P, T, O> {
-        self.buffer_.borrow()
-    }
-
-    pub(super) fn state(&self) -> &IoCtxState {
-        &self.ctx_st_
-    }
-
-    #[inline]
-    pub(super) fn demand(&self) -> Option<&Demand<O>> {
-        self.demand_.as_ref()
-    }
-
-    pub(super) fn try_init_demand(
-        self: Pin<&mut Self>,
-        demand: Demand<O>,
-    ) -> Result<&Demand<O>, Demand<O>> {
-        let this = unsafe { self.get_unchecked_mut() };
-        if this.demand_.is_none() {
-            this.demand_ = Option::Some(demand);
-            let Option::Some(demand_ref) = &this.demand_ else {
-                unreachable!()
-            };
-            Result::Ok(demand_ref)
-        } else {
-            Result::Err(demand)
-        }
-    }
-}
-
-impl<B, P, T, O> AsMut<B> for IoCtx<B, P, T, O>
-where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    fn as_mut(&mut self) -> &mut B {
-        &mut self.buffer_
-    }
-}
-
-pub(super) struct IoCtxState(AtomicUsize);
-
-impl IoCtxState {
-    /// Set the MSB to 1 to flag NO_CLOSE
-    const NO_CLOSE_FLAG: usize = 1usize << (usize::BITS - 1);
-
-    const fn closing_flag() -> Self {
-        Self(AtomicUsize::new(0usize))
-    }
-
-    const fn no_close_flag() -> Self {
-        Self(AtomicUsize::new(Self::NO_CLOSE_FLAG))
-    }
-
-    #[inline(always)]
-    fn atomic_count_(&self) -> AtomicCount<usize, &mut AtomicUsize> {
-        let x = self as *const _ as *mut Self;
-        unsafe { AtomicCount::new(&mut (*x).0) }
-    }
-
-    #[inline(always)]
-    fn get_use_count_(s: usize) -> usize {
-        s & (!Self::NO_CLOSE_FLAG)
-    }
-
-    /// Returns if the flag indicate the input or output end should close;
-    /// true, should close, false, no close.
-    #[inline(always)]
-    pub fn test_closing_flagged(s: usize) -> bool {
-        s | (!Self::NO_CLOSE_FLAG) != usize::MAX
-    }
-
-    pub fn incr_use_count(&self) -> IoCtrl {
-        let c = self.atomic_count_().inc();
-        IoCtrl::NoOp(Self::get_use_count_(c))
-    }
-
-    pub fn decr_use_count(&self) -> IoCtrl {
-        let s = self.atomic_count_().dec();
-        let c = Self::get_use_count_(s);
-        if c == 1 && Self::test_closing_flagged(s) {
-            IoCtrl::MarkClose(c)
-        } else {
-            IoCtrl::NoOp(c)
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) enum IoCtrl {
-    MarkClose(usize),
-    NoOp(usize),
-}
-
-impl IoCtrl {
-    #[allow(dead_code)]
-    pub const fn use_count(&self) -> usize {
-        match self {
-            Self::MarkClose(c) => *c,
-            Self::NoOp(c) => *c,
-        }
-    }
-}
-
-impl fmt::Display for IoCtrl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            IoCtrl::MarkClose(c) => {
-                let c = *c;
-                write!(f, "IoCtrl::MarkClose({c})")
-            }
-            IoCtrl::NoOp(c) => {
-                let c = *c;
-                write!(f, "IoCtrl::NoOp({c})")
-            }
-        }
     }
 }
 
@@ -434,22 +273,21 @@ impl fmt::Display for IoCtrl {
 mod tests_ {
     use core::borrow::{Borrow, BorrowMut};
 
-    use asyncex_channel::x_deps::{mm_ptr, atomex};
     use atomex::{
         x_deps::funty,
         TrCmpxchOrderings,
     };
     use core_malloc::CoreAlloc;
     use mm_ptr::{Shared, Owned};
+    use spmv_oneshot::x_deps::atomex;
 
-    use crate::ring_buffer::{*, buffer_::IoCtx};
+    use crate::ring_buffer::*;
 
     /// 向 buffer 中写入 [0][0,1][0,1,2]...[0,1,..,max_step - 2, max_step - 1]
-    async fn write_seq_<X, B, P, T, O>(
-        mut buffer: BuffWrite<X, B, P, T, O>,
+    async fn write_seq_<B, P, T, O>(
+        mut buffer: BuffTx<B, P, T, O>,
         max_len: usize)
     where
-        X: BorrowMut<IoCtx<B, P, T, O>>,
         B: Borrow<RingBuffer<P, T, O>>,
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryFrom<usize> + Copy,
@@ -498,11 +336,10 @@ mod tests_ {
         log::trace!("writer exits")
     }
 
-    async fn read_seq_<X, B, P, T, O>(
-        mut reader: BuffRead<X, B, P, T, O>,
+    async fn read_seq_<B, P, T, O>(
+        mut reader: BuffRx<B, P, T, O>,
         max_len: usize)
     where
-        X: BorrowMut<IoCtx<B, P, T, O>>,
         B: Borrow<RingBuffer<P, T, O>>,
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryInto<usize> + Copy,
@@ -551,7 +388,9 @@ mod tests_ {
             log::trace!("[buffer_::read_seq] #{seq_len}: {target:?} ");
             for (u, x) in target.iter().enumerate() {
                 let v = span_offset;
-                let Result::Ok(x) = (*x).try_into() else { panic!() };
+                let Result::<usize, _>::Ok(x) = (*x).try_into() else {
+                    panic!()
+                };
                 assert_eq!(v, x, "#{u}: v({v}) != x({x})");
                 span_offset += 1;
                 if span_offset == span_length {

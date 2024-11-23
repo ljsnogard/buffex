@@ -1,6 +1,6 @@
 ﻿[package]
 name = "buffex"
-version = "0.0.1"
+version = "0.2.0"
 edition = "2021"
 
 authors = ["lino <lino_snsalias@outlook.com>"]
@@ -13,18 +13,20 @@ readme = "README.md"
 
 [dependencies]
 abs_buff = { git = "https://github.com/ljsnogard/abs_buff.git", branch = "dev-0.2.0" }
-asyncex-channel = { git = "https://github.com/ljsnogard/asyncex-channel.git", tag = "0.0.1" }
+spmv-oneshot = { git = "https://github.com/ljsnogard/spmv-oneshot.git", branch = "dev/0.1.2" }
 
 pin-project = { version = "1.1.*" }
 smallvec = { version = "1.13", features = [] }
 
 [dev-dependencies]
-mm_ptr = { git = "https://github.com/ljsnogard/mm_ptr.git", tag = "0.1.1" }
+mm_ptr = { git = "https://github.com/ljsnogard/mm_ptr.git", branch = "dev/0.1.2" }
 core_malloc = { git = "https://github.com/ljsnogard/core_malloc.git", tag = "0.1.1" }
 abs_buff_chunk_utils = { git = "https://github.com/ljsnogard/abs_buff_chunk_utils.git", branch = "dev-0.2.0" }
 
 env_logger = { version = "0.11.*" }
 log = { version = "0.4.*" }
-tokio = { version = "1", features = ["full"] }
+
 chrono = { version = "0.4.*" }
 rand = { version = "0.8.*" }
+
+tokio = { version = "1", features = ["full", "tracing"] }

@@ -1,31 +1,28 @@
 ﻿use core::{
-    borrow::BorrowMut,
+    borrow::{Borrow, BorrowMut},
     cell::UnsafeCell,
     cmp,
     fmt::{self, Debug},
     marker::{PhantomData, PhantomPinned},
-    ops::{Deref, DerefMut},
+    pin::Pin,
     ptr::{self, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize},
 };
 
-use asyncex_channel::{
-    oneshot::Oneshot,
-    x_deps::atomex,
-};
 use atomex::{
     x_deps::funty,
-    AtomexPtrOwned, CmpxchResult, PhantomAtomicPtr, StrictOrderings,
-    TrAtomicFlags, TrCmpxchOrderings,
+    AtomicCount, AtomexPtrOwned, CmpxchResult, PhantomAtomicPtr,
+    StrictOrderings, TrAtomicFlags, TrCmpxchOrderings,
 };
+use spmv_oneshot::{x_deps::atomex, Oneshot};
 
-use super::{RxError, TxError, Dual};
+use super::{RingBuffer, RxError, TxError, Dual};
 
-pub(super) type FnCheckState<O> = dyn FnMut(&RwState<O>) -> bool;
+pub(super) type FnCheckState<O> = fn(&RwState<O>) -> bool;
 pub(super) type AtomicDemandPtr<O> = AtomexPtrOwned<Demand<O>, O>;
 
 #[derive(Debug)]
-pub(super) struct CheckStateFn<O>(NonNull<FnCheckState<O>>)
+pub(super) struct CheckStateFn<O>(FnCheckState<O>)
 where
     O: TrCmpxchOrderings;
 
@@ -33,9 +30,8 @@ impl<O> CheckStateFn<O>
 where
     O: TrCmpxchOrderings,
 {
-    pub fn new(f: &mut FnCheckState<O>) -> Self {
-        let p = unsafe { NonNull::new_unchecked(f) };
-        CheckStateFn(p)
+    pub const fn new(fp: FnCheckState<O>) -> Self {
+        CheckStateFn(fp)
     }
 }
 
@@ -45,8 +41,8 @@ where
 {
     type Output = bool;
 
-    extern "rust-call" fn call_once(mut self, args: (&RwState<O>,)) -> Self::Output {
-        let f = unsafe { self.0.as_mut() };
+    extern "rust-call" fn call_once(self, args: (&RwState<O>,)) -> Self::Output {
+        let f = self.0;
         f(args.0)
     }
 }
@@ -56,19 +52,8 @@ where
     O: TrCmpxchOrderings,
 {
     extern "rust-call" fn call_mut(&mut self, args: (&RwState<O>,)) -> Self::Output {
-        let f = unsafe { self.0.as_mut() };
+        let f = self.0;
         f(args.0)
-    }
-}
-
-impl<O> Deref for CheckStateFn<O>
-where
-    O: TrCmpxchOrderings,
-{
-    type Target = FnCheckState<O>;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { self.0.as_ref() }
     }
 }
 
@@ -95,7 +80,7 @@ impl<O> Demand<O>
 where
     O: TrCmpxchOrderings,
 {
-    pub fn new(check: &mut FnCheckState<O>) -> Self {
+    pub const fn new(check: FnCheckState<O>) -> Self {
         Demand {
             chk_fn: CheckStateFn::new(check),
             signal: Oneshot::new(),
@@ -106,14 +91,159 @@ where
         let i = state.load_state();
         #[cfg(test)]
         log::trace!("[Demand::producer_check] {i:?}");
-        i.wlen > 0usize
+        i.wl > 0usize
     }
 
     pub fn consumer_check(state: &RwState<O>) -> bool {
         let i = state.load_state();
         #[cfg(test)]
         log::trace!("[Demand::consumer_check] {i:?}");
-        i.rlen > 0usize
+        i.rl > 0usize
+    }
+}
+
+
+pub(super) struct IoCtx<B, P, T, O>
+where
+    B: Borrow<RingBuffer<P, T, O>>,
+    P: BorrowMut<[T]>,
+    T: Clone,
+    O: TrCmpxchOrderings,
+{
+    _pinned: PhantomPinned,
+    _use_p_: PhantomData<P>,
+    _use_t_: PhantomData<[T]>,
+    buffer_: B,
+    ctx_st_: IoCtxState,
+    demand_: Option<Demand<O>>,
+}
+
+impl<B, P, T, O> IoCtx<B, P, T, O>
+where
+    B: Borrow<RingBuffer<P, T, O>>,
+    P: BorrowMut<[T]>,
+    T: Clone,
+    O: TrCmpxchOrderings,
+{
+    pub const fn new(buffer: B, ctx_st: IoCtxState) -> Self {
+        IoCtx {
+            _pinned: PhantomPinned,
+            _use_p_: PhantomData,
+            _use_t_: PhantomData,
+            buffer_: buffer,
+            ctx_st_: ctx_st,
+            demand_: Option::None,
+        }
+    }
+
+    pub fn buffer(&self) -> &RingBuffer<P, T, O> {
+        self.buffer_.borrow()
+    }
+
+    pub fn state(&self) -> &IoCtxState {
+        &self.ctx_st_
+    }
+
+    #[inline]
+    pub fn demand(&self) -> Option<&Demand<O>> {
+        self.demand_.as_ref()
+    }
+
+    pub fn try_init_demand(
+        self: Pin<&mut Self>,
+        demand: Demand<O>,
+    ) -> Result<&Demand<O>, Demand<O>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        if this.demand_.is_none() {
+            this.demand_ = Option::Some(demand);
+            let Option::Some(demand_ref) = &this.demand_ else {
+                unreachable!()
+            };
+            Result::Ok(demand_ref)
+        } else {
+            Result::Err(demand)
+        }
+    }
+}
+
+impl<B, P, T, O> AsMut<B> for IoCtx<B, P, T, O>
+where
+    B: Borrow<RingBuffer<P, T, O>>,
+    P: BorrowMut<[T]>,
+    T: Clone,
+    O: TrCmpxchOrderings,
+{
+    fn as_mut(&mut self) -> &mut B {
+        &mut self.buffer_
+    }
+}
+
+pub(super) struct IoCtxState(AtomicUsize);
+
+impl IoCtxState {
+    /// Set the MSB to 1 to flag NO_CLOSE
+    const NO_CLOSE_FLAG: usize = 1usize << (usize::BITS - 1);
+
+    pub const fn closing_flag() -> Self {
+        Self(AtomicUsize::new(0usize))
+    }
+
+    pub const fn no_close_flag() -> Self {
+        Self(AtomicUsize::new(Self::NO_CLOSE_FLAG))
+    }
+
+    #[inline(always)]
+    fn atomic_count_(&self) -> AtomicCount<usize, &mut AtomicUsize> {
+        let x = self as *const _ as *mut Self;
+        unsafe { AtomicCount::new(&mut (*x).0) }
+    }
+
+    #[inline(always)]
+    fn get_use_count_(s: usize) -> usize {
+        s & (!Self::NO_CLOSE_FLAG)
+    }
+
+    /// Returns if the flag indicate the input or output end should close;
+    /// true, should close, false, no close.
+    #[inline(always)]
+    pub fn test_closing_flagged(s: usize) -> bool {
+        s | (!Self::NO_CLOSE_FLAG) != usize::MAX
+    }
+
+    pub fn incr_use_count(&self) -> CtrlHint {
+        let c = self.atomic_count_().inc();
+        CtrlHint::NoOp(Self::get_use_count_(c))
+    }
+
+    pub fn decr_use_count(&self) -> CtrlHint {
+        let s = self.atomic_count_().dec();
+        let c = Self::get_use_count_(s);
+        if c == 1 && Self::test_closing_flagged(s) {
+            CtrlHint::MarkClose(c)
+        } else {
+            CtrlHint::NoOp(c)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CtrlHint {
+    MarkClose(usize),
+    NoOp(usize),
+}
+
+impl fmt::Display for CtrlHint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CtrlHint::MarkClose(c) => {
+                let c = *c;
+                write!(f, "IoCtrl::MarkClose({c})")
+            }
+            CtrlHint::NoOp(c) => {
+                let c = *c;
+                write!(f, "IoCtrl::NoOp({c})")
+            }
+        }
     }
 }
 
@@ -127,10 +257,22 @@ where
 
     _pinned_: PhantomPinned,
 
-    /// The slot stores the enqueued consumer demand.
+    /// The slot stores the enqueued consumer demand.  
+    /// 
+    /// Possible pointer values are:
+    /// * `ptr::null_mut()`: No enqueued consumer;
+    /// * `BuffState::closed_demand_ptr_()`: consumer end closed;
+    /// * `BuffState::locked_demand_ptr_()`: consumer demand locked;
+    /// * A pointer to an existing `Demand<O>`
     consumer_: AtomicDemandPtr<O>,
 
     /// The slot stores the enqueued producer demand.
+    /// 
+    /// Possible pointer values are:
+    /// * `ptr::null_mut()`: No enqueued producer;
+    /// * `BuffState::closed_demand_ptr_()`: producer end closed;
+    /// * `BuffState::locked_demand_ptr_()`: producer demand locked;
+    /// * A pointer to an existing `Demand<O>`
     producer_: AtomicDemandPtr<O>,
 
     rw_state_: RwState<O>,
@@ -179,6 +321,11 @@ where
     }
 
     #[inline(always)]
+    fn locked_demand_ptr_() -> *mut Demand<O> {
+        (usize::MAX - 1) as *mut _
+    }
+
+    #[inline(always)]
     fn is_closed_(a: &AtomicDemandPtr<O>) -> bool {
         ptr::eq(a.pointer(), Self::closed_demand_ptr_())
     }
@@ -187,11 +334,11 @@ where
         &self,
     ) -> Result<Dual<NonNull<[T]>>, RxError<usize>> {
         let info = self.rw_state_.load_state();
-        if info.rlen == 0usize {
+        if info.rl == 0usize {
             let e = if self.is_closing() {
                 RxError::Closing
             } else {
-                RxError::Drained(info.roff)
+                RxError::Drained(info.rp)
             };
             Result::Err(e)
         } else {
@@ -205,11 +352,11 @@ where
         length: usize,
     ) -> Result<Dual<NonNull<[T]>>, RxError<usize>> {
         let info = self.rw_state_.load_state();
-        if info.rlen == 0usize {
+        if info.rl == 0usize {
             let e = if self.is_closing() {
                 RxError::Closing
             } else {
-                RxError::Drained(info.roff)
+                RxError::Drained(info.rp)
             };
             Result::Err(e)
         } else {
@@ -236,12 +383,12 @@ where
     ) -> Result<BuffIoDelta<usize>, RxError<usize>> {
         let i = self.rw_state_.load_state();
         #[cfg(test)]
-        log::trace!("[BuffState::reader_checked_inc_pos_] {i:?}");
-        if i.rlen == 0usize {
+        log::trace!("[BuffState::reader_checked_inc_pos_] {i:?} ({:?})", self.rw_state_);
+        if i.rl == 0usize {
             let e = if self.is_closing() {
                 RxError::Closing
             } else {
-                RxError::Drained(i.roff)
+                RxError::Drained(i.rp)
             };
             return Result::Err(e);
         };
@@ -252,16 +399,16 @@ where
         &self,
         length: usize,
     ) -> Result<Dual<NonNull<[T]>>, TxError<usize>> {
-        let s = self.rw_state_.load_state();
-        if s.wlen == 0usize {
+        let i = self.rw_state_.load_state();
+        if i.wl == 0usize {
             let e = if self.is_closing() {
                 TxError::Closing
             } else {
-                TxError::Stuffed(s.woff)
+                TxError::Stuffed(i.wp)
             };
             Result::Err(e)
         } else {
-            Result::Ok(self.pack_slice_write_(&s, length))
+            Result::Ok(self.pack_slice_write_(&i, length))
         }
     }
 
@@ -284,21 +431,16 @@ where
     ) -> Result<BuffIoDelta<usize>, TxError<usize>> {
         let i = self.rw_state_.load_state();
         #[cfg(test)]
-        log::trace!("[BuffState::writer_checked_inc_pos_] {i:?}");
-        if i.wlen == 0usize {
+        log::trace!("[BuffState::writer_checked_inc_pos_] {i:?} ({:?})", self.rw_state_);
+        if i.wl == 0usize {
             let e = if self.is_closing() {
                 TxError::Closing
             } else {
-                TxError::Stuffed(i.woff)
+                TxError::Stuffed(i.wp)
             };
             return Result::Err(e);
         }
-        let src_len = if length > i.wlen {
-            i.wlen
-        } else {
-            length
-        };
-        self.rw_state_.try_inc_writer_pos(src_len)
+        self.rw_state_.try_inc_writer_pos(length)
     }
 
     fn pack_slice_write_(
@@ -306,14 +448,14 @@ where
         i: &RwStateInfo<usize>,
         length: usize,
     ) -> Dual<NonNull<[T]>> {
-        debug_assert!(i.wlen > 0usize);
+        debug_assert!(i.wl > 0usize);
         let mut dual = Dual::new();
         let mut buf_ptr = self.get_buff_non_null_();
         let buf_mut: &mut [T] = unsafe { buf_ptr.as_mut() };
 
         // Make sure the 1st slice will not exceed the amount needed.
-        let l0 = cmp::min(i.wlen, length);
-        let s0 = &mut buf_mut[i.woff..i.woff + l0];
+        let l0 = cmp::min(i.wl, length);
+        let s0 = &mut buf_mut[i.wp..i.wp + l0];
         dual.push(unsafe { NonNull::new_unchecked(s0) });
 
         #[cfg(test)]
@@ -322,13 +464,13 @@ where
         // length.saturating_sub(l0) is equivalent to:
         // if l0 < length { length - l0 } else { 0 }
         let l1 = length.saturating_sub(l0);
-        if l1 == 0usize || i.woff < i.roff {
+        if l1 == 0usize || i.wp < i.rp {
             return dual;
         }
-        debug_assert!(i.woff >= i.roff);
-        debug_assert!(i.woff + l0 == buf_mut.len());
+        debug_assert!(i.wp >= i.rp);
+        debug_assert!(i.wp + l0 == buf_mut.len());
         // Make sure the 2nd slice will not exceed the reader position;
-        let l1 = cmp::min(i.roff, l1);
+        let l1 = cmp::min(i.rp, l1);
         if l1 > 0 {
             #[cfg(test)]
             log::trace!("[BuffState::pack_slice_write_] i({i:?}), l1({l1})");
@@ -343,15 +485,15 @@ where
         i: &RwStateInfo<usize>,
         length: usize,
     ) -> Dual<NonNull<[T]>> {
-        debug_assert!(i.rlen > 0usize);
+        debug_assert!(i.rl > 0usize);
         let mut dual = Dual::new();
         let mut buf_ptr = self.get_buff_non_null_();
 
         let buf_mut: &mut [T] = unsafe { buf_ptr.as_mut() };
 
         // Make sure the 1st slice will not exceed the tail of the buffer.
-        let l0 = cmp::min(i.rlen, length);
-        let s0 = &mut buf_mut[i.roff..i.roff + l0];
+        let l0 = cmp::min(i.rl, length);
+        let s0 = &mut buf_mut[i.rp..i.rp + l0];
         dual.push(unsafe { NonNull::new_unchecked(s0) });
 
         #[cfg(test)]
@@ -360,13 +502,13 @@ where
         // length.saturating_sub(l0) is equivalent to:
         // if l0 < length { length - l0 } else { 0 }
         let l1 = length.saturating_sub(l0);
-        if l1 == 0usize || i.roff < i.woff {
+        if l1 == 0usize || i.rp < i.wp {
             return dual;
         }
-        debug_assert!(i.roff >= i.woff);
-        debug_assert!(i.roff + l0 == buf_mut.len());
+        debug_assert!(i.rp >= i.wp);
+        debug_assert!(i.rp + l0 == buf_mut.len());
         // Make sure the 2nd slice will not exceed the writer position
-        let l1 = cmp::min(l1, i.woff);
+        let l1 = cmp::min(l1, i.wp);
         if l1 > 0 {
             #[cfg(test)]
             log::trace!("[BuffState::pack_slice_read_] i({i:?}), l1({l1})");
@@ -462,41 +604,48 @@ where
         &self,
         cell: &AtomicDemandPtr<O>,
     ) {
-        let p = cell.pointer();
-        if p == Self::closed_demand_ptr_() || p.is_null() {
-            #[cfg(test)]
-            log::trace!("[BuffState::try_signal_] closed or null demand({p:p})");
-            return;
+        let try_swap = {
+            let expect = |p: *mut Demand<O>|
+                !p.is_null()
+                    && !ptr::eq(p, Self::closed_demand_ptr_())
+                    && !ptr::eq(p, Self::locked_demand_ptr_());
+            let desire = |_|
+                Self::locked_demand_ptr_();
+            loop {
+                let r = cell.try_spin_compare_exchange_weak(expect, desire);
+                let CmpxchResult::Unexpected(v) = r else {
+                    debug_assert!(matches!(r, CmpxchResult::Succ(_)));
+                    break r;
+                };
+                if ptr::eq(v, Self::locked_demand_ptr_()) {
+                    continue;
+                } else {
+                    #[cfg(test)]
+                    log::trace!("[BuffState::try_signal_] no demand or closed.");
+                    return;
+                }
+            }
         };
-        let opt_demand = unsafe { p.as_mut() };
-        let Option::Some(demand) = opt_demand else {
-            // we should have avoided null_ptr when cmpxch
-            unreachable!("[BuffState::try_signal_] unexpected null demand");
+        let CmpxchResult::Succ(p_demand) = try_swap else {
+            unreachable!("[BuffState::try_signal_]");
         };
+        let demand = unsafe { &mut *p_demand };
         let check_fn = &mut demand.chk_fn;
         if !check_fn(&self.rw_state_) {
             #[cfg(test)]
             log::trace!("[BuffState::try_signal_] demand({demand:p}) denied");
+
+            let expect = |p: *mut Demand<O>|
+                ptr::eq(p, Self::locked_demand_ptr_());
+            let desire = |_| p_demand;
+            let r = cell.try_spin_compare_exchange_weak(expect, desire);
+            debug_assert!(r.is_succ());
             return;
         };
-        let r = cell
-            .try_spin_compare_and_reset(unsafe { NonNull::new_unchecked(p) });
-
-        #[allow(unused_variables)]
-        if let Result::Err(e) = r {
-            #[cfg(test)] log::trace!(
-                "[BuffState::try_signal_] cmpxch failed:
-                expect({demand:p}), occur({e:p})");
-            return;
-        }
         let x = demand.signal.send(()).wait();
-        #[allow(unused_variables)]
-        if let Result::Err(e) = x {
-            #[cfg(test)]
-            log::warn!("[BuffState::try_signal_] signal err({e:?}");
-        }
+        assert!(x.is_ok());
         #[cfg(test)]
-        log::trace!("[BuffState::try_signal_] signaled demand({demand:p}");
+        log::trace!("[BuffState::try_signal_] signaled demand({demand:p})");
     }
 
     fn get_buff_non_null_(&self) -> NonNull<[T]> {
@@ -523,8 +672,7 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let a = unsafe { self.get_buff_non_null_().as_mut() };
-        let g = RwPosIoGuard::acquire(self, a);
-        write!(f, "{}|{:?}", &self.rw_state_, g.deref())
+        write!(f, "{}|{:?}", &self.rw_state_, a)
     }
 }
 
@@ -547,17 +695,17 @@ pub(super) struct RwStateInfo<U>
 where
     U: funty::Unsigned,
 {
-    /// reader offset
-    pub roff: U,
+    /// reader position (offset to the start)
+    pub rp: U,
 
-    /// writer offset
-    pub woff: U,
+    /// writer position (offset to the start)
+    pub wp: U,
 
-    /// Max number of continuous units available for reading from offset
-    pub rlen: U,
+    /// Max number of continuous units available for reading from `rp`
+    pub rl: U,
 
-    /// Max number of continuous units available for writing from offset
-    pub wlen: U,
+    /// Max number of continuous units available for writing from `wp`
+    pub wl: U,
 }
 
 pub(super) struct RwState<O>
@@ -588,7 +736,7 @@ where
 
     #[inline]
     pub fn data_size(&self) -> usize {
-        self.load_state().rlen
+        self.load_state().rl
     }
 }
 
@@ -616,10 +764,6 @@ where
     /// greater than the reader position.
     const INVERT_FLAG: usize = 1usize << (usize::BITS - 1);
 
-    /// To indicate whether the buffer is locked for operation.
-    #[allow(non_snake_case)]
-    const IO_BUSY_FLAG: usize = Self::INVERT_FLAG >> 1;
-
     const MAX_SIZE_BITS: u32 = (usize::BITS - Self::FLAG_RSV_BITS) >> 1;
 
     const BUFF_SIZE_MOD: usize = 1usize << Self::MAX_SIZE_BITS;
@@ -632,21 +776,16 @@ where
     /// Check positions of reader and writer, and calculate the max continuous
     /// buffer size for reading and writing
     fn load_positions_(&self, state: usize) -> RwStateInfo<usize> {
-        let w = Self::load_writer_pos_(state);
-        let r = Self::load_reader_pos_(state);
-        let (l, a) = if Self::expect_invert_true_(state) {
-            debug_assert!(w <= r, "w({w}) <= r({r}), {self:?}");
-            (self.capacity_ - r, r - w)
+        let wp = Self::load_writer_pos_(state);
+        let rp = Self::load_reader_pos_(state);
+        let (rl, wl) = if Self::expect_invert_true_(state) {
+            debug_assert!(wp <= rp, "wp({wp}) <= rp({rp}), {self:?}");
+            (self.capacity_ - rp, rp - wp)
         } else {
-            debug_assert!(w >= r,  "w({w}) >= r({r}), {self:?}");
-            (w - r, self.capacity_ - w)
+            debug_assert!(wp >= rp,  "wp({wp}) >= rp({rp}), {self:?}");
+            (wp - rp, self.capacity_ - wp)
         };
-        RwStateInfo {
-            roff: r,
-            woff: w,
-            rlen: l,
-            wlen: a,
-        }
+        RwStateInfo { rp, wp, rl, wl }
     }
 
     pub fn load_state(&self) -> RwStateInfo<usize> {
@@ -660,38 +799,38 @@ where
         &self,
         amount: usize,
     ) -> Result<BuffIoDelta<usize>, TxError<usize>> {
+        debug_assert!(amount <= self.capacity_);
         let mut state = self.value();
-        let amount = amount % (self.capacity_ + 1usize);
         loop {
-            let r = Self::load_reader_pos_(state);
-            let w = Self::load_writer_pos_(state);
+            let rp = Self::load_reader_pos_(state);
+            let wp = Self::load_writer_pos_(state);
             #[cfg(test)]
             log::trace!(
                 "[RwState::try_inc_writer_pos] before amount({amount}): \
-                capacity({}), state({self})", self.capacity(),
+                capacity({}), state({self})", self.capacity_,
             );
             let s_new;
             let delta;
             if Self::expect_invert_true_(state) {
-                debug_assert!(w <= r, "w({w}) >= r({r})");
-                let available = r - w;
-                if available == 0usize && amount > 0usize {
-                    break Result::Err(TxError::Stuffed(w));
+                debug_assert!(wp <= rp, "wp({wp}) >= rp({rp})");
+                let wl = rp - wp;
+                if wl == 0usize && amount > 0usize {
+                    break Result::Err(TxError::Stuffed(wp));
                 }
-                delta = cmp::min(available, amount);
+                delta = cmp::min(wl, amount);
                 // When the overflow flag is on, increasing the writer position
                 // should never reset the overflow flag.
-                s_new = Self::store_writer_pos_(state, w + delta);
+                s_new = Self::store_writer_pos_(state, wp + delta);
             } else {
-                debug_assert!(w >= r, "w({w}) >= r({r})");
-                let available = self.capacity_ - w + r;
+                debug_assert!(wp >= rp, "wp({wp}) >= rp({rp})");
+                let available = self.capacity_ - wp + rp;
                 if available == 0usize && amount > 0usize {
-                    break Result::Err(TxError::Stuffed(w));
+                    break Result::Err(TxError::Stuffed(wp));
                 }
                 delta = cmp::min(available, amount);
                 if delta > 0usize {
-                    let w_new = (w + delta) % self.capacity_;
-                    s_new = if w_new < r || w_new <= w {
+                    let w_new = (wp + delta) % self.capacity_;
+                    s_new = if w_new < rp || w_new <= wp {
                         let s = Self::store_writer_pos_(state, w_new);
                         Self::desire_invert_true_(s)
                     } else {
@@ -714,11 +853,11 @@ where
             #[cfg(test)]
             log::trace!(
                 "[RwState::try_inc_writer_pos] after  amount({amount}): \
-                capacity({}), state({self})", self.capacity(),
+                capacity({}), state({self})", self.capacity_,
             );
             break Result::Ok(BuffIoDelta {
                 amount: delta,
-                offset: w,
+                offset: wp,
             });
         }
     }
@@ -730,10 +869,11 @@ where
         &self,
         amount: usize,
     ) -> Result<BuffIoDelta<usize>, RxError<usize>> {
+        debug_assert!(amount <= self.capacity_);
         let mut state = self.value();
         loop {
-            let r = Self::load_reader_pos_(state);
-            let w = Self::load_writer_pos_(state);
+            let rp = Self::load_reader_pos_(state);
+            let wp = Self::load_writer_pos_(state);
             #[cfg(test)]
             log::trace!(
                 "[RwState::try_inc_reader_pos] before amount({amount}): \
@@ -742,28 +882,28 @@ where
             let s_new;
             let delta;
             if Self::expect_invert_true_(state) {
-                debug_assert!(r >= w, "r({r}) >= w({w})");
-                let available = self.capacity_ - r + w;
+                debug_assert!(rp >= wp, "rp({rp}) >= wp({wp})");
+                let available = self.capacity_ - rp + wp;
                 if available == 0usize && amount > 0usize {
-                    break Result::Err(RxError::Drained(r));
+                    break Result::Err(RxError::Drained(rp));
                 }
                 delta = cmp::min(available, amount);
-                let r_new = (r + delta) % self.capacity_;
-                s_new = if r_new <= w || r_new <= r {
+                let r_new = (rp + delta) % self.capacity_;
+                s_new = if r_new <= wp || r_new <= rp {
                     let s = Self::store_reader_pos_(state, r_new);
                     Self::desire_invert_false_(s)
                 } else {
                     Self::store_reader_pos_(state, r_new)
                 };
             } else {
-                debug_assert!(r <= w, "r({r}) <= w({w})");
-                let available = w - r;
-                if available == 0usize && amount > 0usize {
-                    break Result::Err(RxError::Drained(r));
+                debug_assert!(rp <= wp, "rp({rp}) <= wp({wp})");
+                let rl = wp - rp;
+                if rl == 0usize && amount > 0usize {
+                    break Result::Err(RxError::Drained(rp));
                 }
-                delta = cmp::min(available, amount);
+                delta = cmp::min(rl, amount);
                 // it is impossible that the increment will reset the overflow flag
-                s_new = Self::store_reader_pos_(state, r + delta);
+                s_new = Self::store_reader_pos_(state, rp + delta);
             }
             let xch_res = self.rw_pos_.compare_exchange_weak(
                 state,
@@ -778,30 +918,12 @@ where
             #[cfg(test)]
             log::trace!(
                 "[RwState::try_inc_reader_pos] after  amount({amount}): \
-                capacity({}), state({self})", self.capacity(),
+                capacity({}), state({self})", self.capacity_,
             );
             break Result::Ok(BuffIoDelta {
                 amount: delta,
-                offset: r,
+                offset: rp,
             });
-        }
-    }
-
-    pub fn is_io_busy(&self) -> bool {
-        Self::expect_io_busy_true_(self.value())
-    }
-
-    pub fn try_set_io_busy(&self, is_busy: bool) -> CmpxchResult<usize> {
-        if is_busy {
-            self.try_spin_compare_exchange_weak(
-                Self::expect_io_busy_false_,
-                Self::desire_io_busy_true_,
-            )
-        } else {
-            self.try_spin_compare_exchange_weak(
-                Self::expect_io_busy_true_,
-                Self::desire_io_busy_false_,
-            )
         }
     }
 
@@ -817,24 +939,6 @@ where
 
     fn desire_invert_true_(value: usize) -> usize {
         value | Self::INVERT_FLAG
-    }
-
-    // -- IO_BUSY_FLAG
-
-    fn expect_io_busy_true_(value: usize) -> bool {
-        value | (!Self::IO_BUSY_FLAG) == usize::MAX
-    }
-
-    fn expect_io_busy_false_(value: usize) -> bool {
-        value & Self::IO_BUSY_FLAG == 0usize
-    }
-
-    fn desire_io_busy_true_(value: usize) -> usize {
-        value | Self::IO_BUSY_FLAG
-    }
-
-    fn desire_io_busy_false_(value: usize) -> usize {
-        value & (!Self::IO_BUSY_FLAG)
     }
 
     // --
@@ -876,92 +980,10 @@ where
         write!(f, "r: {r}, ")?;
         write!(f, "w: {w}, ")?;
         if Self::expect_invert_true_(s) {
-            write!(f, "INVERT, ")?;
+            write!(f, "INVERT")
         } else {
-            write!(f, "NORMAL, ")?;
+            write!(f, "NORMAL")
         }
-        if Self::expect_io_busy_true_(s) {
-            write!(f, "BUSY")
-        } else {
-            write!(f, "FREE")
-        }
-    }
-}
-
-pub(super) struct RwPosIoGuard<'a, P, T, O>(
-    &'a BuffState<P, T, O>,
-    &'a mut [T])
-where
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings;
-
-impl<'a, P, T, O> RwPosIoGuard<'a, P, T, O>
-where
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    fn acquire(
-        state: &'a BuffState<P, T, O>,
-        buffer: &'a mut [T],
-    ) -> RwPosIoGuard<'a, P, T, O> {
-        loop {
-            let x = state.rw_state_.try_set_io_busy(true);
-            if x.is_succ() {
-                break;
-            }
-        }
-        assert!(state.rw_state_.is_io_busy());
-        RwPosIoGuard(state, buffer)
-    }
-
-    fn release_(state: &BuffState<P, T, O>) {
-        loop {
-            let x = state.rw_state_.try_set_io_busy(false);
-            if x.is_succ() {
-                break;
-            }
-        }
-    }
-
-    pub fn state(&self) -> &BuffState<P, T, O> {
-        self.0
-    }
-}
-
-impl<P, T, O> Drop for RwPosIoGuard<'_, P, T, O>
-where
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    fn drop(&mut self) {
-        Self::release_(self.state())
-    }
-}
-
-impl<P, T, O> Deref for RwPosIoGuard<'_, P, T, O>
-where
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    type Target = [T];
-
-    fn deref(&self) -> &Self::Target {
-        self.1
-    }
-}
-
-impl<P, T, O> DerefMut for RwPosIoGuard<'_, P, T, O>
-where
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.1
     }
 }
 
@@ -1010,7 +1032,7 @@ mod tests_ {
     };
     use core_malloc::CoreAlloc;
     use mm_ptr::Owned;
-    use asyncex_channel::x_deps::{mm_ptr, atomex};
+    use spmv_oneshot::x_deps::atomex;
     use crate::ring_buffer::{RxError, TxError};
 
     use super::{BuffState, RwState};
@@ -1023,18 +1045,13 @@ mod tests_ {
         assert_eq!(s, 0);
         assert_eq!(rw.capacity(), BUFF_SIZE);
         assert_eq!(rw.data_size(), 0usize);
-        assert!(!rw.is_io_busy());
+
         assert!(!RwState::<StrictOrderings>::expect_invert_true_(s));
         let info = rw.load_positions_(s);
-        assert_eq!(info.roff, 0);
-        assert_eq!(info.woff, 0);
-        assert_eq!(info.rlen, 0);
-        assert_eq!(info.wlen, BUFF_SIZE); 
-
-        assert!(rw.try_set_io_busy(true).is_succ());
-        assert!(rw.is_io_busy());
-        assert!(rw.try_set_io_busy(false).is_succ());
-        assert!(!rw.is_io_busy());
+        assert_eq!(info.rp, 0);
+        assert_eq!(info.wp, 0);
+        assert_eq!(info.rl, 0);
+        assert_eq!(info.wl, BUFF_SIZE);
     }
 
     #[test]
