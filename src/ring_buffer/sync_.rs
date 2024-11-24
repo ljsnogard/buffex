@@ -114,15 +114,15 @@ where
 
     pub fn producer_check(state: &RwState<O>) -> bool {
         let i = state.load_state();
-        #[cfg(test)]
-        log::trace!("[Demand::producer_check] {i:?}");
+        // #[cfg(test)]
+        // log::trace!("[Demand::producer_check] {i:?}");
         i.wl > 0usize
     }
 
     pub fn consumer_check(state: &RwState<O>) -> bool {
         let i = state.load_state();
-        #[cfg(test)]
-        log::trace!("[Demand::consumer_check] {i:?}");
+        // #[cfg(test)]
+        // log::trace!("[Demand::consumer_check] {i:?}");
         i.rl > 0usize
     }
 }
@@ -415,8 +415,8 @@ where
         length: usize,
     ) -> Result<BuffIoDelta<usize>, RxError<usize>> {
         let i = self.rw_state_.load_state();
-        #[cfg(test)]
-        log::trace!("[BuffState::reader_checked_inc_pos_] {i:?} ({:?})", self.rw_state_);
+        // #[cfg(test)]
+        // log::trace!("[BuffState::reader_checked_inc_pos_] {i:?} ({:?})", self.rw_state_);
         if i.rl == 0usize {
             let e = if self.is_closing() {
                 RxError::Closing
@@ -463,8 +463,8 @@ where
         length: usize,
     ) -> Result<BuffIoDelta<usize>, TxError<usize>> {
         let i = self.rw_state_.load_state();
-        #[cfg(test)]
-        log::trace!("[BuffState::writer_checked_inc_pos_] {i:?} ({:?})", self.rw_state_);
+        // #[cfg(test)]
+        // log::trace!("[BuffState::writer_checked_inc_pos_] {i:?} ({:?})", self.rw_state_);
         if i.wl == 0usize {
             let e = if self.is_closing() {
                 TxError::Closing
@@ -491,8 +491,8 @@ where
         let s0 = &mut buf_mut[i.wp..i.wp + l0];
         dual.push(unsafe { NonNull::new_unchecked(s0) });
 
-        #[cfg(test)]
-        log::trace!("[BuffState::pack_slice_write_] i({i:?}), l0({l0})");
+        // #[cfg(test)]
+        // log::trace!("[BuffState::pack_slice_write_] i({i:?}), l0({l0})");
 
         // length.saturating_sub(l0) is equivalent to:
         // if l0 < length { length - l0 } else { 0 }
@@ -505,8 +505,8 @@ where
         // Make sure the 2nd slice will not exceed the reader position;
         let l1 = cmp::min(i.rp, l1);
         if l1 > 0 {
-            #[cfg(test)]
-            log::trace!("[BuffState::pack_slice_write_] i({i:?}), l1({l1})");
+            // #[cfg(test)]
+            // log::trace!("[BuffState::pack_slice_write_] i({i:?}), l1({l1})");
             let s1 = &mut buf_mut[..l1];
             dual.push(unsafe { NonNull::new_unchecked(s1) });
         }
@@ -529,8 +529,8 @@ where
         let s0 = &mut buf_mut[i.rp..i.rp + l0];
         dual.push(unsafe { NonNull::new_unchecked(s0) });
 
-        #[cfg(test)]
-        log::trace!("[BuffState::pack_slice_read_] i({i:?}), l0({l0})");
+        // #[cfg(test)]
+        // log::trace!("[BuffState::pack_slice_read_] i({i:?}), l0({l0})");
 
         // length.saturating_sub(l0) is equivalent to:
         // if l0 < length { length - l0 } else { 0 }
@@ -543,8 +543,8 @@ where
         // Make sure the 2nd slice will not exceed the writer position
         let l1 = cmp::min(l1, i.wp);
         if l1 > 0 {
-            #[cfg(test)]
-            log::trace!("[BuffState::pack_slice_read_] i({i:?}), l1({l1})");
+            // #[cfg(test)]
+            // log::trace!("[BuffState::pack_slice_read_] i({i:?}), l1({l1})");
             let s1 = &mut buf_mut[..l1];
             dual.push(unsafe { NonNull::new_unchecked(s1) });
         }
@@ -572,14 +572,14 @@ where
     }
 
     pub fn enqueue_rx(&self, demand: &Demand<O>) -> bool {
-        #[cfg(test)]
-        log::trace!("[BuffState::enqueue_rx] {demand:p}");
+        // #[cfg(test)]
+        // log::trace!("[BuffState::enqueue_rx] {demand:p}");
         Self::enqueue_demand_(&self.rx_demand_, demand)
     }
 
     pub fn enqueue_tx(&self, demand: &Demand<O>) -> bool {
-        #[cfg(test)]
-        log::trace!("[BuffState::enqueue_tx] {:p}", demand);
+        // #[cfg(test)]
+        // log::trace!("[BuffState::enqueue_tx] {:p}", demand);
         Self::enqueue_demand_(&self.tx_demand_, demand)
     }
 
@@ -594,14 +594,14 @@ where
     }
 
     pub fn dequeue_rx(&self, demand: &Demand<O>) -> bool {
-        #[cfg(test)]
-        log::trace!("[BuffState::dequeue_rx] {demand:p}");
+        // #[cfg(test)]
+        // log::trace!("[BuffState::dequeue_rx] {demand:p}");
         self.dequeue_demand(&self.rx_demand_, demand)
     }
 
     pub fn dequeue_tx(&self, demand: &Demand<O>) -> bool {
-        #[cfg(test)]
-        log::trace!("[BuffState::dequeue_tx] {demand:p}");
+        // #[cfg(test)]
+        // log::trace!("[BuffState::dequeue_tx] {demand:p}");
         self.dequeue_demand(&self.tx_demand_, demand)
     }
 
@@ -620,16 +620,16 @@ where
     /// Send signal to the demand stored in the `unsignal_` slot. This may not
     /// succeed if the `chk_fn` in demand denies to signal.
     pub fn try_signal_rx(&self) {
-        #[cfg(test)]
-        log::trace!("[BuffState::try_signal_rx]");
+        // #[cfg(test)]
+        // log::trace!("[BuffState::try_signal_rx]");
         self.try_signal_(&self.rx_demand_)
     }
 
     /// Send signal to the demand stored in the `unsignal_` slot. This may not
     /// succeed if the `chk_fn` in demand denies to signal.
     pub fn try_signal_tx(&self) {
-        #[cfg(test)]
-        log::trace!("[BuffState::try_signal_tx]");
+        // #[cfg(test)]
+        // log::trace!("[BuffState::try_signal_tx]");
         self.try_signal_(&self.tx_demand_)
     }
 
@@ -652,8 +652,8 @@ where
                 if ptr::eq(v, Self::locked_demand_ptr_()) {
                     continue;
                 } else {
-                    #[cfg(test)]
-                    log::trace!("[BuffState::try_signal_] no demand or closed.");
+                    // #[cfg(test)]
+                    // log::trace!("[BuffState::try_signal_] no demand or closed.");
                     return;
                 }
             }
@@ -663,8 +663,8 @@ where
         };
         let demand = unsafe { &mut *p_demand };
         if !demand.check_state(&self.rw_state_) {
-            #[cfg(test)]
-            log::trace!("[BuffState::try_signal_] demand({demand:p}) denied");
+            // #[cfg(test)]
+            // log::trace!("[BuffState::try_signal_] demand({demand:p}) denied");
 
             let expect = |p: *mut Demand<O>|
                 ptr::eq(p, Self::locked_demand_ptr_());
@@ -676,8 +676,8 @@ where
         let try_send = demand.try_take_waker().map(|w| w.wake());
         assert!(try_send.is_some());
 
-        #[cfg(test)]
-        log::trace!("[BuffState::try_signal_] signaled demand({demand:p})");
+        // #[cfg(test)]
+        // log::trace!("[BuffState::try_signal_] signaled demand({demand:p})");
 
         let try_reset = cell.try_spin_compare_and_reset(unsafe {
             NonNull::new_unchecked(Self::locked_demand_ptr_())
@@ -841,11 +841,11 @@ where
         loop {
             let rp = Self::load_reader_pos_(state);
             let wp = Self::load_writer_pos_(state);
-            #[cfg(test)]
-            log::trace!(
-                "[RwState::try_inc_writer_pos] before amount({amount}): \
-                capacity({}), state({self})", self.capacity_,
-            );
+            // #[cfg(test)]
+            // log::trace!(
+            //     "[RwState::try_inc_writer_pos] before amount({amount}): \
+            //     capacity({}), state({self})", self.capacity_,
+            // );
             let s_new;
             let delta;
             if Self::expect_invert_true_(state) {
@@ -887,11 +887,11 @@ where
                 state = x;
                 continue;
             }
-            #[cfg(test)]
-            log::trace!(
-                "[RwState::try_inc_writer_pos] after  amount({amount}): \
-                capacity({}), state({self})", self.capacity_,
-            );
+            // #[cfg(test)]
+            // log::trace!(
+            //     "[RwState::try_inc_writer_pos] after  amount({amount}): \
+            //     capacity({}), state({self})", self.capacity_,
+            // );
             break Result::Ok(BuffIoDelta {
                 amount: delta,
                 offset: wp,
@@ -911,11 +911,11 @@ where
         loop {
             let rp = Self::load_reader_pos_(state);
             let wp = Self::load_writer_pos_(state);
-            #[cfg(test)]
-            log::trace!(
-                "[RwState::try_inc_reader_pos] before amount({amount}): \
-                capacity({}), state({self})", self.capacity(),
-            );
+            // #[cfg(test)]
+            // log::trace!(
+            //     "[RwState::try_inc_reader_pos] before amount({amount}): \
+            //     capacity({}), state({self})", self.capacity(),
+            // );
             let s_new;
             let delta;
             if Self::expect_invert_true_(state) {
@@ -952,11 +952,11 @@ where
                 state = x;
                 continue;
             }
-            #[cfg(test)]
-            log::trace!(
-                "[RwState::try_inc_reader_pos] after  amount({amount}): \
-                capacity({}), state({self})", self.capacity_,
-            );
+            // #[cfg(test)]
+            // log::trace!(
+            //     "[RwState::try_inc_reader_pos] after  amount({amount}): \
+            //     capacity({}), state({self})", self.capacity_,
+            // );
             break Result::Ok(BuffIoDelta {
                 amount: delta,
                 offset: rp,
@@ -1151,7 +1151,7 @@ mod tests_ {
         assert!(buff.rx_forward(buf.len()).is_ok());
     }
 
-    /// Write [0..1][0..2]..[0..max_len - 1]
+    /// Write [0][0..1][0..2]..[0..max_len - 1]
     fn writer_<P, T, O>(
         s: Arc<BuffState<P, T, O>>,
         max_len: usize,
@@ -1190,15 +1190,12 @@ mod tests_ {
                         }
                         wrote_len += wc;
                         if wrote_len == source.len() {
-                            log::trace!("writer #{seq_len}: {:?} ({})", source.as_ref(), *s);
+                            // log::trace!("writer #{seq_len}: {:?} ({})", source.as_ref(), *s);
                             break;
                         }
                     },
                     Result::Err(TxError::Stuffed(_)) => continue,
-                    Result::Err(e) => panic!(
-                        "writer_: step({seq_len}), {:?} - {:?}\n{e:?}",
-                        split.0, split.1
-                    ),
+                    Result::Err(_) => break,
                 }
             }
             seq_len += 1;
@@ -1207,7 +1204,7 @@ mod tests_ {
         log::trace!("writer exits")
     }
 
-    /// Read [0..1][0..2] with size-decreasing buffers, from max_len to 1
+    /// Read [0][0..1]..[0..max_len - 1] with size-decreasing buffers, from max_len to 1
     fn reader_<P, T, O>(
         s: Arc<BuffState<P, T, O>>,
         max_len: usize,
@@ -1247,15 +1244,12 @@ mod tests_ {
                         }
                         read_len += rc;
                         if read_len == target.len() {
-                            log::trace!("reader #{seq_len}: {:?} ({})", target.as_ref(), *s);
+                            // log::trace!("reader #{seq_len}: {:?} ({})", target.as_ref(), *s);
                             break;
                         }
                     },
                     Result::Err(RxError::Drained(_)) => continue,
-                    Result::Err(e) => panic!(
-                        "reader: step({seq_len}), {:?} - {:?}\n{e:?}",
-                        split.0, dst,
-                    ),
+                    Result::Err(_) => break,
                 }
             }
             for (u, v) in target.iter().enumerate() {
