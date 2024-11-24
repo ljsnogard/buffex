@@ -11,8 +11,8 @@ use pin_utils::pin_mut;
 
 use abs_buff::{TrBuffIterPeek, TrBuffIterTryPeek};
 use abs_sync::{cancellation::*, x_deps::pin_utils};
-use spmv_oneshot::x_deps::{abs_sync, atomex};
 use atomex::TrCmpxchOrderings;
+use spmv_oneshot::x_deps::{abs_sync, atomex};
 
 use super::{
     buffer_::{RingBuffer, RxError},
@@ -224,7 +224,7 @@ where
 
     async fn peek_async_(self: Pin<&mut Self>) -> <Self as Future>::Output {
         let this = self.project();
-        let mut p_ctx = unsafe {
+        let p_ctx = unsafe {
             let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
             NonNull::new_unchecked(ptr)
         };
@@ -240,29 +240,30 @@ where
         let RxError::Drained(_) = peek_err else {
             return Result::Err(peek_err);
         };
+        let ring_buf = unsafe { p_ring_buf.as_ref() };
         loop {
-            let ring_buf = unsafe { p_ring_buf.as_ref() };
-            if let Option::Some(demand) = this.io_ctx_.demand() {
-                let signal_recv = demand.signal.peeker();
-                pin_mut!(signal_recv);
-                let x = signal_recv
-                    .peek_async()
-                    .may_cancel_with(this.cancel_.as_mut())
+            if let Option::Some(demand) = this.io_ctx_.as_mut().demand_mut() {
+                let x = demand
+                    .recv_signal_async(this.cancel_.as_mut())
                     .await;
-                let _ = ring_buf.state().dequeue_consumer(demand);
+
                 return if x.is_ok() {
-                    unsafe { p_ring_buf.as_ref().try_peek_() }
+                    ring_buf.try_peek_()
                 } else {
+                    let _ = ring_buf.state().dequeue_consumer(demand);
                     Result::Err(RxError::Drained(0usize))
                 }
             } else {
-                let demand = Demand::new(Demand::consumer_check);
-                let try_init = unsafe {
-                    let ctx_pin = Pin::new_unchecked(p_ctx.as_mut());
-                    ctx_pin.try_init_demand(demand)
+                let try_init = this
+                    .io_ctx_
+                    .as_mut()
+                    .try_init_demand(Demand::new(Demand::consumer_check));
+                let Result::Ok(demand_ref) = try_init else {
+                    continue;
                 };
-                let Result::Ok(demand_ref) = try_init else { continue; };
                 let x = ring_buf.state().enqueue_consumer(demand_ref);
+                #[cfg(test)]
+                log::trace!("[ReadFuture::peek_async_] enqueued demand({demand_ref:p})");
                 assert!(x)
             }
         }

@@ -312,7 +312,7 @@ where
         self: Pin<&mut Self>,
     ) -> Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>> {
         let this = self.project();
-        let mut p_ctx = unsafe {
+        let p_ctx = unsafe {
             let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
             NonNull::new_unchecked(ptr)
         };
@@ -334,40 +334,33 @@ where
             log::trace!("[ReadFuture::read_async_] {read_err}");
             return Result::Err(read_err);
         };
+        let ring_buf = unsafe { p_ring_buf.as_ref() };
         loop {
-            let opt_demand = unsafe { p_ctx.as_ref().demand() };
-            if let Option::Some(demand_ref) = opt_demand {
-                let sign_recv = demand_ref.signal.peeker();
-                pin_mut!(sign_recv);
-
+            if let Option::Some(demand) = this.io_ctx_.as_mut().demand_mut() {
                 #[cfg(test)]
-                log::trace!("[ReadFuture::read_async_] before await sig({demand_ref:p})");
+                log::trace!("[ReadFuture::read_async_] before await sig({demand:p})");
 
-                let x = sign_recv
-                    .peek_async()
-                    .may_cancel_with(this.cancel_.as_mut())
+                let x = demand
+                    .recv_signal_async(this.cancel_.as_mut())
                     .await;
 
                 #[cfg(test)]
-                log::trace!("[ReadFuture::read_async_] sig recv({demand_ref:p}) {x:?}");
+                log::trace!("[ReadFuture::read_async_] sig recv({demand:p}) {x:?}");
 
-                let ring_buf = unsafe { p_ring_buf.as_ref() };
-                let _ = ring_buf.state().dequeue_consumer(demand_ref);
                 return if x.is_ok() {
-                    unsafe { p_ring_buf.as_ref().try_read_(*this.length_) }
+                    ring_buf.try_read_(*this.length_)
                 } else {
+                    let _ = ring_buf.state().dequeue_consumer(demand);
                     Result::Err(RxError::Drained(0usize))
                 }
             } else {
-                let demand_ref = Demand::new(Demand::consumer_check);
-                let try_init = unsafe {
-                    let ctx_pin = Pin::new_unchecked(p_ctx.as_mut());
-                    ctx_pin.try_init_demand(demand_ref)
-                };
+                let try_init = this
+                    .io_ctx_
+                    .as_mut()
+                    .try_init_demand(Demand::new(Demand::consumer_check));
                 let Result::Ok(demand_ref) = try_init else {
                     continue;
                 };
-                let ring_buf = unsafe { p_ring_buf.as_ref() };
                 let x = ring_buf.state().enqueue_consumer(demand_ref);
                 #[cfg(test)]
                 log::trace!("[ReadFuture::read_async_] enqueued demand({demand_ref:p})");

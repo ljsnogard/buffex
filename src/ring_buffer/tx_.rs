@@ -37,7 +37,7 @@ where
     O: TrCmpxchOrderings,
 {
     pub(super) fn new(ctx: IoCtx<B, P, T, O>) -> Self {
-        ctx.borrow().state().incr_use_count();
+        ctx.state().incr_use_count();
         BuffTx(ctx)
     }
 
@@ -45,15 +45,16 @@ where
         &mut self,
         length: usize,
     ) -> Result<Dual<ReclSliceMut<'_, P, T, O>>, TxError<usize>> {
-        self.0.borrow_mut().buffer().try_write_(length)
+        self.0.buffer().try_write_(length)
     }
 
     pub fn write_async(
         &mut self,
         length: usize,
     ) -> WriteAsync<'_, B, P, T, O> {
+        // Safe because IoCtx is `!Unpin`
         let io_ctx = unsafe {
-            let mut pointer = NonNull::new_unchecked(self.0.borrow_mut());
+            let mut pointer = NonNull::new_unchecked(&mut self.0);
             Pin::new_unchecked(pointer.as_mut())
         };
         WriteAsync::new(io_ctx, length)
@@ -61,7 +62,7 @@ where
 
     #[inline(always)]
     pub fn buffer(&self) -> &RingBuffer<P, T, O> {
-        self.borrow()
+        self.as_ref()
     }
 }
 
@@ -83,15 +84,15 @@ where
     }
 }
 
-impl<B, P, T, O> Borrow<RingBuffer<P, T, O>> for BuffTx<B, P, T, O>
+impl<B, P, T, O> AsRef<RingBuffer<P, T, O>> for BuffTx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
     T: Clone,
     O: TrCmpxchOrderings,
 {
-    fn borrow(&self) -> &RingBuffer<P, T, O> {
-        self.0.borrow().buffer()
+    fn as_ref(&self) -> &RingBuffer<P, T, O> {
+        self.0.buffer()
     }
 }
 
@@ -284,40 +285,33 @@ where
             log::trace!("[WriteFuture::write_async_] try_write err: {write_err:?}");
             return Result::Err(write_err);
         };
+        let ring_buf = unsafe { p_ring_buf.as_ref() };
         loop {
-            let opt_demand = unsafe { p_io_ctx.as_ref().demand() };
-            if let Option::Some(demand_ref) = opt_demand {
-                let sign_recv = demand_ref.signal.peeker();
-                pin_mut!(sign_recv);
-
+            if let Option::Some(demand) = this.io_ctx_.as_mut().demand_mut() {
                 #[cfg(test)]
-                log::trace!("[WriteFuture::write_async_] before await demand({demand_ref:p})");
+                log::trace!("[WriteFuture::write_async_] before await demand({demand:p})");
 
-                let x = sign_recv
-                    .peek_async()
-                    .may_cancel_with(this.cancel_.as_mut())
+                let x = demand
+                    .recv_signal_async(this.cancel_.as_mut())
                     .await;
 
                 #[cfg(test)]
-                log::trace!("[WriteFuture::write_async_] sig recv({demand_ref:p}) {x:?}");
+                log::trace!("[WriteFuture::write_async_] sig recv({demand:p}) {x:?}");
 
-                let ring_buf = unsafe { p_ring_buf.as_ref() };
-                let _ = ring_buf.state().dequeue_producer(demand_ref);
                 return if x.is_ok() {
-                    unsafe { p_ring_buf.as_ref().try_write_(*this.length_) }
+                    ring_buf.try_write_(*this.length_)
                 } else {
+                    let _ = ring_buf.state().dequeue_producer(demand);
                     Result::Err(TxError::Stuffed(0usize))
                 }
             } else {
-                let demand = Demand::new(Demand::producer_check);
-                let try_init = unsafe {
-                    let ctx_pin = Pin::new_unchecked(p_io_ctx.as_mut());
-                    ctx_pin.try_init_demand(demand)
-                };
+                let try_init = this
+                    .io_ctx_
+                    .as_mut()
+                    .try_init_demand(Demand::new(Demand::producer_check));
                 let Result::Ok(demand_ref) = try_init else {
                     continue;
                 };
-                let ring_buf = unsafe { p_ring_buf.as_ref() };
                 let x = ring_buf.state().enqueue_producer(demand_ref);
                 #[cfg(test)]
                 log::trace!("[WriteFuture::write_async_] enqueued demand({demand_ref:p})");

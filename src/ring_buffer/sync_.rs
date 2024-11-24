@@ -9,12 +9,22 @@
     sync::atomic::{AtomicPtr, AtomicUsize},
 };
 
+use pin_utils::pin_mut;
+
+use abs_sync::{
+    cancellation::TrCancellationToken,
+    x_deps::pin_utils,
+};
 use atomex::{
     x_deps::funty,
     AtomicCount, AtomexPtrOwned, CmpxchResult, PhantomAtomicPtr,
     StrictOrderings, TrAtomicFlags, TrCmpxchOrderings,
 };
-use spmv_oneshot::{x_deps::atomex, Oneshot};
+use spmv_oneshot::{
+    self,
+    x_deps::{abs_sync, atomex},
+    Oneshot,
+};
 
 use super::{RingBuffer, RxError, TxError, Dual};
 
@@ -72,8 +82,8 @@ pub(super) struct Demand<O>
 where
     O: TrCmpxchOrderings,
 {
-    pub chk_fn: CheckStateFn<O>,
-    pub signal: Oneshot<(), O>,
+    check_fn_: CheckStateFn<O>,
+    oneshot_: Oneshot<(), O>,
 }
 
 impl<O> Demand<O>
@@ -82,9 +92,36 @@ where
 {
     pub const fn new(check: FnCheckState<O>) -> Self {
         Demand {
-            chk_fn: CheckStateFn::new(check),
-            signal: Oneshot::new(),
+            check_fn_: CheckStateFn::new(check),
+            oneshot_: Oneshot::new(),
         }
+    }
+
+    pub fn check_state(
+        &mut self,
+        rw_state: &RwState<O>,
+    ) -> bool {
+        let f = &mut self.check_fn_;
+        f(rw_state)
+    }
+
+    pub async fn recv_signal_async<C: TrCancellationToken>(
+        &mut self,
+        cancel: Pin<&mut C>,
+    ) -> Result<(), spmv_oneshot::RxError<()>> {
+        let peeker = self.oneshot_.peeker();
+        pin_mut!(peeker);
+        peeker
+            .peek_async()
+            .may_cancel_with(cancel)
+            .await
+            .copied()
+    }
+
+    pub fn send_signal(
+        &mut self,
+    ) -> Result<(), spmv_oneshot::TxError<()>> {
+        self.oneshot_.send(()).wait()
     }
 
     pub fn producer_check(state: &RwState<O>) -> bool {
@@ -101,7 +138,6 @@ where
         i.rl > 0usize
     }
 }
-
 
 pub(super) struct IoCtx<B, P, T, O>
 where
@@ -145,21 +181,24 @@ where
     }
 
     #[inline]
-    pub fn demand(&self) -> Option<&Demand<O>> {
-        self.demand_.as_ref()
+    pub fn demand_mut(
+        self: Pin<&mut Self>,
+    ) -> Option<&mut Demand<O>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        this.demand_.as_mut()
     }
 
     pub fn try_init_demand(
         self: Pin<&mut Self>,
         demand: Demand<O>,
-    ) -> Result<&Demand<O>, Demand<O>> {
+    ) -> Result<&mut Demand<O>, Demand<O>> {
         let this = unsafe { self.get_unchecked_mut() };
         if this.demand_.is_none() {
             this.demand_ = Option::Some(demand);
-            let Option::Some(demand_ref) = &this.demand_ else {
+            let Option::Some(demand_mut) = &mut this.demand_ else {
                 unreachable!()
             };
-            Result::Ok(demand_ref)
+            Result::Ok(demand_mut)
         } else {
             Result::Err(demand)
         }
@@ -600,11 +639,10 @@ where
         self.try_signal_(&self.producer_)
     }
 
-    fn try_signal_(
-        &self,
-        cell: &AtomicDemandPtr<O>,
-    ) {
-        let try_swap = {
+    fn try_signal_(&self, cell: &AtomicDemandPtr<O>) {
+        // Try to lock up the demand by swapping it out of the queue, replacing
+        // with locked_demand_ptr_
+        let try_lock = {
             let expect = |p: *mut Demand<O>|
                 !p.is_null()
                     && !ptr::eq(p, Self::closed_demand_ptr_())
@@ -626,12 +664,11 @@ where
                 }
             }
         };
-        let CmpxchResult::Succ(p_demand) = try_swap else {
+        let CmpxchResult::Succ(p_demand) = try_lock else {
             unreachable!("[BuffState::try_signal_]");
         };
         let demand = unsafe { &mut *p_demand };
-        let check_fn = &mut demand.chk_fn;
-        if !check_fn(&self.rw_state_) {
+        if !demand.check_state(&self.rw_state_) {
             #[cfg(test)]
             log::trace!("[BuffState::try_signal_] demand({demand:p}) denied");
 
@@ -642,10 +679,16 @@ where
             debug_assert!(r.is_succ());
             return;
         };
-        let x = demand.signal.send(()).wait();
-        assert!(x.is_ok());
+        let try_send = demand.send_signal();
+        assert!(try_send.is_ok());
+
         #[cfg(test)]
         log::trace!("[BuffState::try_signal_] signaled demand({demand:p})");
+
+        let try_reset = cell.try_spin_compare_and_reset(unsafe {
+            NonNull::new_unchecked(Self::locked_demand_ptr_())
+        });
+        assert!(try_reset.is_ok());
     }
 
     fn get_buff_non_null_(&self) -> NonNull<[T]> {
