@@ -312,18 +312,11 @@ where
         self: Pin<&mut Self>,
     ) -> Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>> {
         let this = self.project();
-        let p_ctx = unsafe {
+        let ring_buf: &'a RingBuffer<P, T, O> = unsafe {
             let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
-            NonNull::new_unchecked(ptr)
+            NonNull::new_unchecked(ptr).as_ref().buffer()
         };
-        let p_ring_buf = unsafe { 
-            let ring_buf = p_ctx.as_ref().buffer();
-            let ptr = ring_buf as *const _ as *mut RingBuffer<P, T, O>;
-            NonNull::new_unchecked(ptr)
-        };
-        let try_read = unsafe {
-            p_ring_buf.as_ref().try_read_(*this.length_)
-        };
+        let try_read = ring_buf.try_read_(*this.length_);
         let Result::Err(read_err) = try_read else {
             #[cfg(test)]
             log::trace!("[ReadFuture::read_async_] try_read ok");
@@ -334,7 +327,6 @@ where
             log::trace!("[ReadFuture::read_async_] {read_err}");
             return Result::Err(read_err);
         };
-        let ring_buf = unsafe { p_ring_buf.as_ref() };
         loop {
             if let Option::Some(demand) = this.io_ctx_.as_mut().demand_mut() {
                 #[cfg(test)]

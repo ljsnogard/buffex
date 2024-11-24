@@ -265,18 +265,11 @@ where
         self: Pin<&mut Self>,
     ) -> Result<Dual<ReclSliceMut<'a, P, T, O>>, TxError<usize>> {
         let this = self.project();
-        let mut p_io_ctx = unsafe {
+        let ring_buf: &'a RingBuffer<P, T, O> = unsafe {
             let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
-            NonNull::new_unchecked(ptr)
+            NonNull::new_unchecked(ptr).as_ref().buffer()
         };
-        let p_ring_buf = unsafe { 
-            let ring_buf = p_io_ctx.as_ref().buffer();
-            let ptr = ring_buf as *const _ as *mut RingBuffer<P, T, O>;
-            NonNull::new_unchecked(ptr)
-        };
-        let try_write = unsafe {
-            p_ring_buf.as_ref().try_write_(*this.length_)
-        };
+        let try_write = ring_buf.try_write_(*this.length_);
         let Result::Err(write_err) = try_write else {
             return try_write;
         };
@@ -285,7 +278,6 @@ where
             log::trace!("[WriteFuture::write_async_] try_write err: {write_err:?}");
             return Result::Err(write_err);
         };
-        let ring_buf = unsafe { p_ring_buf.as_ref() };
         loop {
             if let Option::Some(demand) = this.io_ctx_.as_mut().demand_mut() {
                 #[cfg(test)]

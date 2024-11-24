@@ -224,23 +224,17 @@ where
 
     async fn peek_async_(self: Pin<&mut Self>) -> <Self as Future>::Output {
         let this = self.project();
-        let p_ctx = unsafe {
+        let ring_buf: &'a RingBuffer<P, T, O> = unsafe {
             let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
-            NonNull::new_unchecked(ptr)
+            NonNull::new_unchecked(ptr).as_ref().buffer()
         };
-        let p_ring_buf = unsafe { 
-            let ring_buf = p_ctx.as_ref().buffer();
-            let ptr = ring_buf as *const _ as *mut RingBuffer<P, T, O>;
-            NonNull::new_unchecked(ptr)
-        };
-        let try_peek = unsafe { p_ring_buf.as_ref().try_peek_() };
+        let try_peek =  ring_buf.try_peek_();
         let Result::Err(peek_err) = try_peek else {
             return try_peek;
         };
         let RxError::Drained(_) = peek_err else {
             return Result::Err(peek_err);
         };
-        let ring_buf = unsafe { p_ring_buf.as_ref() };
         loop {
             if let Option::Some(demand) = this.io_ctx_.as_mut().demand_mut() {
                 let x = demand
