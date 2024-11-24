@@ -7,7 +7,6 @@
 };
 
 use atomex::{StrictOrderings, TrCmpxchOrderings};
-use spmv_oneshot::x_deps::atomex;
 
 use super::{
     reclaim_::{ReaderForwardFn, ReclSliceMut, ReclSliceRef, WriterForwardFn},

@@ -12,7 +12,6 @@ use pin_utils::pin_mut;
 use abs_buff::{TrBuffIterPeek, TrBuffIterTryPeek};
 use abs_sync::{cancellation::*, x_deps::pin_utils};
 use atomex::TrCmpxchOrderings;
-use spmv_oneshot::x_deps::{abs_sync, atomex};
 
 use super::{
     buffer_::{RingBuffer, RxError},
@@ -49,10 +48,11 @@ where
 
     pub fn peek_async(&mut self) -> PeekAsync<'_, B, P, T, O> {
         // Safe because IoCtx is !Unpin
-        let io_ctx = unsafe {
+        let mut io_ctx = unsafe {
             let mut pointer = NonNull::new_unchecked(self.0.borrow_mut());
             Pin::new_unchecked(pointer.as_mut())
         };
+        let _ = io_ctx.as_mut().try_reset_demand();
         PeekAsync::new(io_ctx)
     }
 }
@@ -68,7 +68,7 @@ where
         let ctx = self.0.borrow_mut();
         let ctrl = ctx.state().decr_use_count();
         if matches!(ctrl, CtrlHint::MarkClose(_)) {
-            ctx.buffer().state().mark_consumer_closed()
+            ctx.buffer().state().mark_rx_closed()
         }
         #[cfg(test)]
         log::trace!("[BuffPeek::Drop] ctrl({ctrl})");
@@ -221,47 +221,6 @@ where
             cancel_: cancel,
         }
     }
-
-    async fn peek_async_(self: Pin<&mut Self>) -> <Self as Future>::Output {
-        let this = self.project();
-        let ring_buf: &'a RingBuffer<P, T, O> = unsafe {
-            let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
-            NonNull::new_unchecked(ptr).as_ref().buffer()
-        };
-        let try_peek =  ring_buf.try_peek_();
-        let Result::Err(peek_err) = try_peek else {
-            return try_peek;
-        };
-        let RxError::Drained(_) = peek_err else {
-            return Result::Err(peek_err);
-        };
-        loop {
-            if let Option::Some(demand) = this.io_ctx_.as_mut().demand_mut() {
-                let x = demand
-                    .recv_signal_async(this.cancel_.as_mut())
-                    .await;
-
-                return if x.is_ok() {
-                    ring_buf.try_peek_()
-                } else {
-                    let _ = ring_buf.state().dequeue_consumer(demand);
-                    Result::Err(RxError::Drained(0usize))
-                }
-            } else {
-                let try_init = this
-                    .io_ctx_
-                    .as_mut()
-                    .try_init_demand(Demand::new(Demand::consumer_check));
-                let Result::Ok(demand_ref) = try_init else {
-                    continue;
-                };
-                let x = ring_buf.state().enqueue_consumer(demand_ref);
-                #[cfg(test)]
-                log::trace!("[ReadFuture::peek_async_] enqueued demand({demand_ref:p})");
-                assert!(x)
-            }
-        }
-    }
 }
 
 impl<'a, C, B, P, T, O> Future for PeekFuture<'a, C, B, P, T, O>
@@ -275,8 +234,67 @@ where
     type Output = Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let f = self.peek_async_();
-        pin_mut!(f);
-        f.poll(cx)
+        let this = self.project();
+        let ring_buf: &'a RingBuffer<P, T, O> = unsafe {
+            let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
+            NonNull::new_unchecked(ptr).as_ref().buffer()
+        };
+        loop {
+            if let Option::Some(demand) = this.io_ctx_.as_mut().demand_mut() {
+                let try_peek = ring_buf.try_peek_();
+                let Result::Err(rx_err) = try_peek else {
+                    // try_peek is ok
+                    #[cfg(test)]
+                    log::trace!("[PeekFuture::poll] enqueued({demand:p}) try_peek_ ok");
+                    let _ = ring_buf.state().dequeue_rx(demand);
+                    return Poll::Ready(try_peek);
+                };
+                let RxError::Drained(p) = rx_err else {
+                    // try_peek is not TxError::Stuffed
+                    #[cfg(test)]
+                    log::trace!("[PeekFuture::poll] enqueued({demand:p}) try_peek_ err: {rx_err:?}");
+                    let _ = ring_buf.state().dequeue_rx(demand);
+                    return Poll::Ready(Result::Err(rx_err));
+                };
+                let fut_cancel = this
+                    .cancel_
+                    .as_mut()
+                    .cancellation()
+                    .into_future();
+                pin_mut!(fut_cancel);
+                if fut_cancel.poll(cx).is_ready() {
+                    #[cfg(test)]
+                    log::trace!("[PeekFuture::poll] enqueued({demand:p}) cancelled");
+                    let _ = ring_buf.state().dequeue_rx(demand);
+                    return Poll::Ready(Result::Err(RxError::Drained(p)));
+                }
+                break Poll::Pending;
+            } else {
+                let try_peek = ring_buf.try_peek_();
+                let Result::Err(rx_err) = try_peek else {
+                    // try_peek is ok
+                    return Poll::Ready(try_peek);
+                };
+                let RxError::Drained(_) = rx_err else {
+                    // try_peek is not RxError::Drained
+                    #[cfg(test)]
+                    log::trace!("[PeekFuture::poll] not queued try_peek_ err: {rx_err:?}");
+                    return Poll::Ready(Result::Err(rx_err));
+                };
+                let try_init = this
+                    .io_ctx_
+                    .as_mut()
+                    .try_init_demand(Demand::new(Demand::consumer_check));
+                let Result::Ok(demand) = try_init else {
+                    unreachable!("[PeekFuture::poll]")
+                };
+                let x = demand.try_init_waker(|| cx.waker().clone());
+                assert!(x.is_ok());
+                let x = ring_buf.state().enqueue_rx(demand);
+                assert!(x);
+                #[cfg(test)]
+                log::trace!("[PeekFuture::poll] enqueued demand({demand:p})");
+            }
+        }
     }
 }

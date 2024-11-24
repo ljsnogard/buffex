@@ -14,7 +14,6 @@ use abs_buff::{
 };
 use abs_sync::{cancellation::*, x_deps::pin_utils};
 use atomex::TrCmpxchOrderings;
-use spmv_oneshot::x_deps::{abs_sync, atomex};
 
 use super::{
     buffer_::{RingBuffer, RxError},
@@ -55,11 +54,12 @@ where
         &mut self,
         length: usize,
     ) -> ReadAsync<'_, B, P, T, O> {
-        let context = unsafe {
+        let mut io_ctx = unsafe {
             let mut pointer = NonNull::new_unchecked(&mut self.0);
             Pin::new_unchecked(pointer.as_mut())
         };
-        ReadAsync::new(context, length)
+        let _ = io_ctx.as_mut().try_reset_demand();
+        ReadAsync::new(io_ctx, length)
     }
 
     pub fn try_peek(
@@ -69,11 +69,12 @@ where
     }
 
     pub fn peek_async(&mut self) -> PeekAsync<'_, B, P, T, O> {
-        let context = unsafe {
+        let mut io_ctx = unsafe {
             let mut pointer = NonNull::new_unchecked(&mut self.0);
             Pin::new_unchecked(pointer.as_mut())
         };
-        PeekAsync::new(context)
+        let _ = io_ctx.as_mut().try_reset_demand();
+        PeekAsync::new(io_ctx)
     }
 
     pub fn as_peek(&mut self) -> BuffPeek<'_, B, P, T, O> {
@@ -92,7 +93,7 @@ where
         let ctx = &self.0;
         let hint = ctx.state().decr_use_count();
         if matches!(hint, CtrlHint::MarkClose(_)) {
-            ctx.buffer().state().mark_consumer_closed()
+            ctx.buffer().state().mark_rx_closed()
         }
         #[cfg(test)]
         log::trace!("[BuffRead::Drop] hint({hint})");
@@ -271,23 +272,6 @@ where
     cancel_: Pin<&'a mut C>,
 }
 
-impl<'a, C, B, P, T, O> Future for ReadFuture<'a, C, B, P, T, O>
-where
-    C: TrCancellationToken,
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    type Output = Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let f = self.read_async_();
-        pin_mut!(f);
-        f.poll(cx)
-    }
-}
-
 impl<'a, C, B, P, T, O> ReadFuture<'a, C, B, P, T, O>
 where
     C: TrCancellationToken,
@@ -307,56 +291,79 @@ where
             cancel_: cancel,
         }
     }
+}
 
-    async fn read_async_(
-        self: Pin<&mut Self>,
-    ) -> Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>> {
+impl<'a, C, B, P, T, O> Future for ReadFuture<'a, C, B, P, T, O>
+where
+    C: TrCancellationToken,
+    B: Borrow<RingBuffer<P, T, O>>,
+    P: BorrowMut<[T]>,
+    T: Clone,
+    O: TrCmpxchOrderings,
+{
+    type Output = Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         let ring_buf: &'a RingBuffer<P, T, O> = unsafe {
             let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
             NonNull::new_unchecked(ptr).as_ref().buffer()
         };
-        let try_read = ring_buf.try_read_(*this.length_);
-        let Result::Err(read_err) = try_read else {
-            #[cfg(test)]
-            log::trace!("[ReadFuture::read_async_] try_read ok");
-            return try_read;
-        };
-        let RxError::Drained(_) = read_err else {
-            #[cfg(test)]
-            log::trace!("[ReadFuture::read_async_] {read_err}");
-            return Result::Err(read_err);
-        };
         loop {
             if let Option::Some(demand) = this.io_ctx_.as_mut().demand_mut() {
-                #[cfg(test)]
-                log::trace!("[ReadFuture::read_async_] before await sig({demand:p})");
-
-                let x = demand
-                    .recv_signal_async(this.cancel_.as_mut())
-                    .await;
-
-                #[cfg(test)]
-                log::trace!("[ReadFuture::read_async_] sig recv({demand:p}) {x:?}");
-
-                return if x.is_ok() {
-                    ring_buf.try_read_(*this.length_)
-                } else {
-                    let _ = ring_buf.state().dequeue_consumer(demand);
-                    Result::Err(RxError::Drained(0usize))
+                let try_read = ring_buf.try_read_(*this.length_);
+                let Result::Err(rx_err) = try_read else {
+                    // try_read is ok
+                    #[cfg(test)]
+                    log::trace!("[ReadFuture::poll] enqueued({demand:p}) try_read_ ok");
+                    let _ = ring_buf.state().dequeue_rx(demand);
+                    return Poll::Ready(try_read);
+                };
+                let RxError::Drained(p) = rx_err else {
+                    // try_read is not RxError::Drained
+                    #[cfg(test)]
+                    log::trace!("[ReadFuture::poll] enqueued({demand:p}) try_read_ err: {rx_err:?}");
+                    let _ = ring_buf.state().dequeue_rx(demand);
+                    return Poll::Ready(Result::Err(rx_err));
+                };
+                let fut_cancel = this
+                    .cancel_
+                    .as_mut()
+                    .cancellation()
+                    .into_future();
+                pin_mut!(fut_cancel);
+                if fut_cancel.poll(cx).is_ready() {
+                    #[cfg(test)]
+                    log::trace!("[ReadFuture::poll] enqueued({demand:p}) cancelled");
+                    let _ = ring_buf.state().dequeue_rx(demand);
+                    return Poll::Ready(Result::Err(RxError::Drained(p)));
                 }
+                break Poll::Pending;
             } else {
+                let try_read = ring_buf.try_read_(*this.length_);
+                let Result::Err(rx_err) = try_read else {
+                    // try_read is ok
+                    return Poll::Ready(try_read);
+                };
+                let RxError::Drained(_) = rx_err else {
+                    // try_read is not RxError::Drained
+                    #[cfg(test)]
+                    log::trace!("[ReadFuture::poll] not queued try_read_ err: {rx_err:?}");
+                    return Poll::Ready(Result::Err(rx_err));
+                };
                 let try_init = this
                     .io_ctx_
                     .as_mut()
                     .try_init_demand(Demand::new(Demand::consumer_check));
-                let Result::Ok(demand_ref) = try_init else {
-                    continue;
+                let Result::Ok(demand) = try_init else {
+                    unreachable!("[ReadFuture::poll]")
                 };
-                let x = ring_buf.state().enqueue_consumer(demand_ref);
+                let x = demand.try_init_waker(|| cx.waker().clone());
+                assert!(x.is_ok());
+                let x = ring_buf.state().enqueue_rx(demand);
+                assert!(x);
                 #[cfg(test)]
-                log::trace!("[ReadFuture::read_async_] enqueued demand({demand_ref:p})");
-                assert!(x)
+                log::trace!("[ReadFuture::poll] enqueued demand({demand:p})");
             }
         }
     }

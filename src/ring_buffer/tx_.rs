@@ -12,7 +12,6 @@ use pin_utils::pin_mut;
 use abs_buff::{TrBuffIterWrite, TrBuffIterTryWrite};
 use abs_sync::{cancellation::*, x_deps::pin_utils};
 use atomex::TrCmpxchOrderings;
-use spmv_oneshot::x_deps::{abs_sync, atomex};
 
 use super::{
     buffer_::{RingBuffer, TxError},
@@ -53,10 +52,11 @@ where
         length: usize,
     ) -> WriteAsync<'_, B, P, T, O> {
         // Safe because IoCtx is `!Unpin`
-        let io_ctx = unsafe {
+        let mut io_ctx = unsafe {
             let mut pointer = NonNull::new_unchecked(&mut self.0);
             Pin::new_unchecked(pointer.as_mut())
         };
+        let _ = io_ctx.as_mut().try_reset_demand();
         WriteAsync::new(io_ctx, length)
     }
 
@@ -77,7 +77,7 @@ where
         let ctx = self.0.borrow_mut();
         let ctrl = ctx.state().decr_use_count();
         if matches!(ctrl, CtrlHint::MarkClose(_)) {
-            ctx.buffer().state().mark_producer_closed();
+            ctx.buffer().state().mark_tx_closed();
         }
         #[cfg(test)]
         log::trace!("[BuffWrite::Drop] ctrl({ctrl})");
@@ -223,23 +223,6 @@ where
     #[pin]demand_: Option<Demand<O>>,
 }
 
-impl<'a, C, B, P, T, O> Future for WriteFuture<'a, C, B, P, T, O>
-where
-    C: TrCancellationToken,
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
-    T: Clone,
-    O: TrCmpxchOrderings,
-{
-    type Output = Result<Dual<ReclSliceMut<'a, P, T, O>>, TxError<usize>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let f = self.write_async_();
-        pin_mut!(f);
-        f.poll(cx)
-    }
-}
-
 impl<'a, C, B, P, T, O> WriteFuture<'a, C, B, P, T, O>
 where
     C: TrCancellationToken,
@@ -260,54 +243,79 @@ where
             demand_: Option::None,
         }
     }
+}
 
-    async fn write_async_(
-        self: Pin<&mut Self>,
-    ) -> Result<Dual<ReclSliceMut<'a, P, T, O>>, TxError<usize>> {
+impl<'a, C, B, P, T, O> Future for WriteFuture<'a, C, B, P, T, O>
+where
+    C: TrCancellationToken,
+    B: Borrow<RingBuffer<P, T, O>>,
+    P: BorrowMut<[T]>,
+    T: Clone,
+    O: TrCmpxchOrderings,
+{
+    type Output = Result<Dual<ReclSliceMut<'a, P, T, O>>, TxError<usize>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         let ring_buf: &'a RingBuffer<P, T, O> = unsafe {
             let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
             NonNull::new_unchecked(ptr).as_ref().buffer()
         };
-        let try_write = ring_buf.try_write_(*this.length_);
-        let Result::Err(write_err) = try_write else {
-            return try_write;
-        };
-        let TxError::Stuffed(_) = write_err else {
-            #[cfg(test)]
-            log::trace!("[WriteFuture::write_async_] try_write err: {write_err:?}");
-            return Result::Err(write_err);
-        };
         loop {
             if let Option::Some(demand) = this.io_ctx_.as_mut().demand_mut() {
-                #[cfg(test)]
-                log::trace!("[WriteFuture::write_async_] before await demand({demand:p})");
-
-                let x = demand
-                    .recv_signal_async(this.cancel_.as_mut())
-                    .await;
-
-                #[cfg(test)]
-                log::trace!("[WriteFuture::write_async_] sig recv({demand:p}) {x:?}");
-
-                return if x.is_ok() {
-                    ring_buf.try_write_(*this.length_)
-                } else {
-                    let _ = ring_buf.state().dequeue_producer(demand);
-                    Result::Err(TxError::Stuffed(0usize))
+                let try_write = ring_buf.try_write_(*this.length_);
+                let Result::Err(tx_err) = try_write else {
+                    // try_write is ok
+                    #[cfg(test)]
+                    log::trace!("[WriteFuture::poll] enqueued({demand:p}) try_write ok");
+                    let _ = ring_buf.state().dequeue_tx(demand);
+                    return Poll::Ready(try_write);
+                };
+                let TxError::Stuffed(p) = tx_err else {
+                    // try_write is not TxError::Stuffed
+                    #[cfg(test)]
+                    log::trace!("[WriteFuture::poll] enqueued({demand:p}) try_write err: {tx_err:?}");
+                    let _ = ring_buf.state().dequeue_tx(demand);
+                    return Poll::Ready(Result::Err(tx_err));
+                };
+                let fut_cancel = this
+                    .cancel_
+                    .as_mut()
+                    .cancellation()
+                    .into_future();
+                pin_mut!(fut_cancel);
+                if fut_cancel.poll(cx).is_ready() {
+                    #[cfg(test)]
+                    log::trace!("[WriteFuture::poll] enqueued({demand:p}) cancelled");
+                    let _ = ring_buf.state().dequeue_tx(demand);
+                    return Poll::Ready(Result::Err(TxError::Stuffed(p)));
                 }
+                break Poll::Pending;
             } else {
+                let try_write = ring_buf.try_write_(*this.length_);
+                let Result::Err(write_err) = try_write else {
+                    // try_write is ok
+                    return Poll::Ready(try_write);
+                };
+                let TxError::Stuffed(_) = write_err else {
+                    // try_write is not TxError::Stuffed
+                    #[cfg(test)]
+                    log::trace!("[WriteFuture::poll] not queued try_write err: {write_err:?}");
+                    return Poll::Ready(Result::Err(write_err));
+                };
                 let try_init = this
                     .io_ctx_
                     .as_mut()
                     .try_init_demand(Demand::new(Demand::producer_check));
-                let Result::Ok(demand_ref) = try_init else {
-                    continue;
+                let Result::Ok(demand) = try_init else {
+                    unreachable!("[WriteFuture::poll]")
                 };
-                let x = ring_buf.state().enqueue_producer(demand_ref);
+                let x = demand.try_init_waker(|| cx.waker().clone());
+                assert!(x.is_ok());
+                let x = ring_buf.state().enqueue_tx(demand);
+                assert!(x);
                 #[cfg(test)]
-                log::trace!("[WriteFuture::write_async_] enqueued demand({demand_ref:p})");
-                assert!(x)
+                log::trace!("[WriteFuture::poll] enqueued demand({demand:p})");
             }
         }
     }

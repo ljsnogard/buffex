@@ -7,23 +7,13 @@
     pin::Pin,
     ptr::{self, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize},
+    task::Waker,
 };
 
-use pin_utils::pin_mut;
-
-use abs_sync::{
-    cancellation::TrCancellationToken,
-    x_deps::pin_utils,
-};
 use atomex::{
     x_deps::funty,
     AtomicCount, AtomexPtrOwned, CmpxchResult, PhantomAtomicPtr,
     StrictOrderings, TrAtomicFlags, TrCmpxchOrderings,
-};
-use spmv_oneshot::{
-    self,
-    x_deps::{abs_sync, atomex},
-    Oneshot,
 };
 
 use super::{RingBuffer, RxError, TxError, Dual};
@@ -82,8 +72,8 @@ pub(super) struct Demand<O>
 where
     O: TrCmpxchOrderings,
 {
-    check_fn_: CheckStateFn<O>,
-    oneshot_: Oneshot<(), O>,
+    check_: CheckStateFn<O>,
+    waker_: Option<Waker>,
 }
 
 impl<O> Demand<O>
@@ -92,8 +82,8 @@ where
 {
     pub const fn new(check: FnCheckState<O>) -> Self {
         Demand {
-            check_fn_: CheckStateFn::new(check),
-            oneshot_: Oneshot::new(),
+            check_: CheckStateFn::new(check),
+            waker_: Option::None,
         }
     }
 
@@ -101,27 +91,25 @@ where
         &mut self,
         rw_state: &RwState<O>,
     ) -> bool {
-        let f = &mut self.check_fn_;
+        let f = &mut self.check_;
         f(rw_state)
     }
 
-    pub async fn recv_signal_async<C: TrCancellationToken>(
+    pub fn try_init_waker(
         &mut self,
-        cancel: Pin<&mut C>,
-    ) -> Result<(), spmv_oneshot::RxError<()>> {
-        let peeker = self.oneshot_.peeker();
-        pin_mut!(peeker);
-        peeker
-            .peek_async()
-            .may_cancel_with(cancel)
-            .await
-            .copied()
+        get_waker: impl FnOnce() -> Waker,
+    ) -> Result<&Waker, &Waker> {
+        let opt = &mut self.waker_;
+        if let Option::Some(existing) = opt {
+            Result::Err(existing)
+        } else {
+            *opt = Option::Some(get_waker());
+            Result::Ok(opt.as_ref().unwrap())
+        }
     }
 
-    pub fn send_signal(
-        &mut self,
-    ) -> Result<(), spmv_oneshot::TxError<()>> {
-        self.oneshot_.send(()).wait()
+    pub fn try_take_waker(&mut self) -> Option<Waker> {
+        self.waker_.take()
     }
 
     pub fn producer_check(state: &RwState<O>) -> bool {
@@ -202,6 +190,12 @@ where
         } else {
             Result::Err(demand)
         }
+    }
+
+    pub fn try_reset_demand(self: Pin<&mut Self>) -> bool {
+        let this = unsafe { self.get_unchecked_mut() };
+        let opt = this.demand_.take();
+        opt.is_some()
     }
 }
 
@@ -303,7 +297,7 @@ where
     /// * `BuffState::closed_demand_ptr_()`: consumer end closed;
     /// * `BuffState::locked_demand_ptr_()`: consumer demand locked;
     /// * A pointer to an existing `Demand<O>`
-    consumer_: AtomicDemandPtr<O>,
+    rx_demand_: AtomicDemandPtr<O>,
 
     /// The slot stores the enqueued producer demand.
     /// 
@@ -312,7 +306,7 @@ where
     /// * `BuffState::closed_demand_ptr_()`: producer end closed;
     /// * `BuffState::locked_demand_ptr_()`: producer demand locked;
     /// * A pointer to an existing `Demand<O>`
-    producer_: AtomicDemandPtr<O>,
+    tx_demand_: AtomicDemandPtr<O>,
 
     rw_state_: RwState<O>,
 
@@ -333,8 +327,8 @@ where
         Result::Ok(BuffState {
             _unuse_t_: PhantomData,
             _pinned_: PhantomPinned,
-            consumer_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
-            producer_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
+            rx_demand_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
+            tx_demand_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
             rw_state_: RwState::new(buffer.borrow().len()),
             buf_cell_: UnsafeCell::new(buffer)
         })
@@ -351,7 +345,7 @@ where
     }
 
     pub fn is_closing(&self) -> bool {
-        Self::is_closed_(&self.consumer_) || Self::is_closed_(&self.producer_)
+        Self::is_closed_(&self.rx_demand_) || Self::is_closed_(&self.tx_demand_)
     }
 
     #[inline(always)]
@@ -403,20 +397,20 @@ where
         }
     }
 
-    pub fn reader_forward(
+    pub fn rx_forward(
         &self,
         length: usize,
     ) -> Result<usize, RxError<usize>> {
         let r = self
-            .reader_checked_inc_pos_(length)
+            .rx_checked_inc_pos_(length)
             .map(|delta| delta.map_to_usize().amount);
         if r.is_ok() {
-            self.try_signal_producer();
+            self.try_signal_tx();
         };
         r
     }
 
-    fn reader_checked_inc_pos_(
+    fn rx_checked_inc_pos_(
         &self,
         length: usize,
     ) -> Result<BuffIoDelta<usize>, RxError<usize>> {
@@ -451,20 +445,20 @@ where
         }
     }
 
-    pub fn writer_forward(
+    pub fn tx_forward(
         &self,
         length: usize,
     ) -> Result<usize, TxError<usize>> {
         let r = self
-            .writer_checked_inc_pos_(length)
+            .tx_checked_inc_pos_(length)
             .map(|delta| delta.map_to_usize().amount);
         if r.is_ok() {
-            self.try_signal_consumer();
+            self.try_signal_rx();
         };
         r
     }
 
-    fn writer_checked_inc_pos_(
+    fn tx_checked_inc_pos_(
         &self,
         length: usize,
     ) -> Result<BuffIoDelta<usize>, TxError<usize>> {
@@ -557,16 +551,16 @@ where
         dual
     }
 
-    pub fn mark_consumer_closed(&self) {
-        let x = Self::mark_closed_(&self.consumer_);
+    pub fn mark_rx_closed(&self) {
+        let x = Self::mark_closed_(&self.rx_demand_);
         assert!(x.is_succ());
-        self.try_signal_producer();
+        self.try_signal_tx();
     }
 
-    pub fn mark_producer_closed(&self) {
-        let x = Self::mark_closed_(&self.producer_);
+    pub fn mark_tx_closed(&self) {
+        let x = Self::mark_closed_(&self.tx_demand_);
         assert!(x.is_succ());
-        self.try_signal_consumer();
+        self.try_signal_rx();
     }
 
     fn mark_closed_(
@@ -577,16 +571,16 @@ where
         cell.try_spin_compare_exchange_weak(expect, desire)
     }
 
-    pub fn enqueue_consumer(&self, demand: &Demand<O>) -> bool {
+    pub fn enqueue_rx(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
-        log::trace!("[BuffState::enqueue_consumer] {demand:p}");
-        Self::enqueue_demand_(&self.consumer_, demand)
+        log::trace!("[BuffState::enqueue_rx] {demand:p}");
+        Self::enqueue_demand_(&self.rx_demand_, demand)
     }
 
-    pub fn enqueue_producer(&self, demand: &Demand<O>) -> bool {
+    pub fn enqueue_tx(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
-        log::trace!("[BuffState::enqueue_producer] {:p}", demand);
-        Self::enqueue_demand_(&self.producer_, demand)
+        log::trace!("[BuffState::enqueue_tx] {:p}", demand);
+        Self::enqueue_demand_(&self.tx_demand_, demand)
     }
 
     fn enqueue_demand_(
@@ -599,16 +593,16 @@ where
             .is_succ()
     }
 
-    pub fn dequeue_consumer(&self, demand: &Demand<O>) -> bool {
+    pub fn dequeue_rx(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
-        log::trace!("[BuffState::dequeue_consumer] {demand:p}");
-        self.dequeue_demand(&self.consumer_, demand)
+        log::trace!("[BuffState::dequeue_rx] {demand:p}");
+        self.dequeue_demand(&self.rx_demand_, demand)
     }
 
-    pub fn dequeue_producer(&self, demand: &Demand<O>) -> bool {
+    pub fn dequeue_tx(&self, demand: &Demand<O>) -> bool {
         #[cfg(test)]
-        log::trace!("[BuffState::dequeue_producer] {demand:p}");
-        self.dequeue_demand(&self.producer_, demand)
+        log::trace!("[BuffState::dequeue_tx] {demand:p}");
+        self.dequeue_demand(&self.tx_demand_, demand)
     }
 
     fn dequeue_demand(
@@ -625,18 +619,18 @@ where
 
     /// Send signal to the demand stored in the `unsignal_` slot. This may not
     /// succeed if the `chk_fn` in demand denies to signal.
-    pub fn try_signal_consumer(&self) {
+    pub fn try_signal_rx(&self) {
         #[cfg(test)]
-        log::trace!("[BuffState::try_signal_consumer]");
-        self.try_signal_(&self.consumer_)
+        log::trace!("[BuffState::try_signal_rx]");
+        self.try_signal_(&self.rx_demand_)
     }
 
     /// Send signal to the demand stored in the `unsignal_` slot. This may not
     /// succeed if the `chk_fn` in demand denies to signal.
-    pub fn try_signal_producer(&self) {
+    pub fn try_signal_tx(&self) {
         #[cfg(test)]
-        log::trace!("[BuffState::try_signal_producer]");
-        self.try_signal_(&self.producer_)
+        log::trace!("[BuffState::try_signal_tx]");
+        self.try_signal_(&self.tx_demand_)
     }
 
     fn try_signal_(&self, cell: &AtomicDemandPtr<O>) {
@@ -679,8 +673,8 @@ where
             debug_assert!(r.is_succ());
             return;
         };
-        let try_send = demand.send_signal();
-        assert!(try_send.is_ok());
+        let try_send = demand.try_take_waker().map(|w| w.wake());
+        assert!(try_send.is_some());
 
         #[cfg(test)]
         log::trace!("[BuffState::try_signal_] signaled demand({demand:p})");
@@ -1118,7 +1112,7 @@ mod tests_ {
                         let len = target.len();
                         assert!(len <= BUFF_SIZE - c);
                         c += len;
-                        let x = buff.writer_forward(len);
+                        let x = buff.tx_forward(len);
                         assert!(x.is_ok());
                     }
                     continue;
@@ -1139,7 +1133,7 @@ mod tests_ {
                         assert!(len <= BUFF_SIZE - c);
                         // we don't actually read the content, just drop it
                         c += len;
-                        let x = buff.reader_forward(len);
+                        let x = buff.rx_forward(len);
                         assert!(x.is_ok());
                     }
                     continue;
@@ -1150,11 +1144,11 @@ mod tests_ {
         };
         // 3. Write some byte into the front
         assert!(buff.try_write(BUFF_SIZE - 2).is_ok());
-        assert!(buff.writer_forward(BUFF_SIZE - 2).is_ok());
+        assert!(buff.tx_forward(BUFF_SIZE - 2).is_ok());
         let try_read = buff.try_read(BUFF_SIZE);
         assert!(try_read.is_ok());
         let buf = try_read.ok().unwrap();
-        assert!(buff.reader_forward(buf.len()).is_ok());
+        assert!(buff.rx_forward(buf.len()).is_ok());
     }
 
     /// Write [0..1][0..2]..[0..max_len - 1]
@@ -1191,7 +1185,7 @@ mod tests_ {
                             assert!(wc + dst.len() <= src.len());
                             dst.clone_from_slice(&src[wc..wc + dst.len()]);
                             wc += dst.len();
-                            let x = s.writer_forward(dst.len());
+                            let x = s.tx_forward(dst.len());
                             assert!(x.is_ok());
                         }
                         wrote_len += wc;
@@ -1209,7 +1203,7 @@ mod tests_ {
             }
             seq_len += 1;
         }
-        s.mark_producer_closed();
+        s.mark_tx_closed();
         log::trace!("writer exits")
     }
 
@@ -1248,7 +1242,7 @@ mod tests_ {
                             let tgt = &mut dst[rc..rc + src.len()];
                             tgt.clone_from_slice(src);
                             rc += src.len();
-                            let x = s.reader_forward(rc);
+                            let x = s.rx_forward(rc);
                             assert!(x.is_ok());
                         }
                         read_len += rc;
@@ -1272,7 +1266,7 @@ mod tests_ {
             }
             seq_len += 1;
         }
-        s.mark_consumer_closed();
+        s.mark_rx_closed();
         log::trace!("reader exits")
     }
 

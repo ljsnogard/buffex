@@ -45,6 +45,9 @@ async fn single_byte_smoke() {
     {
         let mut b = 0u8;
         loop {
+            if b == u8::MAX {
+                break;
+            }
             let x = tx.write_async(ARR_SIZE).await;
             let Result::Ok(buff_iter) = x else {
                 let err = x.err().unwrap();
@@ -72,6 +75,10 @@ async fn single_byte_smoke() {
     {
         let mut b = 0u8;
         loop {
+            if b == u8::MAX {
+                break;
+            }
+            log::trace!("[single_byte_demo::rx_work_] b({b})");
             let x = rx.read_async(ARR_SIZE).await;
             let Result::Ok(buff_iter) = x else {
                 let err = x.err().unwrap();
@@ -80,7 +87,7 @@ async fn single_byte_smoke() {
             };
             for buff in buff_iter.into_iter() {
                 let x = buff[INDEX];
-                log::trace!("[single_byte_demo::rx_work_] {x}");
+                log::trace!("[single_byte_demo::rx_work_] x({x}), b({b})");
                 assert_eq!(x, b);
                 if b == u8::MAX {
                     break;

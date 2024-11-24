@@ -1,7 +1,6 @@
 ﻿use core::borrow::BorrowMut;
 
 use atomex::TrCmpxchOrderings;
-use spmv_oneshot::x_deps::atomex;
 
 use crate::slices::{SliceMut, SliceRef};
 use super::buffer_::RingBuffer;
@@ -44,7 +43,7 @@ where
         args: (&mut ReclSliceRef<'a, P, T, O>,),
     ) -> Self::Output {
         let slice_ref = args.0;
-        let x = self.0.state().reader_forward(slice_ref.len());
+        let x = self.0.state().rx_forward(slice_ref.len());
         assert!(x.is_ok())
     }
 }
@@ -81,7 +80,7 @@ where
         args: (&mut ReclSliceMut<'a, P, T, O>,),
     ) -> Self::Output {
         let slice_mut = args.0;
-        let x = self.0.state().writer_forward(slice_mut.len());
+        let x = self.0.state().tx_forward(slice_mut.len());
         assert!(x.is_ok())
     }
 }
