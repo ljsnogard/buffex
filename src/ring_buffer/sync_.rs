@@ -1152,10 +1152,7 @@ mod tests_ {
     }
 
     /// Write [0][0..1][0..2]..[0..max_len - 1]
-    fn writer_<P, T, O>(
-        s: Arc<BuffState<P, T, O>>,
-        max_len: usize,
-    )
+    fn writer_<P, T, O>(s: Arc<BuffState<P, T, O>>, max_len: usize)
     where
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryFrom<usize> + Copy,
@@ -1204,34 +1201,35 @@ mod tests_ {
         log::trace!("writer exits")
     }
 
-    /// Read [0][0..1]..[0..max_len - 1] with size-decreasing buffers, from max_len to 1
-    fn reader_<P, T, O>(
-        s: Arc<BuffState<P, T, O>>,
-        max_len: usize,
-    )
+    /// Read [0][0..1]..[0..max_len - 1] with size-decreasing buffers
+    fn reader_<P, T, O>(s: Arc<BuffState<P, T, O>>, max_len: usize)
     where
         P: BorrowMut<[T]>,
         T: funty::Unsigned + TryInto<usize> + Copy,
         O: TrCmpxchOrderings,
     {
         let mut seq_len = 1usize;
+        let mut auth_length = 1usize;
+        let mut auth_offset = 0usize;
         loop {
-            if seq_len > max_len {
+            if seq_len > max_len - 1 {
                 break;
             }
             // generate [0..seq_len - 1]
             let mut target = Owned::new_slice(
-                seq_len,
+                max_len - seq_len,
                 |_| T::ZERO,
                 CoreAlloc::new(),
             );
-            let mut read_len = 0usize;
-            // read [0..seq_len] from the buffer
+            // how many units has been copied to target
+            let mut read_offset = 0usize;
+            // read [0..seq_len - 1] from the buffer
             loop {
-                let split = target.split_at_mut(read_len);
+                let split = target.split_at_mut(read_offset);
                 let dst = split.1;
                 match s.try_read(dst.len()) {
                     Result::Ok(dual) => {
+                        // how many units has been copied to dst
                         let mut rc = 0usize;
                         for p in dual.into_iter() {
                             let src = unsafe { p.as_ref() };
@@ -1239,12 +1237,12 @@ mod tests_ {
                             let tgt = &mut dst[rc..rc + src.len()];
                             tgt.clone_from_slice(src);
                             rc += src.len();
-                            let x = s.rx_forward(rc);
+                            let x = s.rx_forward(src.len());
                             assert!(x.is_ok());
                         }
-                        read_len += rc;
-                        if read_len == target.len() {
-                            // log::trace!("reader #{seq_len}: {:?} ({})", target.as_ref(), *s);
+                        read_offset += rc;
+                        if read_offset == target.len() {
+                            // log::trace!("reader #{seq_len}: {:?}", target.as_ref());
                             break;
                         }
                     },
@@ -1252,11 +1250,20 @@ mod tests_ {
                     Result::Err(_) => break,
                 }
             }
-            for (u, v) in target.iter().enumerate() {
+            for v in target.iter() {
                 let Result::Ok(a) = TryInto::<usize>::try_into(*v) else {
                     panic!()
                 };
-                assert_eq!(u, a)
+                assert_eq!(
+                    a, auth_offset,
+                    "a({a}), auth_offset({auth_offset} / {auth_length})",
+                );
+                if auth_offset < auth_length - 1 {
+                    auth_offset += 1;
+                } else if auth_length < max_len {
+                    auth_offset = 0;
+                    auth_length += 1;
+                }
             }
             seq_len += 1;
         }
@@ -1264,7 +1271,7 @@ mod tests_ {
         log::trace!("reader exits")
     }
 
-    const TEST_MAX_LEN: usize = 255;
+    const TEST_MAX_LEN: usize = 256;
 
     #[test]
     fn u8_read_write_concurrent_smoke() {
