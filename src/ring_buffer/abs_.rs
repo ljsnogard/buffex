@@ -3,10 +3,7 @@
 /// A fixed size buffer that serves a pair of producer and a consumer, offering
 /// a conceptually infinite sized buffer, by internally linking the head and the
 /// tail of the buffer.
-pub trait TrRingBuffer<T = u8>
-where
-    T: Clone,
-{
+pub trait TrRingBuffer<T = u8> {
     type Tx<'a>: 'a + TrBuffIterTryWrite<T> where Self: 'a;
     type Rx<'a>: 'a + TrBuffIterTryRead<T> where Self: 'a;
 

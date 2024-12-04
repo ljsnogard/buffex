@@ -7,7 +7,6 @@
 pub struct SliceRef<B, T, R>
 where
     B: Borrow<[T]>,
-    T: Clone,
     R: FnOnce(&mut Self),
 {
     slice_: B,
@@ -18,7 +17,6 @@ where
 impl<B, T, R> SliceRef<B, T, R>
 where
     B: Borrow<[T]>,
-    T: Clone,
     R: FnOnce(&mut Self),
 {
     pub const fn new(slice: B, reclaim: Option<R>) -> Self {
@@ -33,7 +31,6 @@ where
 impl<B, T, R> Drop for SliceRef<B, T, R>
 where
     B: Borrow<[T]>,
-    T: Clone,
     R: FnOnce(&mut Self),
 {
     fn drop(&mut self) {
@@ -47,7 +44,6 @@ where
 impl<B, T, R> Deref for SliceRef<B, T, R>
 where
     B: Borrow<[T]>,
-    T: Clone,
     R: FnOnce(&mut Self),
 {
     type Target = [T];
@@ -60,7 +56,6 @@ where
 pub struct SliceMut<B, T, R>
 where
     B: BorrowMut<[T]>,
-    T: Clone,
     R: FnOnce(&mut Self),
 {
     slice_mut_: B,
@@ -71,7 +66,6 @@ where
 impl<B, T, R> SliceMut<B, T, R>
 where
     B: BorrowMut<[T]>,
-    T: Clone,
     R: FnOnce(&mut Self),
 {
     pub const fn new(slice_mut: B, reclaim: Option<R>) -> Self {
@@ -86,7 +80,6 @@ where
 impl<B, T, R> Drop for SliceMut<B, T, R>
 where
     B: BorrowMut<[T]>,
-    T: Clone,
     R: FnOnce(&mut Self),
 {
     fn drop(&mut self) {
@@ -100,7 +93,6 @@ where
 impl<B, T, R> Deref for SliceMut<B, T, R>
 where
     B: BorrowMut<[T]>,
-    T: Clone,
     R: FnOnce(&mut Self),
 {
     type Target = [T];
@@ -113,7 +105,6 @@ where
 impl<B, T, R> DerefMut for SliceMut<B, T, R>
 where
     B: BorrowMut<[T]>,
-    T: Clone,
     R: FnOnce(&mut Self),
 {
     fn deref_mut(&mut self) -> &mut [T] {

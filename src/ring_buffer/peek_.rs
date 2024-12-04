@@ -25,14 +25,12 @@ pub struct BuffPeek<'a, B, P, T, O>(&'a mut IoCtx<B, P, T, O>)
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings;
 
 impl<'a, B, P, T, O> BuffPeek<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     pub(super) fn new(ctx: &'a mut IoCtx<B, P, T, O>) -> Self {
@@ -61,7 +59,6 @@ impl<B, P, T, O> Drop for BuffPeek<'_, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     fn drop(&mut self) {
@@ -79,7 +76,6 @@ impl<B, P, T, O> TrBuffIterPeek<T> for BuffPeek<'_, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type SliceRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
@@ -97,7 +93,6 @@ impl<B, P, T, O> TrBuffIterTryPeek<T> for BuffPeek<'_, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 { 
     #[inline]
@@ -113,7 +108,6 @@ impl<B, P, T, O> AsRef<RingBuffer<P, T, O>> for BuffPeek<'_, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     #[inline]
@@ -126,14 +120,12 @@ pub struct PeekAsync<'a, B, P, T, O>(Pin<&'a mut IoCtx<B, P, T, O>>)
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings;
 
 impl<'a, B, P, T, O> PeekAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     #[inline(always)]
@@ -157,7 +149,6 @@ impl<'a, B, P, T, O> IntoFuture for PeekAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type IntoFuture = PeekFuture<'a, NonCancellableToken, B, P, T, O>;
@@ -173,7 +164,6 @@ impl<'a, B, P, T, O> TrIntoFutureMayCancel<'a> for PeekAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type MayCancelOutput =
@@ -197,7 +187,6 @@ where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
@@ -209,7 +198,6 @@ where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     pub(super) const fn new(
@@ -228,7 +216,6 @@ where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type Output = Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>>;

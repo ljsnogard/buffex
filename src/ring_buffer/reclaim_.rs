@@ -16,13 +16,11 @@ pub type ReclSliceMut<'a, P, T, O> =
 pub struct ReaderForwardFn<'a, P, T, O>(&'a RingBuffer<P, T, O>)
 where
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings;
 
 impl<'a, P, T, O> ReaderForwardFn<'a, P, T, O>
 where
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     pub const fn new(ring_buff: &'a RingBuffer<P, T, O>) -> Self {
@@ -33,7 +31,6 @@ where
 impl<'a, P, T, O> FnOnce<(&mut ReclSliceRef<'a, P, T, O>,)> for ReaderForwardFn<'a, P, T, O>
 where
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type Output = ();
@@ -53,13 +50,11 @@ where
 pub struct WriterForwardFn<'a, P, T, O>(&'a RingBuffer<P, T, O>)
 where
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings;
 
 impl<'a, P, T, O> WriterForwardFn<'a, P, T, O>
 where
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     pub const fn new(ring_buff: &'a RingBuffer<P, T, O>) -> Self {
@@ -70,7 +65,6 @@ where
 impl<'a, P, T, O> FnOnce<(&mut ReclSliceMut<'a, P, T, O>,)> for WriterForwardFn<'a, P, T, O>
 where
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type Output = ();

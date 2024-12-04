@@ -131,7 +131,6 @@ pub(super) struct IoCtx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     _pinned: PhantomPinned,
@@ -146,7 +145,6 @@ impl<B, P, T, O> IoCtx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     pub const fn new(buffer: B, ctx_st: IoCtxState) -> Self {
@@ -203,7 +201,6 @@ impl<B, P, T, O> AsMut<B> for IoCtx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     fn as_mut(&mut self) -> &mut B {
@@ -283,7 +280,6 @@ impl fmt::Display for CtrlHint {
 pub(super) struct BuffState<B, T = u8, O = StrictOrderings>
 where
     B: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     _unuse_t_: PhantomData<[T]>,
@@ -316,7 +312,6 @@ where
 impl<B, T, O> BuffState<B, T, O>
 where
     B: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     pub fn try_new(buffer: B) -> Result<Self, usize> {
@@ -704,7 +699,7 @@ where
 impl<P, T, O> fmt::Display for BuffState<P, T, O>
 where
     P: BorrowMut<[T]>,
-    T: Clone + Debug,
+    T: Debug,
     O: TrCmpxchOrderings,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -716,14 +711,14 @@ where
 unsafe impl<P, T, O> Send for BuffState<P, T, O>
 where
     P: BorrowMut<[T]>,
-    T: Clone + Send,
+    T: Send,
     O: TrCmpxchOrderings,
 {}
 
 unsafe impl<P, T, O> Sync for BuffState<P, T, O>
 where
     P: BorrowMut<[T]>,
-    T: Clone + Send + Sync,
+    T: Send + Sync,
     O: TrCmpxchOrderings,
 {}
 

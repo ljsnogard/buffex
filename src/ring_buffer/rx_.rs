@@ -28,14 +28,12 @@ pub struct BuffRx<B, P, T, O>(IoCtx<B, P, T, O>)
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings;
 
 impl<B, P, T, O> BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     pub(super) fn new(ctx: IoCtx<B, P, T, O>) -> Self {
@@ -86,7 +84,6 @@ impl<B, P, T, O> Drop for BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     fn drop(&mut self) {
@@ -104,7 +101,6 @@ impl<B, P, T, O> AsRef<RingBuffer<P, T, O>> for BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     fn as_ref(&self) -> &RingBuffer<P, T, O> {
@@ -116,7 +112,6 @@ impl<B, P, T, O> TrBuffIterRead<T> for BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type SliceRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
@@ -134,7 +129,6 @@ impl<B, P, T, O> TrBuffIterTryRead<T> for BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     #[inline]
@@ -150,7 +144,6 @@ impl<B, P, T, O> TrBuffIterPeek<T> for BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type SliceRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
@@ -168,7 +161,6 @@ impl<B, P, T, O> TrBuffIterTryPeek<T> for BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     #[inline]
@@ -184,7 +176,6 @@ pub struct ReadAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
@@ -195,7 +186,6 @@ impl<'a, B, P, T, O> ReadAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     pub(super) const fn new(
@@ -224,7 +214,6 @@ impl<'a, B, P, T, O> IntoFuture for ReadAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type IntoFuture = ReadFuture<'a, NonCancellableToken, B, P, T, O>;
@@ -240,7 +229,6 @@ impl<'a, B, P, T, O> TrIntoFutureMayCancel<'a> for ReadAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type MayCancelOutput =
@@ -264,7 +252,6 @@ where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
@@ -277,7 +264,6 @@ where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     pub(super) const fn new(
@@ -298,7 +284,6 @@ where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type Output = Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>>;

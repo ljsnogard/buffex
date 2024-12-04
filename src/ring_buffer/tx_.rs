@@ -25,14 +25,12 @@ pub struct BuffTx<B, P, T, O>(IoCtx<B, P, T, O>)
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings;
 
 impl<B, P, T, O> BuffTx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     pub(super) fn new(ctx: IoCtx<B, P, T, O>) -> Self {
@@ -70,7 +68,6 @@ impl<B, P, T, O> Drop for BuffTx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     fn drop(&mut self) {
@@ -88,7 +85,6 @@ impl<B, P, T, O> AsRef<RingBuffer<P, T, O>> for BuffTx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     fn as_ref(&self) -> &RingBuffer<P, T, O> {
@@ -100,7 +96,6 @@ impl<B, P, T, O> TrBuffIterWrite<T> for BuffTx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type SliceMut<'a> = ReclSliceMut<'a, P, T, O> where Self: 'a;
@@ -118,7 +113,6 @@ impl<B, P, T, O> TrBuffIterTryWrite<T> for BuffTx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     #[inline(always)]
@@ -134,7 +128,6 @@ pub struct WriteAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
@@ -145,7 +138,6 @@ impl<'a, B, P, T, O> WriteAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     #[inline(always)]
@@ -175,7 +167,6 @@ impl<'a, B, P, T, O> IntoFuture for WriteAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type IntoFuture = WriteFuture<'a, NonCancellableToken, B, P, T, O>;
@@ -191,7 +182,6 @@ impl<'a, B, P, T, O> TrIntoFutureMayCancel<'a> for WriteAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type MayCancelOutput = <<Self as IntoFuture>::IntoFuture as Future>::Output;
@@ -214,7 +204,6 @@ where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
@@ -228,7 +217,6 @@ where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     pub(super) const fn new(
@@ -250,7 +238,6 @@ where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type Output = Result<Dual<ReclSliceMut<'a, P, T, O>>, TxError<usize>>;

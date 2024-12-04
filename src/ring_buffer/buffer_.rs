@@ -87,14 +87,12 @@ type TrySplitResult<B, P, T, O> = Result<IoPair<B, P, T, O>, B>;
 pub struct RingBuffer<P, T = u8, O = StrictOrderings>(BuffState<P, T, O>)
 where
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings;
 
 // Public APIs for RingBuffer
 impl<P, T, O> RingBuffer<P, T, O>
 where
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     pub fn try_new(buffer: P) -> Result<Self, usize> {
@@ -172,7 +170,6 @@ where
 impl<P, T, O> RingBuffer<P, T, O>
 where
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     pub(super) fn try_read_(
@@ -233,7 +230,6 @@ where
 impl<P, T, O> AsRef<[T]> for RingBuffer<P, T, O>
 where
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     fn as_ref(&self) -> &[T] {
@@ -244,7 +240,6 @@ where
 impl<P, T, O> TrRingBuffer<T> for RingBuffer<P, T, O>
 where
     P: BorrowMut<[T]>,
-    T: Clone,
     O: TrCmpxchOrderings,
 {
     type Tx<'a> = BuffTx<&'a Self, P, T, O> where Self: 'a;
