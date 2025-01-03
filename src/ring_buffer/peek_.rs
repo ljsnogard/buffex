@@ -1,6 +1,7 @@
 ﻿use core::{
     borrow::{Borrow, BorrowMut},
     future::{Future, IntoFuture},
+    mem::MaybeUninit,
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll},
@@ -24,13 +25,13 @@ use super::{
 pub struct BuffPeek<'a, B, P, T, O>(&'a mut IoCtx<B, P, T, O>)
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings;
 
 impl<'a, B, P, T, O> BuffPeek<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     pub(super) fn new(ctx: &'a mut IoCtx<B, P, T, O>) -> Self {
@@ -58,7 +59,7 @@ where
 impl<B, P, T, O> Drop for BuffPeek<'_, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     fn drop(&mut self) {
@@ -75,7 +76,7 @@ where
 impl<B, P, T, O> TrBuffIterPeek<T> for BuffPeek<'_, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     type SliceRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
@@ -92,7 +93,7 @@ where
 impl<B, P, T, O> TrBuffIterTryPeek<T> for BuffPeek<'_, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 { 
     #[inline]
@@ -107,7 +108,7 @@ where
 impl<B, P, T, O> AsRef<RingBuffer<P, T, O>> for BuffPeek<'_, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     #[inline]
@@ -119,13 +120,13 @@ where
 pub struct PeekAsync<'a, B, P, T, O>(Pin<&'a mut IoCtx<B, P, T, O>>)
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings;
 
 impl<'a, B, P, T, O> PeekAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     #[inline(always)]
@@ -148,7 +149,7 @@ where
 impl<'a, B, P, T, O> IntoFuture for PeekAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     type IntoFuture = PeekFuture<'a, NonCancellableToken, B, P, T, O>;
@@ -163,7 +164,7 @@ where
 impl<'a, B, P, T, O> TrIntoFutureMayCancel<'a> for PeekAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     type MayCancelOutput =
@@ -186,7 +187,7 @@ pub struct PeekFuture<'a, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
@@ -197,7 +198,7 @@ impl<'a, C, B, P, T, O> PeekFuture<'a, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     pub(super) const fn new(
@@ -215,7 +216,7 @@ impl<'a, C, B, P, T, O> Future for PeekFuture<'a, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     type Output = Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>>;

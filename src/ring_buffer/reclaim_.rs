@@ -1,4 +1,7 @@
-﻿use core::borrow::BorrowMut;
+﻿use core::{
+    borrow::BorrowMut,
+    mem::MaybeUninit,
+};
 
 use atomex::TrCmpxchOrderings;
 
@@ -9,18 +12,18 @@ pub type ReclSliceRef<'a, P, T, O> =
     SliceRef<&'a [T], T, ReaderForwardFn<'a, P, T, O>>;
 
 pub type ReclSliceMut<'a, P, T, O> =
-    SliceMut<&'a mut [T], T, WriterForwardFn<'a, P, T, O>>;
+    SliceMut<&'a mut [MaybeUninit<T>], T, WriterForwardFn<'a, P, T, O>>;
 
 /// A wrapper around the internal function that forwards the reader position,
 /// and will be invoked when a `ReclSliceRef` drops.
 pub struct ReaderForwardFn<'a, P, T, O>(&'a RingBuffer<P, T, O>)
 where
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings;
 
 impl<'a, P, T, O> ReaderForwardFn<'a, P, T, O>
 where
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     pub const fn new(ring_buff: &'a RingBuffer<P, T, O>) -> Self {
@@ -30,7 +33,7 @@ where
 
 impl<'a, P, T, O> FnOnce<(&mut ReclSliceRef<'a, P, T, O>,)> for ReaderForwardFn<'a, P, T, O>
 where
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     type Output = ();
@@ -49,12 +52,12 @@ where
 /// and will be invoked when a `ReclSliceMut` drops.
 pub struct WriterForwardFn<'a, P, T, O>(&'a RingBuffer<P, T, O>)
 where
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings;
 
 impl<'a, P, T, O> WriterForwardFn<'a, P, T, O>
 where
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     pub const fn new(ring_buff: &'a RingBuffer<P, T, O>) -> Self {
@@ -64,7 +67,7 @@ where
 
 impl<'a, P, T, O> FnOnce<(&mut ReclSliceMut<'a, P, T, O>,)> for WriterForwardFn<'a, P, T, O>
 where
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     type Output = ();

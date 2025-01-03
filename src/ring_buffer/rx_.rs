@@ -1,6 +1,7 @@
 ﻿use core::{
     borrow::{Borrow, BorrowMut},
     future::{Future, IntoFuture},
+    mem::MaybeUninit,
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll},
@@ -23,17 +24,17 @@ use super::{
     Dual,
 };
 
-/// To move data from, or to pull data out of, the ring buffer.
+/// To move or pull data from the ring buffer.
 pub struct BuffRx<B, P, T, O>(IoCtx<B, P, T, O>)
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings;
 
 impl<B, P, T, O> BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     pub(super) fn new(ctx: IoCtx<B, P, T, O>) -> Self {
@@ -83,7 +84,7 @@ where
 impl<B, P, T, O> Drop for BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     fn drop(&mut self) {
@@ -100,7 +101,7 @@ where
 impl<B, P, T, O> AsRef<RingBuffer<P, T, O>> for BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     fn as_ref(&self) -> &RingBuffer<P, T, O> {
@@ -111,7 +112,7 @@ where
 impl<B, P, T, O> TrBuffIterRead<T> for BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     type SliceRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
@@ -128,7 +129,7 @@ where
 impl<B, P, T, O> TrBuffIterTryRead<T> for BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     #[inline]
@@ -143,7 +144,7 @@ where
 impl<B, P, T, O> TrBuffIterPeek<T> for BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     type SliceRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
@@ -160,7 +161,7 @@ where
 impl<B, P, T, O> TrBuffIterTryPeek<T> for BuffRx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     #[inline]
@@ -175,7 +176,7 @@ where
 pub struct ReadAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
@@ -185,7 +186,7 @@ where
 impl<'a, B, P, T, O> ReadAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     pub(super) const fn new(
@@ -213,7 +214,7 @@ where
 impl<'a, B, P, T, O> IntoFuture for ReadAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     type IntoFuture = ReadFuture<'a, NonCancellableToken, B, P, T, O>;
@@ -228,7 +229,7 @@ where
 impl<'a, B, P, T, O> TrIntoFutureMayCancel<'a> for ReadAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     type MayCancelOutput =
@@ -251,7 +252,7 @@ pub struct ReadFuture<'a, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
@@ -263,7 +264,7 @@ impl<'a, C, B, P, T, O> ReadFuture<'a, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     pub(super) const fn new(
@@ -283,7 +284,7 @@ impl<'a, C, B, P, T, O> Future for ReadFuture<'a, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     type Output = Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>>;

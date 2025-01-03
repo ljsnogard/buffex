@@ -4,6 +4,7 @@
     cmp,
     fmt::{self, Debug},
     marker::{PhantomData, PhantomPinned},
+    mem::MaybeUninit,
     pin::Pin,
     ptr::{self, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize},
@@ -130,7 +131,7 @@ where
 pub(super) struct IoCtx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     _pinned: PhantomPinned,
@@ -144,7 +145,7 @@ where
 impl<B, P, T, O> IoCtx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     pub const fn new(buffer: B, ctx_st: IoCtxState) -> Self {
@@ -200,7 +201,7 @@ where
 impl<B, P, T, O> AsMut<B> for IoCtx<B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     fn as_mut(&mut self) -> &mut B {
@@ -279,10 +280,10 @@ impl fmt::Display for CtrlHint {
 
 pub(super) struct BuffState<B, T = u8, O = StrictOrderings>
 where
-    B: BorrowMut<[T]>,
+    B: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    _unuse_t_: PhantomData<[T]>,
+    _unuse_t_: PhantomData<NonNull<[MaybeUninit<T>]>>,
 
     _pinned_: PhantomPinned,
 
@@ -311,7 +312,7 @@ where
 
 impl<B, T, O> BuffState<B, T, O>
 where
-    B: BorrowMut<[T]>,
+    B: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
     pub fn try_new(buffer: B) -> Result<Self, usize> {
@@ -423,10 +424,11 @@ where
         self.rw_state_.try_inc_reader_pos(length)
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn try_write(
         &self,
         length: usize,
-    ) -> Result<Dual<NonNull<[T]>>, TxError<usize>> {
+    ) -> Result<Dual<NonNull<[MaybeUninit<T>]>>, TxError<usize>> {
         let i = self.rw_state_.load_state();
         if i.wl == 0usize {
             let e = if self.is_closing() {
@@ -475,11 +477,11 @@ where
         &self,
         i: &RwStateInfo<usize>,
         length: usize,
-    ) -> Dual<NonNull<[T]>> {
+    ) -> Dual<NonNull<[MaybeUninit<T>]>> {
         debug_assert!(i.wl > 0usize);
         let mut dual = Dual::new();
         let mut buf_ptr = self.get_buff_non_null_();
-        let buf_mut: &mut [T] = unsafe { buf_ptr.as_mut() };
+        let buf_mut: &mut [MaybeUninit<T>] = unsafe { buf_ptr.as_mut() };
 
         // Make sure the 1st slice will not exceed the amount needed.
         let l0 = cmp::min(i.wl, length);
@@ -517,7 +519,10 @@ where
         let mut dual = Dual::new();
         let mut buf_ptr = self.get_buff_non_null_();
 
-        let buf_mut: &mut [T] = unsafe { buf_ptr.as_mut() };
+        let buf_mut: &mut [T] = unsafe {
+            let p = buf_ptr.as_mut() as *mut [MaybeUninit<T>];
+            &mut (*(p as *mut [T]))
+        };
 
         // Make sure the 1st slice will not exceed the tail of the buffer.
         let l0 = cmp::min(i.rl, length);
@@ -680,7 +685,7 @@ where
         assert!(try_reset.is_ok());
     }
 
-    fn get_buff_non_null_(&self) -> NonNull<[T]> {
+    fn get_buff_non_null_(&self) -> NonNull<[MaybeUninit<T>]> {
         let as_mut = unsafe { self.buf_cell_.get().as_mut() };
         let Option::Some(b) = as_mut else {
             unreachable!("[BuffState::get_buff_mut_] b")
@@ -691,14 +696,14 @@ where
         p
     }
 
-    pub fn buffer_data(&self) -> &[T] {
+    pub fn buffer_data(&self) -> &[MaybeUninit<T>] {
         unsafe { self.get_buff_non_null_().as_ref() }
     }
 }
 
 impl<P, T, O> fmt::Display for BuffState<P, T, O>
 where
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     T: Debug,
     O: TrCmpxchOrderings,
 {
@@ -710,14 +715,14 @@ where
 
 unsafe impl<P, T, O> Send for BuffState<P, T, O>
 where
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     T: Send,
     O: TrCmpxchOrderings,
 {}
 
 unsafe impl<P, T, O> Sync for BuffState<P, T, O>
 where
-    P: BorrowMut<[T]>,
+    P: BorrowMut<[MaybeUninit<T>]>,
     T: Send + Sync,
     O: TrCmpxchOrderings,
 {}
