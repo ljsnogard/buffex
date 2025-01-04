@@ -16,6 +16,8 @@ trait CloneFromSpec<T> {
     fn spec_clone_from(&mut self, src: &[T]);
 }
 
+/// The rented slice from the rx of the
+/// [RingBuffer](crate::ring_buffer::RingBuffer).
 pub struct SliceRef<B, T, R>
 where
     B: Borrow<[T]>,
@@ -31,12 +33,22 @@ where
     B: Borrow<[T]>,
     R: TrReclaim<Self>,
 {
-    pub const fn new(slice: B, reclaim: Option<R>) -> Self {
+    pub(super) const fn new(slice: B, reclaim: Option<R>) -> Self {
         SliceRef {
             slice_: slice,
             reclaim_: reclaim,
             _mark_t_: PhantomData,
         }
+    }
+}
+
+impl<B, T, R> Borrow<[T]> for SliceRef<B, T, R>
+where
+    B: Borrow<[T]>,
+    R: TrReclaim<Self>,
+{
+    fn borrow(&self) -> &[T] {
+        self.slice_.borrow()
     }
 }
 
@@ -69,7 +81,6 @@ impl<B, T, R> IntoIterator for SliceRef<B, T, R>
 where
     B: Borrow<[T]>,
     R: TrReclaim<Self>,
-    T: Unpin,
 {
     type Item = T;
     type IntoIter = Iter<Self, Self::Item>;
@@ -80,6 +91,7 @@ where
     }
 }
 
+/// The rented slice for tx of the [RingBuffer](crate::ring_buffer::RingBuffer)
 pub struct SliceMut<B, T, R>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
@@ -104,48 +116,25 @@ where
     }
 }
 
-impl<B, T, R> SliceMut<B, T, R>
+impl<B, T, R> Borrow<[MaybeUninit<T>]> for SliceMut<B, T, R>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    T: Clone,
     R: TrReclaim<Self>,
 {
-    /// Call [`clone_from_slice`] when `T` is not [`Copy`] but [`Clone`], or
-    /// [`copy_from_slice`] only when `T` is [`Copy`].
-    pub fn clone_or_copy(&mut self, src: &[T]) {
-        CloneFromSpec::spec_clone_from(self, src);
-    }
-
-    /// Overwrite elements in the slice cloning from source without dropping.
-    pub fn clone_from_slice(&mut self, src: &[T]) {
-        assert!(
-            self.len() == src.len(),
-            "destination and source slices have different lengths",
-        );
-        // NOTE: We need to explicitly slice them to the same length
-        // to make it easier for the optimizer to elide bounds checking.
-        // But since it can't be relied on we also have an explicit specialization for T: Copy.
-        let len = self.len();
-        let src = &src[..len];
-        for i in 0..len {
-            self[i].write(src[i].clone());
-        }
+    #[inline]
+    fn borrow(&self) -> &[MaybeUninit<T>] {
+        self.slice_mut_.borrow()
     }
 }
 
-impl<B, T, R> SliceMut<B, T, R>
+impl<B, T, R> BorrowMut<[MaybeUninit<T>]> for SliceMut<B, T, R>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    T: Copy,
     R: TrReclaim<Self>,
 {
-    /// An conventient wrapper around [`core::slice::copy_from_slice`]
-    pub fn copy_from_slice(&mut self, src: &[T]) {
-        let slice = unsafe {
-            let p = self.deref_mut() as *mut [MaybeUninit<T>] as *mut [T];
-            &mut *p
-        };
-        slice.copy_from_slice(src);
+    #[inline]
+    fn borrow_mut(&mut self) -> &mut [MaybeUninit<T>] {
+        self.slice_mut_.borrow_mut()
     }
 }
 
@@ -199,6 +188,50 @@ where
     }
 }
 
+impl<B, T, R> SliceMut<B, T, R>
+where
+    B: BorrowMut<[MaybeUninit<T>]>,
+    T: Clone,
+    R: TrReclaim<Self>,
+{
+    /// Call [clone_from_slice](Self::clone_from_slice) when `T` not [`Copy`]
+    /// but [`Clone`], or [copy_from_slice](Self::copy_from_slice) only when
+    /// `T` is [`Copy`].
+    pub fn clone_or_copy(&mut self, src: &[T]) {
+        CloneFromSpec::spec_clone_from(self, src);
+    }
+
+    /// Overwrite elements in the slice cloning from source without dropping.
+    pub fn clone_from_slice(&mut self, src: &[T]) {
+        assert!(
+            self.len() == src.len(),
+            "destination and source slices have different lengths",
+        );
+        let len = self.len();
+        let src = &src[..len];
+        for i in 0..len {
+            self[i].write(src[i].clone());
+        }
+    }
+}
+
+impl<B, T, R> SliceMut<B, T, R>
+where
+    B: BorrowMut<[MaybeUninit<T>]>,
+    T: Copy,
+    R: TrReclaim<Self>,
+{
+    /// A convenient wrapper around [copy_from_slice](<[T]>::copy_from_slice)
+    pub fn copy_from_slice(&mut self, src: &[T]) {
+        let slice = unsafe {
+            let p = self.deref_mut() as *mut [MaybeUninit<T>] as *mut [T];
+            &mut *p
+        };
+        slice.copy_from_slice(src);
+    }
+}
+
+/// The iterator for [SliceRef](crate::slices::SliceRef)
 pub struct Iter<S, T>
 where
     S: Deref<Target = [T]>,
@@ -215,8 +248,8 @@ where
     /// 
     /// # Safety
     /// 
-    /// * `slice` must be the owner of the slice which it can dereference.
-    /// * Elements of the `slice` must be safe to move.
+    /// * `slice` must be the semantic owner of the [T] (like [SliceRef]);
+    /// * All elements of the `slice` must be safe to move.
     pub const unsafe fn new_unchecked(slice: S) -> Self {
         Iter {
             slice_: MaybeUninit::new(slice),
