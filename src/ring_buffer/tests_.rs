@@ -1,6 +1,7 @@
 ﻿use std::{
     borrow::{Borrow, BorrowMut},
     boxed::Box,
+    mem::MaybeUninit,
     sync::Arc,
 };
 
@@ -19,7 +20,7 @@ const INDEX: usize = 0usize;
 async fn tx_work_<B, P, O>(mut tx: BuffTx<B, P, u8, O>)
 where
     B: Borrow<RingBuffer<P, u8, O>>,
-    P: BorrowMut<[u8]>,
+    P: BorrowMut<[MaybeUninit<u8>]>,
     O: TrCmpxchOrderings,
 {
     let mut b = 0u8;
@@ -34,7 +35,7 @@ where
             break;
         };
         for mut buff in buff_iter.into_iter() {
-            buff[INDEX] = b;
+            buff[INDEX].write(b);
             log::trace!("[single_byte_demo::tx_work_] {b}");
             if b == u8::MAX {
                 break;
@@ -49,7 +50,7 @@ where
 async fn rx_work_<B, P, O>(mut rx: BuffRx<B, P, u8, O>)
 where
     B: Borrow<RingBuffer<P, u8, O>>,
-    P: BorrowMut<[u8]>,
+    P: BorrowMut<[MaybeUninit<u8>]>,
     O: TrCmpxchOrderings,
 {
     let mut b = 0u8;
@@ -83,9 +84,10 @@ where
 async fn single_byte_async_smoke() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let arr = Box::new([0u8; ARR_SIZE]);
-    let ring_buf = Arc::new(RingBuffer::<Box<[u8]>, u8, StrictOrderings>
-        ::try_new(arr).unwrap());
+    let arr = Box::<[u8]>::new_uninit_slice(ARR_SIZE);
+    let ring_buf = Arc::new(
+        RingBuffer::<Box<[MaybeUninit<u8>]>, u8, StrictOrderings>
+            ::try_new(arr).unwrap());
     let try_split = RingBuffer::try_split(
         ring_buf,
         Arc::strong_count,

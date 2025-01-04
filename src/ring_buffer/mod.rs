@@ -1,13 +1,13 @@
-﻿mod abs_;
+﻿//! This mod contains the implementation of a ring buffer (or circular buffer)
+//! that works with `no-std`, no internal heap-alloc, async-runtime agnostic.
+
+mod abs_;
 mod buffer_;
 mod reclaim_;
 mod peek_;
 mod sync_;
 mod rx_;
 mod tx_;
-
-#[cfg(test)]
-mod chunk_;
 
 #[cfg(test)]
 mod tests_;

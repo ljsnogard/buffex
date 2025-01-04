@@ -1061,6 +1061,8 @@ pub(super) fn d_to_usize<D: funty::Unsigned>(d: D,  m: &'static str) -> usize {
 mod tests_ {
     use std::{
         borrow::*,
+        boxed::Box,
+        mem::MaybeUninit,
         sync::Arc,
     };
     use atomex::{
@@ -1096,8 +1098,9 @@ mod tests_ {
         let _ = env_logger::builder().is_test(true).try_init();
 
         const BUFF_SIZE: usize = 4usize;
-        let Result::Ok(buff) = BuffState::<std::boxed::Box<[u8]>>
-            ::try_new(std::boxed::Box::new([0u8; BUFF_SIZE]))
+        let Result::Ok(buff) =
+            BuffState::<Box<[MaybeUninit<u8>]>>::try_new(
+                Box::<[u8]>::new_uninit_slice(BUFF_SIZE))
         else {
             panic!()
         };
@@ -1154,7 +1157,7 @@ mod tests_ {
     /// Write [0][0..1][0..2]..[0..max_len - 1]
     fn writer_<P, T, O>(s: Arc<BuffState<P, T, O>>, max_len: usize)
     where
-        P: BorrowMut<[T]>,
+        P: BorrowMut<[MaybeUninit<T>]>,
         T: funty::Unsigned + TryFrom<usize> + Copy,
         O: TrCmpxchOrderings,
     {
@@ -1166,7 +1169,10 @@ mod tests_ {
             // generate [0..seq_len - 1]
             let source = Owned::new_slice(
                 seq_len,
-                |u| { let Result::Ok(x) = T::try_from(u) else { panic!() }; x },
+                |u, m| {
+                    let Result::Ok(x) = T::try_from(u) else { panic!() };
+                    m.write(x)
+                },
                 CoreAlloc::new(),
             );
             let mut wrote_len = 0usize;
@@ -1180,6 +1186,9 @@ mod tests_ {
                         for mut p in dual.into_iter() {
                             let dst = unsafe { p.as_mut() };
                             assert!(wc + dst.len() <= src.len());
+                            let dst = unsafe {
+                                &mut *(dst as *mut _ as *mut [T])
+                            };
                             dst.clone_from_slice(&src[wc..wc + dst.len()]);
                             wc += dst.len();
                             let x = s.tx_forward(dst.len());
@@ -1204,7 +1213,7 @@ mod tests_ {
     /// Read [0][0..1]..[0..max_len - 1] with size-decreasing buffers
     fn reader_<P, T, O>(s: Arc<BuffState<P, T, O>>, max_len: usize)
     where
-        P: BorrowMut<[T]>,
+        P: BorrowMut<[MaybeUninit<T>]>,
         T: funty::Unsigned + TryInto<usize> + Copy,
         O: TrCmpxchOrderings,
     {
@@ -1218,7 +1227,7 @@ mod tests_ {
             // generate [0..seq_len - 1]
             let mut target = Owned::new_slice(
                 max_len - seq_len,
-                |_| T::ZERO,
+                |_, m| m.write(T::ZERO),
                 CoreAlloc::new(),
             );
             // how many units has been copied to target
@@ -1278,11 +1287,11 @@ mod tests_ {
         const BUFF_SIZE: u8 = u8::MAX;
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let Result::Ok(state) = BuffState::<Owned<[u8], CoreAlloc>>::try_new(
-            Owned::new_slice(
-                usize::from(BUFF_SIZE),
-                |_| 0u8,
-                CoreAlloc::new(),
+        let Result::Ok(state) =
+            BuffState::<Owned<[MaybeUninit<u8>], CoreAlloc>>::try_new(
+                Owned::new_zeroed_slice(
+                    usize::from(BUFF_SIZE),
+                    CoreAlloc::new(),
             ))
         else {
             panic!()
@@ -1302,11 +1311,11 @@ mod tests_ {
         const BUFF_SIZE: u16 = 1024u16;
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let Result::Ok(state) = BuffState::<Owned<[u16], CoreAlloc>, u16>
-            ::try_new(Owned::new_slice(
-                usize::from(BUFF_SIZE),
-                |_| 0u16,
-                CoreAlloc::new(),
+        let Result::Ok(state) =
+            BuffState::<Owned<[MaybeUninit<u16>], CoreAlloc>, u16>::try_new(
+                Owned::new_zeroed_slice(
+                    usize::from(BUFF_SIZE), 
+                    CoreAlloc::new(),
             ))
         else {
             panic!()
@@ -1326,11 +1335,11 @@ mod tests_ {
         const BUFF_SIZE: u32 = 1024u32;
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let Result::Ok(state) = BuffState::<Owned<[u32], CoreAlloc>, u32>
-            ::try_new(Owned::new_slice(
-                usize::try_from(BUFF_SIZE).unwrap(),
-                |_| 0u32,
-                CoreAlloc::new(),
+        let Result::Ok(state) =
+            BuffState::<Owned<[MaybeUninit<u32>], CoreAlloc>, u32>::try_new(
+                Owned::new_zeroed_slice(
+                    usize::try_from(BUFF_SIZE).unwrap(),
+                    CoreAlloc::new(),
             ))
         else {
             panic!()

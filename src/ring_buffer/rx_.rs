@@ -11,6 +11,7 @@ use pin_project::pin_project;
 use pin_utils::pin_mut;
 
 use abs_buff::{
+    x_deps::abs_sync,
     TrBuffIterPeek, TrBuffIterRead, TrBuffIterTryPeek, TrBuffIterTryRead,
 };
 use abs_sync::{cancellation::*, x_deps::pin_utils};

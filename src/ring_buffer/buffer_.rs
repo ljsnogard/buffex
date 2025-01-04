@@ -85,6 +85,7 @@ type IoPair<B, P, T, O> = (
 );
 type TrySplitResult<B, P, T, O> = Result<IoPair<B, P, T, O>, B>;
 
+/// A ring buffer that support both sync and async operation.
 pub struct RingBuffer<P, T = u8, O = StrictOrderings>(BuffState<P, T, O>)
 where
     P: BorrowMut<[MaybeUninit<T>]>,
@@ -96,10 +97,15 @@ where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
+    /// Create a ring buffer by specifying its internal data storage.
+    /// 
+    /// Will return `Err` if the buffer is too large ( size greater than or
+    /// eqaul to `1 << (usize::BITS - 2)`)
     pub fn try_new(buffer: P) -> Result<Self, usize> {
         Result::Ok(RingBuffer(BuffState::try_new(buffer)?))
     }
 
+    /// Split the buffer into tx end and rx and.
     pub fn split(
         ring_buff: &mut Self,
     ) -> IoPair<&'_ Self, P, T, O> {
@@ -146,19 +152,19 @@ where
         self.0.capacity()
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn data_size(&self) -> usize {
         self.0.data_size()
     }
 
-    /// Get the `BuffWrite` instance associated with this ring buffer.
+    /// Get the `BuffTx` instance associated with this ring buffer.
     /// Dropping it will not cause rx end receiving `RxError::Closing`.
     pub fn tx(&mut self) -> BuffTx<&Self, P, T, O> {
         let ctx_st = IoCtxState::no_close_flag();
         BuffTx::new(IoCtx::new(self, ctx_st))
     }
 
-    /// Get the `BuffRead` instance associated with this ring buffer.
+    /// Get the `BuffRx` instance associated with this ring buffer.
     /// Dropping it will not cause tx end receiving `RxError::Closing`.
     pub fn rx(&mut self) -> BuffRx<&Self, P, T, O> {
         let ctx_st = IoCtxState::no_close_flag();
@@ -266,7 +272,10 @@ where
 
 #[cfg(test)]
 mod tests_ {
-    use core::borrow::{Borrow, BorrowMut};
+    use core::{
+        borrow::{Borrow, BorrowMut},
+        mem::MaybeUninit,
+    };
 
     use atomex::{
         x_deps::funty,
@@ -284,7 +293,7 @@ mod tests_ {
         max_len: usize)
     where
         B: Borrow<RingBuffer<P, T, O>>,
-        P: BorrowMut<[T]>,
+        P: BorrowMut<[MaybeUninit<T>]>,
         T: funty::Unsigned + TryFrom<usize> + Copy,
         O: TrCmpxchOrderings,
     {
@@ -296,9 +305,9 @@ mod tests_ {
             }
             let source = Owned::new_slice(
                 seq_len,
-                |u| {
+                |u, m| {
                     let Result::Ok(x) = T::try_from(u) else { panic!("unable conver from {u}") };
-                    x
+                    m.write(x)
                 },
                 CoreAlloc::new(),
             );
@@ -323,7 +332,7 @@ mod tests_ {
                     let src = split.1;
                     let len = dst.len();
                     assert!(len <= src.len());
-                    dst.clone_from_slice(src.split_at(len).0);
+                    dst.clone_or_copy(src.split_at(len).0);
                     wrote_len += len;
                 }
             }
@@ -336,7 +345,7 @@ mod tests_ {
         max_len: usize)
     where
         B: Borrow<RingBuffer<P, T, O>>,
-        P: BorrowMut<[T]>,
+        P: BorrowMut<[MaybeUninit<T>]>,
         T: funty::Unsigned + TryInto<usize> + Copy,
         O: TrCmpxchOrderings,
     {
@@ -351,7 +360,7 @@ mod tests_ {
             }
             let mut target = Owned::new_slice(
                 seq_len,
-                |_| T::ZERO,
+                |_, m| m.write( T::ZERO),
                 CoreAlloc::new(),
             );
             let mut read_len = 0usize;
@@ -409,11 +418,9 @@ mod tests_ {
 
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let Result::Ok(ring_buff) = RingBuffer::<Owned<[u8], CoreAlloc>>
-            ::try_new(Owned::new_slice(
-                BUFF_SIZE,
-                |_| 0u8,
-                CoreAlloc::new(),
+        let Result::Ok(ring_buff) =
+            RingBuffer::<Owned<[MaybeUninit<u8>], CoreAlloc>>::try_new(
+                Owned::new_uninit_slice(BUFF_SIZE, CoreAlloc::new(),
             ))
         else {
             panic!("[tests_::u8_read_write_async_smoke] try_new")
@@ -438,11 +445,9 @@ mod tests_ {
 
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let Result::Ok(ring_buff) = RingBuffer::<Owned<[u16], CoreAlloc>, u16>
-            ::try_new(Owned::new_slice(
-                BUFF_SIZE,
-                |_| 0u16,
-                CoreAlloc::new(),
+        let Result::Ok(ring_buff) =
+            RingBuffer::<Owned<[MaybeUninit<u16>], CoreAlloc>, u16>::try_new(
+                Owned::new_uninit_slice(BUFF_SIZE, CoreAlloc::new(),
             ))
         else {
             panic!("[tests_::u16_read_write_async_smoke] try_new")
@@ -467,11 +472,9 @@ mod tests_ {
 
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let Result::Ok(ring_buff) = RingBuffer::<Owned<[u32], CoreAlloc>, u32>
-            ::try_new(Owned::new_slice(
-                BUFF_SIZE,
-                |_| 0u32,
-                CoreAlloc::new(),
+        let Result::Ok(ring_buff) =
+            RingBuffer::<Owned<[MaybeUninit<u32>], CoreAlloc>, u32>::try_new(
+                Owned::new_uninit_slice(BUFF_SIZE, CoreAlloc::new(),
             ))
         else {
             panic!("[tests_::u32_read_write_async_smoke] try_new")

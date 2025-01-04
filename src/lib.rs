@@ -1,7 +1,7 @@
 ﻿#![no_std]
 
-// To allow a struct implement Fn*
-#![feature(unboxed_closures)]
+#![feature(min_specialization)] // To allow specialization for `Clone` and `Copy`
+#![feature(unboxed_closures)] // To allow a struct implement Fn*
 #![feature(fn_traits)]
 
 // We always pull in `std` during tests, because it's just easier
@@ -14,8 +14,10 @@ pub mod slices;
 
 pub mod x_deps {
     pub use abs_buff;
-    pub use abs_sync;
+    pub use abs_buff::x_deps::abs_sync;
+
     pub use atomex;
+    pub use atomex::x_deps::funty;
 
     pub use smallvec;
 }

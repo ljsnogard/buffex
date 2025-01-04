@@ -5,7 +5,7 @@
 
 use atomex::TrCmpxchOrderings;
 
-use crate::slices::{SliceMut, SliceRef};
+use crate::slices::{SliceMut, SliceRef, TrReclaim};
 use super::buffer_::RingBuffer;
 
 pub type ReclSliceRef<'a, P, T, O> =
@@ -31,19 +31,14 @@ where
     }
 }
 
-impl<'a, P, T, O> FnOnce<(&mut ReclSliceRef<'a, P, T, O>,)> for ReaderForwardFn<'a, P, T, O>
+impl<'a, P, T, O> TrReclaim<ReclSliceRef<'a, P, T, O>>
+for ReaderForwardFn<'a, P, T, O>
 where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    type Output = ();
-
-    extern "rust-call" fn call_once(
-        self,
-        args: (&mut ReclSliceRef<'a, P, T, O>,),
-    ) -> Self::Output {
-        let slice_ref = args.0;
-        let x = self.0.state().rx_forward(slice_ref.len());
+    fn reclaim(&mut self, t: &mut ReclSliceRef<'a, P, T, O>) {
+        let x = self.0.state().rx_forward(t.len());
         assert!(x.is_ok())
     }
 }
@@ -65,19 +60,14 @@ where
     }
 }
 
-impl<'a, P, T, O> FnOnce<(&mut ReclSliceMut<'a, P, T, O>,)> for WriterForwardFn<'a, P, T, O>
+impl<'a, P, T, O> TrReclaim<ReclSliceMut<'a, P, T, O>>
+for WriterForwardFn<'a, P, T, O>
 where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    type Output = ();
-
-    extern "rust-call" fn call_once(
-        self,
-        args: (&mut ReclSliceMut<'a, P, T, O>,),
-    ) -> Self::Output {
-        let slice_mut = args.0;
-        let x = self.0.state().tx_forward(slice_mut.len());
+    fn reclaim(&mut self, t: &mut ReclSliceMut<'a, P, T, O>) {
+        let x = self.0.state().tx_forward(t.len());
         assert!(x.is_ok())
     }
 }

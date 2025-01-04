@@ -10,7 +10,10 @@
 use pin_project::pin_project;
 use pin_utils::pin_mut;
 
-use abs_buff::{TrBuffIterPeek, TrBuffIterTryPeek};
+use abs_buff::{
+    x_deps::abs_sync,
+    TrBuffIterPeek, TrBuffIterTryPeek,
+};
 use abs_sync::{cancellation::*, x_deps::pin_utils};
 use atomex::TrCmpxchOrderings;
 

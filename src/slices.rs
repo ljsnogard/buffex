@@ -7,10 +7,19 @@
     ops::{Deref, DerefMut},
 };
 
+pub trait TrReclaim<T>: Sized {
+    fn reclaim(&mut self, t: &mut T);
+}
+
+/// Relies on the unstable feature `#![feature(min_specialization)]`
+trait CloneFromSpec<T> {
+    fn spec_clone_from(&mut self, src: &[T]);
+}
+
 pub struct SliceRef<B, T, R>
 where
     B: Borrow<[T]>,
-    R: FnOnce(&mut Self),
+    R: TrReclaim<Self>,
 {
     slice_: B,
     reclaim_: Option<R>,
@@ -20,7 +29,7 @@ where
 impl<B, T, R> SliceRef<B, T, R>
 where
     B: Borrow<[T]>,
-    R: FnOnce(&mut Self),
+    R: TrReclaim<Self>,
 {
     pub const fn new(slice: B, reclaim: Option<R>) -> Self {
         SliceRef {
@@ -34,20 +43,20 @@ where
 impl<B, T, R> Drop for SliceRef<B, T, R>
 where
     B: Borrow<[T]>,
-    R: FnOnce(&mut Self),
+    R: TrReclaim<Self>,
 {
     fn drop(&mut self) {
-        let Option::Some(r) = self.reclaim_.take() else {
+        let Option::Some(mut r) = self.reclaim_.take() else {
             return;
         };
-        r(self)
+        r.reclaim(self)
     }
 }
 
 impl<B, T, R> Deref for SliceRef<B, T, R>
 where
     B: Borrow<[T]>,
-    R: FnOnce(&mut Self),
+    R: TrReclaim<Self>,
 {
     type Target = [T];
 
@@ -59,7 +68,7 @@ where
 impl<B, T, R> IntoIterator for SliceRef<B, T, R>
 where
     B: Borrow<[T]>,
-    R: FnOnce(&mut Self),
+    R: TrReclaim<Self>,
     T: Unpin,
 {
     type Item = T;
@@ -74,7 +83,7 @@ where
 pub struct SliceMut<B, T, R>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: FnOnce(&mut Self),
+    R: TrReclaim<Self>,
 {
     slice_mut_: B,
     reclaim_: Option<R>,
@@ -84,7 +93,7 @@ where
 impl<B, T, R> SliceMut<B, T, R>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: FnOnce(&mut Self),
+    R: TrReclaim<Self>,
 {
     pub const fn new(slice_mut: B, reclaim: Option<R>) -> Self {
         SliceMut {
@@ -95,23 +104,68 @@ where
     }
 }
 
+impl<B, T, R> SliceMut<B, T, R>
+where
+    B: BorrowMut<[MaybeUninit<T>]>,
+    T: Clone,
+    R: TrReclaim<Self>,
+{
+    /// Call [`clone_from_slice`] when `T` is not [`Copy`] but [`Clone`], or
+    /// [`copy_from_slice`] only when `T` is [`Copy`].
+    pub fn clone_or_copy(&mut self, src: &[T]) {
+        CloneFromSpec::spec_clone_from(self, src);
+    }
+
+    /// Overwrite elements in the slice cloning from source without dropping.
+    pub fn clone_from_slice(&mut self, src: &[T]) {
+        assert!(
+            self.len() == src.len(),
+            "destination and source slices have different lengths",
+        );
+        // NOTE: We need to explicitly slice them to the same length
+        // to make it easier for the optimizer to elide bounds checking.
+        // But since it can't be relied on we also have an explicit specialization for T: Copy.
+        let len = self.len();
+        let src = &src[..len];
+        for i in 0..len {
+            self[i].write(src[i].clone());
+        }
+    }
+}
+
+impl<B, T, R> SliceMut<B, T, R>
+where
+    B: BorrowMut<[MaybeUninit<T>]>,
+    T: Copy,
+    R: TrReclaim<Self>,
+{
+    /// An conventient wrapper around [`core::slice::copy_from_slice`]
+    pub fn copy_from_slice(&mut self, src: &[T]) {
+        let slice = unsafe {
+            let p = self.deref_mut() as *mut [MaybeUninit<T>] as *mut [T];
+            &mut *p
+        };
+        slice.copy_from_slice(src);
+    }
+}
+
 impl<B, T, R> Drop for SliceMut<B, T, R>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: FnOnce(&mut Self),
+    R: TrReclaim<Self>,
 {
     fn drop(&mut self) {
-        let Option::Some(r) = self.reclaim_.take() else {
+        let Option::Some(mut r) = self.reclaim_.take() else {
             return;
         };
-        r(self)
+        r.reclaim(self)
     }
 }
 
 impl<B, T, R> Deref for SliceMut<B, T, R>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: FnOnce(&mut Self),
+    R: TrReclaim<Self>,
 {
     type Target = [MaybeUninit<T>];
 
@@ -123,7 +177,7 @@ where
 impl<B, T, R> DerefMut for SliceMut<B, T, R>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: FnOnce(&mut Self),
+    R: TrReclaim<Self>,
 {
     fn deref_mut(&mut self) -> &mut [MaybeUninit<T>] {
         self.slice_mut_.borrow_mut()
@@ -133,7 +187,7 @@ where
 impl<B, T, R> IntoIterator for SliceMut<B, T, R>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: FnOnce(&mut Self),
+    R: TrReclaim<Self>,
     T: Unpin,
 {
     type Item = MaybeUninit<T>;
@@ -214,5 +268,29 @@ where
 {
     fn drop(&mut self) {
         unsafe { self.slice_.assume_init_drop() }; 
+    }
+}
+
+/// Default clone behaviour
+impl<B, T, R> CloneFromSpec<T> for SliceMut<B, T, R>
+where
+    B: BorrowMut<[MaybeUninit<T>]>,
+    T: Clone,
+    R: TrReclaim<Self>,
+{
+    default fn spec_clone_from(&mut self, src: &[T]) {
+        self.clone_from_slice(src);
+    }
+}
+
+/// Specialized clone behaviour when T: Copy
+impl<B, T, R> CloneFromSpec<T> for SliceMut<B, T, R>
+where
+    B: BorrowMut<[MaybeUninit<T>]>,
+    T: Copy,
+    R: TrReclaim<Self>,
+{
+    fn spec_clone_from(&mut self, src: &[T]) {
+        self.copy_from_slice(src);
     }
 }
