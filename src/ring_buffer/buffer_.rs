@@ -183,10 +183,11 @@ where
         &self,
         length: usize,
     ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
-        let make_slice = |slice| ReclSliceRef::new(
-            slice,
-            Option::Some(ReaderForwardFn::new(self))
-        );
+        let make_slice = |slice| unsafe {
+            ReclSliceRef::new(
+                slice,
+                Option::Some(ReaderForwardFn::new(self))
+        )};
         let dual = self
             .0
             .try_read(length)?
@@ -200,7 +201,8 @@ where
     pub(super) fn try_peek_(
         &self,
     ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
-        let make_slice = |slice| ReclSliceRef::new(slice, Option::None);
+        let make_slice = |slice| unsafe {
+            ReclSliceRef::new(slice, Option::None) };
         let dual = self
             .0
             .try_peek()?
@@ -215,10 +217,11 @@ where
         &self,
         length: usize,
     ) -> Result<Dual<ReclSliceMut<'_, P, T, O>>, TxError<usize>> {
-        let make_slice = |slice_mut| ReclSliceMut::new(
-            slice_mut,
-            Option::Some(WriterForwardFn::new(self)),
-        );
+        let make_slice = |slice_mut| unsafe {
+            ReclSliceMut::new(
+                slice_mut,
+                Option::Some(WriterForwardFn::new(self)),
+        )};
         let dual = self
             .0
             .try_write(length)?

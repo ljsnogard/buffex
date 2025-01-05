@@ -4,8 +4,8 @@
 };
 
 use atomex::TrCmpxchOrderings;
+use recl_slices::{SliceMut, SliceRef, TrReclaim};
 
-use crate::slices::{SliceMut, SliceRef, TrReclaim};
 use super::buffer_::RingBuffer;
 
 pub type ReclSliceRef<'a, P, T, O> =
