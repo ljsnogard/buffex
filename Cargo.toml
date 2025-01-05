@@ -5,7 +5,7 @@ edition = "2021"
 
 authors = ["lino <lino_snsalias@outlook.com>"]
 description = "BUFFer EXtensions: ring buffer and buffer chaining."
-homepage = "https://github.com/ljsnogard/buffex"
+repository = "https://github.com/ljsnogard/buffex"
 keywords = ["buffer", "io"]
 categories = ["algorithms", "no-std"]
 license = "MIT/Apache-2.0"

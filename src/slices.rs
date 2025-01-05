@@ -107,7 +107,7 @@ where
     B: BorrowMut<[MaybeUninit<T>]>,
     R: TrReclaim<Self>,
 {
-    pub const fn new(slice_mut: B, reclaim: Option<R>) -> Self {
+    pub(super) const fn new(slice_mut: B, reclaim: Option<R>) -> Self {
         SliceMut {
             slice_mut_: slice_mut,
             reclaim_: reclaim,
@@ -177,7 +177,6 @@ impl<B, T, R> IntoIterator for SliceMut<B, T, R>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
     R: TrReclaim<Self>,
-    T: Unpin,
 {
     type Item = MaybeUninit<T>;
     type IntoIter = Iter<Self, Self::Item>;
@@ -234,7 +233,7 @@ where
 /// The iterator for [SliceRef](crate::slices::SliceRef)
 pub struct Iter<S, T>
 where
-    S: Deref<Target = [T]>,
+    S: Deref<Target = [T]> + IntoIterator<Item = T>,
 {
     slice_: MaybeUninit<S>,
     offset_: usize,
@@ -242,29 +241,15 @@ where
 
 impl<S, T> Iter<S, T>
 where
-    S: Deref<Target = [T]>,
+    S: Deref<Target = [T]> + IntoIterator<Item = T>,
 {
     /// The iterator for `SliceRef` and `SliceMut`. 
     /// 
     /// # Safety
     /// 
-    /// * `slice` must be the semantic owner of the [T] (like [SliceRef]);
-    /// * All elements of the `slice` must be safe to move.
+    /// - `slice` must be the semantic owner of the items (like [SliceRef]);
+    /// - Items of the `slice` must be safe to move during the iteration;
     pub const unsafe fn new_unchecked(slice: S) -> Self {
-        Iter {
-            slice_: MaybeUninit::new(slice),
-            offset_: 0,
-        }
-    }
-}
-
-impl<S, T> Iter<S, T>
-where
-    S: Deref<Target = [T]>,
-    T: Clone,
-{
-    /// The iterator for `SliceRef` and `SliceMut`. 
-    pub const fn new(slice: S) -> Self {
         Iter {
             slice_: MaybeUninit::new(slice),
             offset_: 0,
@@ -274,19 +259,20 @@ where
 
 impl<S, T> Iterator for Iter<S, T>
 where
-    S: Deref<Target = [T]>,
+    S: Deref<Target = [T]> + IntoIterator<Item = T>,
 {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
         let slice_ref = unsafe { self.slice_.assume_init_ref() };
-        let curr_offset: usize = self.offset_;
+        let curr_offset = self.offset_;
         if curr_offset < slice_ref.len() {
-            let item = &slice_ref[self.offset_];
+            let item = &slice_ref[curr_offset];
             self.offset_ += 1;
             Option::Some(
-                // Safe here because we will never read the item again, and T
-                // is `Unpin`, so it is safe to move.
+                // Safe here because we will never read the item again, and the
+                // item is guaranteed to be safe to move. And it will be treated
+                // as MaybeUninit<T> after the slice is reclaimed.
                 unsafe { ptr::read(item) }
             )
         } else {
@@ -297,7 +283,7 @@ where
 
 impl<S, T> Drop for Iter<S, T>
 where
-    S: Deref<Target = [T]>,
+    S: Deref<Target = [T]> + IntoIterator<Item = T>,
 {
     fn drop(&mut self) {
         unsafe { self.slice_.assume_init_drop() }; 

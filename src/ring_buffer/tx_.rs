@@ -103,8 +103,11 @@ where
     O: TrCmpxchOrderings,
 {
     type SliceMut<'a> = ReclSliceMut<'a, P, T, O> where Self: 'a;
+
     type BuffIter<'a> = Dual<Self::SliceMut<'a>> where Self: 'a;
+
     type Err = TxError<usize>;
+
     type WriteAsync<'a> = WriteAsync<'a, B, P, T, O> where Self: 'a;
 
     #[inline]
