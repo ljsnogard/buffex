@@ -38,6 +38,14 @@ where
     O: TrCmpxchOrderings,
 {
     fn reclaim(&mut self, t: &mut ReclSliceRef<'a, P, T, O>) {
+        debug_assert!({
+            let slice = &*t;
+            let info = self.0.state().load_state_info();
+            let buff = self.0.state().buffer_data();
+            let rp = &buff[info.rp] as *const MaybeUninit<T> as *const T;
+            let head = &slice[0] as *const T;
+            core::ptr::eq(rp, head)
+        });
         let x = self.0.state().rx_forward(t.len());
         assert!(x.is_ok())
     }
@@ -67,6 +75,14 @@ where
     O: TrCmpxchOrderings,
 {
     fn reclaim(&mut self, t: &mut ReclSliceMut<'a, P, T, O>) {
+        debug_assert!({
+            let slice = &*t;
+            let info = self.0.state().load_state_info();
+            let buff = self.0.state().buffer_data();
+            let wp = &buff[info.wp] as *const MaybeUninit<T>;
+            let head = &slice[0] as *const MaybeUninit<T>;
+            core::ptr::eq(wp, head)
+        });
         let x = self.0.state().tx_forward(t.len());
         assert!(x.is_ok())
     }

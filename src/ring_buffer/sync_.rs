@@ -340,6 +340,11 @@ where
         self.rw_state_.data_size()
     }
 
+    #[inline]
+    pub fn load_state_info(&self) -> RwStateInfo<usize> {
+        self.rw_state_.load_state()
+    }
+
     pub fn is_closing(&self) -> bool {
         Self::is_closed_(&self.rx_demand_) || Self::is_closed_(&self.tx_demand_)
     }
