@@ -1,7 +1,7 @@
 ﻿[package]
 name = "buffex"
 version = "0.0.2"
-edition = "2021"
+edition = "2024"
 
 authors = ["lino <lino_snsalias@outlook.com>"]
 description = "BUFFer EXtensions: ring buffer and buffer chaining."
@@ -12,11 +12,12 @@ license = "MIT/Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-abs_buff = { git = "https://github.com/ljsnogard/abs_buff.git", branch = "dev-0.2.0" }
+abs_buff = { git = "https://github.com/ljsnogard/abs_buff.git", branch = "refactor/jan-11" }
 atomex = { git = "https://github.com/ljsnogard/atomex-rs.git", branch = "dev/0.1.1" }
-recl-slices = { git = "https://github.com/ljsnogard/recl-slices.git", commit = "1c886c69341fe82d1768eb8b93bcc0cc63b57264" }
+recl-slices = { git = "https://github.com/ljsnogard/recl-slices.git", branch = "refactor/jan-11" }
 
 pin-project = { version = "1.1.*" }
+pin-utils = { version = "*" }
 smallvec = { version = "1.13", features = [] }
 
 [dev-dependencies]

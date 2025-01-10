@@ -3,6 +3,7 @@
     mem::MaybeUninit,
 };
 
+use abs_buff::TrBuffSegmView;
 use atomex::TrCmpxchOrderings;
 use recl_slices::{SliceMut, SliceRef, TrReclaim};
 
@@ -31,22 +32,21 @@ where
     }
 }
 
-impl<'a, P, T, O> TrReclaim<ReclSliceRef<'a, P, T, O>>
-for ReaderForwardFn<'a, P, T, O>
+impl<P, T, O> TrReclaim<T> for ReaderForwardFn<'_, P, T, O>
 where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    fn reclaim(&mut self, t: &mut ReclSliceRef<'a, P, T, O>) {
+    fn reclaim<S: TrBuffSegmView<Item = T>>(&mut self, s: &mut S) {
         debug_assert!({
-            let slice = &*t;
+            let slice = s.borrow();
             let info = self.0.state().load_state_info();
             let buff = self.0.state().buffer_data();
             let rp = &buff[info.rp] as *const MaybeUninit<T> as *const T;
             let head = &slice[0] as *const T;
             core::ptr::eq(rp, head)
         });
-        let x = self.0.state().rx_forward(t.len());
+        let x = self.0.state().rx_forward(s.len());
         assert!(x.is_ok())
     }
 }
@@ -68,22 +68,21 @@ where
     }
 }
 
-impl<'a, P, T, O> TrReclaim<ReclSliceMut<'a, P, T, O>>
-for WriterForwardFn<'a, P, T, O>
+impl<P, T, O> TrReclaim<MaybeUninit<T>> for WriterForwardFn<'_, P, T, O>
 where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    fn reclaim(&mut self, t: &mut ReclSliceMut<'a, P, T, O>) {
+    fn reclaim<S: TrBuffSegmView<Item = MaybeUninit<T>>>(&mut self, s: &mut S) {
         debug_assert!({
-            let slice = &*t;
+            let slice = s.borrow();
             let info = self.0.state().load_state_info();
             let buff = self.0.state().buffer_data();
             let wp = &buff[info.wp] as *const MaybeUninit<T>;
             let head = &slice[0] as *const MaybeUninit<T>;
             core::ptr::eq(wp, head)
         });
-        let x = self.0.state().tx_forward(t.len());
+        let x = self.0.state().tx_forward(s.len());
         assert!(x.is_ok())
     }
 }

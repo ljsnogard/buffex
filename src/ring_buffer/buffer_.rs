@@ -183,11 +183,10 @@ where
         &self,
         length: usize,
     ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
-        let make_slice = |slice| unsafe {
-            ReclSliceRef::new(
-                slice,
-                Option::Some(ReaderForwardFn::new(self))
-        )};
+        let make_slice = |slice| ReclSliceRef::new(
+            slice,
+            Option::Some(ReaderForwardFn::new(self))
+        );
         let dual = self
             .0
             .try_read(length)?
@@ -201,8 +200,8 @@ where
     pub(super) fn try_peek_(
         &self,
     ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
-        let make_slice = |slice| unsafe {
-            ReclSliceRef::new(slice, Option::None) };
+        let make_slice = |slice|
+            ReclSliceRef::new(slice, Option::None);
         let dual = self
             .0
             .try_peek()?
@@ -217,11 +216,10 @@ where
         &self,
         length: usize,
     ) -> Result<Dual<ReclSliceMut<'_, P, T, O>>, TxError<usize>> {
-        let make_slice = |slice_mut| unsafe {
-            ReclSliceMut::new(
-                slice_mut,
-                Option::Some(WriterForwardFn::new(self)),
-        )};
+        let make_slice = |slice_mut| ReclSliceMut::new(
+            slice_mut,
+            Option::Some(WriterForwardFn::new(self)),
+        );
         let dual = self
             .0
             .try_write(length)?
@@ -310,7 +308,7 @@ mod tests_ {
                 seq_len,
                 |u, m| {
                     let Result::Ok(x) = T::try_from(u) else { panic!("unable conver from {u}") };
-                    m.write(x)
+                    m.write(x);
                 },
                 CoreAlloc::new(),
             );
@@ -335,7 +333,7 @@ mod tests_ {
                     let src = split.1;
                     let len = dst.len();
                     assert!(len <= src.len());
-                    dst.clone_or_copy(src.split_at(len).0);
+                    dst.clone_from(src.split_at(len).0);
                     wrote_len += len;
                 }
             }
@@ -363,7 +361,7 @@ mod tests_ {
             }
             let mut target = Owned::new_slice(
                 seq_len,
-                |_, m| m.write( T::ZERO),
+                |_, m| { m.write(T::ZERO); },
                 CoreAlloc::new(),
             );
             let mut read_len = 0usize;

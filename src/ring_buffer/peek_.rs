@@ -14,7 +14,8 @@ use abs_buff::{
     x_deps::abs_sync,
     TrBuffIterPeek, TrBuffIterTryPeek,
 };
-use abs_sync::{cancellation::*, x_deps::pin_utils};
+use abs_sync::cancellation::{
+    NonCancellableToken, TrCancellationToken, TrIntoFutureMayCancel};
 use atomex::TrCmpxchOrderings;
 
 use super::{
@@ -82,10 +83,10 @@ where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    type SliceRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
-    type BuffIter<'a> = Dual<Self::SliceRef<'a>> where Self: 'a;
-    type Err = RxError<usize>;
+    type SegmRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
+    type Segments<'a> = Dual<Self::SegmRef<'a>> where Self: 'a;
     type PeekAsync<'a> = PeekAsync<'a, B, P, T, O> where Self: 'a;
+    type Err = RxError<usize>;
 
     #[inline]
     fn peek_async(&mut self) -> Self::PeekAsync<'_> {
@@ -101,7 +102,7 @@ where
 { 
     #[inline]
     fn try_peek(&mut self) -> Result<
-        <Self as TrBuffIterPeek<T>>::BuffIter<'_>,
+        <Self as TrBuffIterPeek<T>>::Segments<'_>,
         <Self as TrBuffIterPeek<T>>::Err,
     > {
         BuffPeek::try_peek(self)
@@ -132,18 +133,18 @@ where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    #[inline(always)]
+    #[inline]
     pub(super) fn new(io_ctx: Pin<&'a mut IoCtx<B, P, T, O>>) -> Self {
         PeekAsync(io_ctx)
     }
 
-    #[inline(always)]
-    pub fn may_cancel_with<C>(
+    #[inline]
+    pub fn may_cancel_with<'f, C: TrCancellationToken>(
         self,
-        cancel: Pin<&'a mut C>,
-    ) -> PeekFuture<'a, C, B, P, T, O>
+        cancel: Pin<&'f mut C>,
+    ) -> PeekFuture<'a, 'f, C, B, P, T, O>
     where
-        C: TrCancellationToken,
+        Self: 'f,
     {
         PeekFuture::new(self.0, cancel)
     }
@@ -155,7 +156,7 @@ where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    type IntoFuture = PeekFuture<'a, NonCancellableToken, B, P, T, O>;
+    type IntoFuture = PeekFuture<'a, 'a, NonCancellableToken, B, P, T, O>;
     type Output = <Self::IntoFuture as Future>::Output;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -164,7 +165,7 @@ where
     }
 }
 
-impl<'a, B, P, T, O> TrIntoFutureMayCancel<'a> for PeekAsync<'a, B, P, T, O>
+impl<B, P, T, O> TrIntoFutureMayCancel for PeekAsync<'_, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[MaybeUninit<T>]>,
@@ -174,30 +175,30 @@ where
         <<Self as IntoFuture>::IntoFuture as Future>::Output;
 
     #[inline(always)]
-    fn may_cancel_with<C>(
+    fn may_cancel_with<'f, C: TrCancellationToken>(
         self,
-        cancel: Pin<&'a mut C>,
+        cancel: Pin<&'f mut C>,
     ) -> impl Future<Output = Self::MayCancelOutput>
     where
-        C: TrCancellationToken,
+        Self: 'f,
     {
         PeekAsync::may_cancel_with(self, cancel)
     }
 }
 
 #[pin_project]
-pub struct PeekFuture<'a, C, B, P, T, O>
+pub struct PeekFuture<'ctx, 'tok, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
-    cancel_: Pin<&'a mut C>,
+    io_ctx_: Pin<&'ctx mut IoCtx<B, P, T, O>>,
+    cancel_: Pin<&'tok mut C>,
 }
 
-impl<'a, C, B, P, T, O> PeekFuture<'a, C, B, P, T, O>
+impl<'ctx, 'tok, C, B, P, T, O> PeekFuture<'ctx, 'tok, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
@@ -205,8 +206,8 @@ where
     O: TrCmpxchOrderings,
 {
     pub(super) const fn new(
-        io_ctx: Pin<&'a mut IoCtx<B, P, T, O>>,
-        cancel: Pin<&'a mut C>,
+        io_ctx: Pin<&'ctx mut IoCtx<B, P, T, O>>,
+        cancel: Pin<&'tok mut C>,
     ) -> Self {
         PeekFuture {
             io_ctx_: io_ctx,
@@ -215,18 +216,19 @@ where
     }
 }
 
-impl<'a, C, B, P, T, O> Future for PeekFuture<'a, C, B, P, T, O>
+impl<'ctx, C, B, P, T, O> Future
+for PeekFuture<'ctx, '_, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    type Output = Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>>;
+    type Output = Result<Dual<ReclSliceRef<'ctx, P, T, O>>, RxError<usize>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        let ring_buf: &'a RingBuffer<P, T, O> = unsafe {
+        let ring_buf: &'ctx RingBuffer<P, T, O> = unsafe {
             let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
             NonNull::new_unchecked(ptr).as_ref().buffer()
         };

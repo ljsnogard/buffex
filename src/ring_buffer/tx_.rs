@@ -12,9 +12,11 @@ use pin_utils::pin_mut;
 
 use abs_buff::{
     x_deps::abs_sync,
-    TrBuffIterWrite, TrBuffIterTryWrite,
+    TrBuffIterTryWrite, TrBuffIterWrite
 };
-use abs_sync::{cancellation::*, x_deps::pin_utils};
+use abs_sync::cancellation::{
+    NonCancellableToken, TrCancellationToken, TrIntoFutureMayCancel,
+};
 use atomex::TrCmpxchOrderings;
 
 use super::{
@@ -102,13 +104,10 @@ where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    type SliceMut<'a> = ReclSliceMut<'a, P, T, O> where Self: 'a;
-
-    type BuffIter<'a> = Dual<Self::SliceMut<'a>> where Self: 'a;
-
-    type Err = TxError<usize>;
-
+    type SegmMut<'a> = ReclSliceMut<'a, P, T, O> where Self: 'a;
+    type Segments<'a> = Dual<Self::SegmMut<'a>> where Self: 'a;
     type WriteAsync<'a> = WriteAsync<'a, B, P, T, O> where Self: 'a;
+    type Err = TxError<usize>;
 
     #[inline]
     fn write_async(&mut self, length: usize) -> Self::WriteAsync<'_> {
@@ -124,7 +123,7 @@ where
 {
     #[inline(always)]
     fn try_write(&mut self, length: usize) -> Result<
-        <Self as TrBuffIterWrite<T>>::BuffIter<'_>,
+        <Self as TrBuffIterWrite<T>>::Segments<'_>,
         <Self as TrBuffIterWrite<T>>::Err,
     > {
         BuffTx::try_write(self, length)
@@ -159,12 +158,12 @@ where
     }
 
     #[inline(always)]
-    pub fn may_cancel_with<C>(
+    pub fn may_cancel_with<'f, C: TrCancellationToken>(
         self,
-        cancel: Pin<&'a mut C>,
-    ) -> WriteFuture<'a, C, B, P, T, O>
+        cancel: Pin<&'f mut C>,
+    ) -> WriteFuture<'a, 'f, C, B, P, T, O>
     where
-        C: TrCancellationToken,
+        Self: 'f,
     {
         WriteFuture::new(self.io_ctx_, self.length_, cancel)
     }
@@ -176,7 +175,7 @@ where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    type IntoFuture = WriteFuture<'a, NonCancellableToken, B, P, T, O>;
+    type IntoFuture = WriteFuture<'a, 'a, NonCancellableToken, B, P, T, O>;
     type Output = <Self::IntoFuture as Future>::Output;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -185,7 +184,7 @@ where
     }
 }
 
-impl<'a, B, P, T, O> TrIntoFutureMayCancel<'a> for WriteAsync<'a, B, P, T, O>
+impl<B, P, T, O> TrIntoFutureMayCancel for WriteAsync<'_, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[MaybeUninit<T>]>,
@@ -194,32 +193,32 @@ where
     type MayCancelOutput = <<Self as IntoFuture>::IntoFuture as Future>::Output;
 
     #[inline(always)]
-    fn may_cancel_with<C>(
+    fn may_cancel_with<'f, C: TrCancellationToken>(
         self,
-        cancel: Pin<&'a mut C>,
+        cancel: Pin<&'f mut C>,
     ) -> impl Future<Output = Self::MayCancelOutput>
     where
-        C: TrCancellationToken,
+        Self: 'f,
     {
         WriteAsync::may_cancel_with(self, cancel)
     }
 }
 
 #[pin_project]
-pub struct WriteFuture<'a, C, B, P, T, O>
+pub struct WriteFuture<'ctx, 'tok, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
-    cancel_: Pin<&'a mut C>,
+    io_ctx_: Pin<&'ctx mut IoCtx<B, P, T, O>>,
+    cancel_: Pin<&'tok mut C>,
     length_: usize,
     #[pin]demand_: Option<Demand<O>>,
 }
 
-impl<'a, C, B, P, T, O> WriteFuture<'a, C, B, P, T, O>
+impl<'ctx, 'tok, C, B, P, T, O> WriteFuture<'ctx, 'tok, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
@@ -227,9 +226,9 @@ where
     O: TrCmpxchOrderings,
 {
     pub(super) const fn new(
-        io_ctx: Pin<&'a mut IoCtx<B, P, T, O>>,
+        io_ctx: Pin<&'ctx mut IoCtx<B, P, T, O>>,
         length: usize,
-        cancel: Pin<&'a mut C>,
+        cancel: Pin<&'tok mut C>,
     ) -> Self {
         WriteFuture {
             io_ctx_: io_ctx,
@@ -240,18 +239,19 @@ where
     }
 }
 
-impl<'a, C, B, P, T, O> Future for WriteFuture<'a, C, B, P, T, O>
+impl<'ctx, C, B, P, T, O> Future
+for WriteFuture<'ctx, '_, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    type Output = Result<Dual<ReclSliceMut<'a, P, T, O>>, TxError<usize>>;
+    type Output = Result<Dual<ReclSliceMut<'ctx, P, T, O>>, TxError<usize>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        let ring_buf: &'a RingBuffer<P, T, O> = unsafe {
+        let ring_buf: &'ctx RingBuffer<P, T, O> = unsafe {
             let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
             NonNull::new_unchecked(ptr).as_ref().buffer()
         };

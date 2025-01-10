@@ -340,6 +340,7 @@ where
         self.rw_state_.data_size()
     }
 
+    #[allow(unused)]
     #[inline]
     pub fn load_state_info(&self) -> RwStateInfo<usize> {
         self.rw_state_.load_state()
@@ -1176,7 +1177,7 @@ mod tests_ {
                 seq_len,
                 |u, m| {
                     let Result::Ok(x) = T::try_from(u) else { panic!() };
-                    m.write(x)
+                    m.write(x);
                 },
                 CoreAlloc::new(),
             );
@@ -1232,7 +1233,7 @@ mod tests_ {
             // generate [0..seq_len - 1]
             let mut target = Owned::new_slice(
                 max_len - seq_len,
-                |_, m| m.write(T::ZERO),
+                |_, m| { m.write(T::ZERO); },
                 CoreAlloc::new(),
             );
             // how many units has been copied to target
@@ -1302,8 +1303,10 @@ mod tests_ {
             panic!()
         };
         let s = Arc::new(state);
-        let s_cloned = s.clone();
-        let writer_handle = std::thread::spawn(move || writer_(s_cloned, TEST_MAX_LEN));
+        let writer_handle = {
+            let s_cloned = s.clone();
+            std::thread::spawn(move || writer_(s_cloned, TEST_MAX_LEN))
+        };
         let reader_handle = std::thread::spawn(move || reader_(s, TEST_MAX_LEN));
         let w = writer_handle.join();
         let r = reader_handle.join();

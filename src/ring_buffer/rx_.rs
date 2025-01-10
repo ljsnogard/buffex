@@ -14,7 +14,8 @@ use abs_buff::{
     x_deps::abs_sync,
     TrBuffIterPeek, TrBuffIterRead, TrBuffIterTryPeek, TrBuffIterTryRead,
 };
-use abs_sync::{cancellation::*, x_deps::pin_utils};
+use abs_sync::cancellation::{
+    NonCancellableToken, TrCancellationToken, TrIntoFutureMayCancel};
 use atomex::TrCmpxchOrderings;
 
 use super::{
@@ -116,10 +117,10 @@ where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    type SliceRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
-    type BuffIter<'a> = Dual<Self::SliceRef<'a>> where Self: 'a;
+    type SegmRef<'s> = ReclSliceRef<'s, P, T, O> where Self: 's;
+    type Segments<'s> = Dual<Self::SegmRef<'s>> where Self: 's;
+    type ReadAsync<'s> = ReadAsync<'s, B, P, T, O> where Self: 's;
     type Err = RxError<usize>;
-    type ReadAsync<'a> = ReadAsync<'a, B, P, T, O> where Self: 'a;
 
     #[inline]
     fn read_async(&mut self, length: usize) -> Self::ReadAsync<'_> {
@@ -135,7 +136,7 @@ where
 {
     #[inline]
     fn try_read(&mut self, length: usize) -> Result<
-        <Self as TrBuffIterRead<T>>::BuffIter<'_>,
+        <Self as TrBuffIterRead<T>>::Segments<'_>,
         <Self as TrBuffIterRead<T>>::Err,
     > {
         BuffRx::try_read(self, length)
@@ -148,10 +149,10 @@ where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    type SliceRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
-    type BuffIter<'a> = Dual<Self::SliceRef<'a>> where Self: 'a;
-    type Err = RxError<usize>;
+    type SegmRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
+    type Segments<'a> = Dual<Self::SegmRef<'a>> where Self: 'a;
     type PeekAsync<'a> = PeekAsync<'a, B, P, T, O> where Self: 'a;
+    type Err = RxError<usize>;
 
     #[inline]
     fn peek_async(&mut self) -> Self::PeekAsync<'_> {
@@ -167,7 +168,7 @@ where
 {
     #[inline]
     fn try_peek(&mut self) -> Result<
-        <Self as TrBuffIterPeek<T>>::BuffIter<'_>,
+        <Self as TrBuffIterPeek<T>>::Segments<'_>,
         <Self as TrBuffIterPeek<T>>::Err,
     > {
         BuffRx::try_peek(self)
@@ -201,10 +202,10 @@ where
     }
 
     #[inline(always)]
-    pub fn may_cancel_with<C>(
+    pub fn may_cancel_with<'f, C>(
         self,
-        cancel: Pin<&'a mut C>,
-    ) -> ReadFuture<'a, C, B, P, T, O>
+        cancel: Pin<&'f mut C>,
+    ) -> ReadFuture<'a, 'f, C, B, P, T, O>
     where
         C: TrCancellationToken,
     {
@@ -218,7 +219,7 @@ where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    type IntoFuture = ReadFuture<'a, NonCancellableToken, B, P, T, O>;
+    type IntoFuture = ReadFuture<'a, 'a, NonCancellableToken, B, P, T, O>;
     type Output = <Self::IntoFuture as Future>::Output;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -227,7 +228,7 @@ where
     }
 }
 
-impl<'a, B, P, T, O> TrIntoFutureMayCancel<'a> for ReadAsync<'a, B, P, T, O>
+impl<B, P, T, O> TrIntoFutureMayCancel for ReadAsync<'_, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[MaybeUninit<T>]>,
@@ -236,32 +237,32 @@ where
     type MayCancelOutput =
         <<Self as IntoFuture>::IntoFuture as Future>::Output;
 
-    #[inline(always)]
-    fn may_cancel_with<C>(
+    #[inline]
+    fn may_cancel_with<'f, C: TrCancellationToken>(
         self,
-        cancel: Pin<&'a mut C>,
+        cancel: Pin<&'f mut C>,
     ) -> impl Future<Output = Self::MayCancelOutput>
     where
-        C: TrCancellationToken,
+        Self: 'f,
     {
         ReadAsync::may_cancel_with(self, cancel)
     }
 }
 
 #[pin_project]
-pub struct ReadFuture<'a, C, B, P, T, O>
+pub struct ReadFuture<'ctx, 'tok, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
+    io_ctx_: Pin<&'ctx mut IoCtx<B, P, T, O>>,
     length_: usize,
-    cancel_: Pin<&'a mut C>,
+    cancel_: Pin<&'tok mut C>,
 }
 
-impl<'a, C, B, P, T, O> ReadFuture<'a, C, B, P, T, O>
+impl<'ctx, 'tok, C, B, P, T, O> ReadFuture<'ctx, 'tok, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
@@ -269,9 +270,9 @@ where
     O: TrCmpxchOrderings,
 {
     pub(super) const fn new(
-        io_ctx: Pin<&'a mut IoCtx<B, P, T, O>>,
+        io_ctx: Pin<&'ctx mut IoCtx<B, P, T, O>>,
         length: usize,
-        cancel: Pin<&'a mut C>,
+        cancel: Pin<&'tok mut C>,
     ) -> Self {
         ReadFuture {
             io_ctx_: io_ctx,
@@ -281,18 +282,19 @@ where
     }
 }
 
-impl<'a, C, B, P, T, O> Future for ReadFuture<'a, C, B, P, T, O>
+impl<'ctx, C, B, P, T, O> Future
+for ReadFuture<'ctx, '_, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    type Output = Result<Dual<ReclSliceRef<'a, P, T, O>>, RxError<usize>>;
+    type Output = Result<Dual<ReclSliceRef<'ctx, P, T, O>>, RxError<usize>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        let ring_buf: &'a RingBuffer<P, T, O> = unsafe {
+        let ring_buf: &'ctx RingBuffer<P, T, O> = unsafe {
             let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
             NonNull::new_unchecked(ptr).as_ref().buffer()
         };
