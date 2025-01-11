@@ -1,6 +1,6 @@
 ﻿[package]
 name = "buffex"
-version = "0.0.2"
+version = "0.2.0"
 edition = "2024"
 
 authors = ["lino <lino_snsalias@outlook.com>"]
@@ -12,9 +12,9 @@ license = "MIT/Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-abs_buff = { git = "https://github.com/ljsnogard/abs_buff.git", branch = "refactor/jan-11" }
+abs_buff = { git = "https://github.com/ljsnogard/abs_buff.git", branch = "dev/0.2.0" }
 atomex = { git = "https://github.com/ljsnogard/atomex-rs.git", branch = "dev/0.1.1" }
-recl-slices = { git = "https://github.com/ljsnogard/recl-slices.git", branch = "refactor/jan-11" }
+segm_buff = { git = "https://github.com/ljsnogard/segm_buff.git", branch = "main" }
 
 pin-project = { version = "1.1.*" }
 pin-utils = { version = "*" }

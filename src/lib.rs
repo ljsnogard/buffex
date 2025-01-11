@@ -17,7 +17,7 @@ pub mod x_deps {
     pub use atomex;
     pub use atomex::x_deps::funty;
 
-    pub use recl_slices;
+    pub use segm_buff;
 
     pub use smallvec;
 }
