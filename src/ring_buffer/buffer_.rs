@@ -383,7 +383,10 @@ mod tests_ {
                         c += dst_w;
                         if read_len == target.len() { break; }
                     },
-                    Result::Err(RxError::Closing) => break,
+                    Result::Err(RxError::Closing) => {
+                        log::trace!("[buffer_::read_seq_] closing");
+                        break
+                    },
                     Result::Err(e) => panic!(
                         "reader_: step({seq_len}), {:?} - {:?}\n{e:?}",
                         split.0, split.1,

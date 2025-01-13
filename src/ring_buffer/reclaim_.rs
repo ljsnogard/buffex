@@ -47,7 +47,8 @@ where
             let rp = &buff[info.rp] as *const MaybeUninit<T> as *const T;
             core::ptr::eq(head, rp)
         });
-        let x = self.0.state().rx_forward(s.len());
+        let length = s.borrowed_len();
+        let x = self.0.state().rx_forward(length);
         assert!(x.is_ok())
     }
 }
@@ -76,6 +77,8 @@ where
 {
     fn reclaim<S: TrBuffSegmView<Item = MaybeUninit<T>>>(&mut self, s: &mut S) {
         let Option::Some(head) = s.iter_ptr().next() else {
+            #[cfg(test)]
+            log::warn!("[WriterForwardFn::reclaim] empty head buff segm");
             return;
         };
         debug_assert!({
@@ -84,7 +87,8 @@ where
             let wp = &buff[info.wp] as *const MaybeUninit<T>;
             core::ptr::eq(head, wp)
         });
-        let x = self.0.state().tx_forward(s.len());
+        let length = s.borrowed_len();
+        let x = self.0.state().tx_forward(length);
         assert!(x.is_ok())
     }
 }

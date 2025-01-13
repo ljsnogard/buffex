@@ -828,7 +828,10 @@ where
             debug_assert!(wp >= rp,  "wp({wp}) >= rp({rp}), {self:?}");
             (wp - rp, self.capacity_ - wp)
         };
-        RwStateInfo { rp, wp, rl, wl }
+        let info = RwStateInfo { rp, wp, rl, wl };
+        #[cfg(test)]
+        log::trace!("[RwState::load_positions] state({state}), info({info:?})");
+        info
     }
 
     pub fn load_state(&self) -> RwStateInfo<usize> {
