@@ -11,13 +11,11 @@ extern crate std;
 pub mod ring_buffer;
 
 pub mod x_deps {
-    pub use abs_buff;
-    pub use abs_buff::x_deps::abs_sync;
-
     pub use atomex;
     pub use atomex::x_deps::funty;
 
     pub use segm_buff;
+    pub use segm_buff::x_deps::{abs_buff, abs_sync};
 
     pub use smallvec;
 }

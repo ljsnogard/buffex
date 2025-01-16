@@ -1,4 +1,5 @@
 ﻿use abs_buff::{TrBuffIterTryRead, TrBuffIterTryWrite};
+use segm_buff::x_deps::abs_buff;
 
 /// A fixed size buffer that serves a pair of producer and a consumer, offering
 /// a conceptually infinite sized buffer, by internally linking the head and the

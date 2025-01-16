@@ -5,7 +5,7 @@
 
 use abs_buff::TrBuffSegmView;
 use atomex::TrCmpxchOrderings;
-use segm_buff::{SegmMut, SegmRef, TrReclaim};
+use segm_buff::{x_deps::abs_buff, SegmMut, SegmRef, TrReclaim};
 
 use super::buffer_::RingBuffer;
 

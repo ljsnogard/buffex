@@ -10,13 +10,11 @@
 use pin_project::pin_project;
 use pin_utils::pin_mut;
 
-use abs_buff::{
-    x_deps::abs_sync,
-    TrBuffIterPeek, TrBuffIterTryPeek,
-};
+use abs_buff::{TrBuffIterPeek, TrBuffIterTryPeek};
 use abs_sync::cancellation::{
-    NonCancellableToken, TrCancellationToken, TrIntoFutureMayCancel};
+    NonCancellableToken, TrCancellationToken, TrMayCancel};
 use atomex::TrCmpxchOrderings;
+use segm_buff::x_deps::{abs_buff, abs_sync};
 
 use super::{
     buffer_::{RingBuffer, RxError},
@@ -165,7 +163,7 @@ where
     }
 }
 
-impl<B, P, T, O> TrIntoFutureMayCancel for PeekAsync<'_, B, P, T, O>
+impl<'a, B, P, T, O> TrMayCancel<'a> for PeekAsync<'a, B, P, T, O>
 where
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[MaybeUninit<T>]>,
@@ -178,7 +176,7 @@ where
     fn may_cancel_with<'f, C: TrCancellationToken>(
         self,
         cancel: Pin<&'f mut C>,
-    ) -> impl Future<Output = Self::MayCancelOutput>
+    ) -> impl IntoFuture<Output = Self::MayCancelOutput>
     where
         Self: 'f,
     {
