@@ -97,6 +97,14 @@ where
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
+    /// ## Safety
+    /// 
+    /// - `capacity` must be less than or equal buffer's length;
+    /// - `capacity` must be less than or usize::MAx >> 3;
+    pub const unsafe fn new_unchecked(buffer: P, capacity: usize) -> Self {
+        RingBuffer(BuffState::new_unchecked(buffer, capacity))
+    }
+
     /// Create a ring buffer by specifying its internal data storage.
     /// 
     /// Will return `Err` if the buffer is too large ( size greater than or
@@ -270,6 +278,20 @@ where
         Option::Some(Self::split(self))
     }
 }
+
+unsafe impl<P, T, O> Send for RingBuffer<P, T, O>
+where
+    P: BorrowMut<[MaybeUninit<T>]>,
+    T: Send,
+    O: TrCmpxchOrderings,
+{}
+
+unsafe impl<P, T, O> Sync for RingBuffer<P, T, O>
+where
+    P: BorrowMut<[MaybeUninit<T>]>,
+    T: Send + Sync,
+    O: TrCmpxchOrderings,
+{}
 
 #[cfg(test)]
 mod tests_ {

@@ -315,19 +315,23 @@ where
     B: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
+    pub const fn new_unchecked(buffer: B, capacity: usize) -> Self {
+        BuffState {
+            _unuse_t_: PhantomData,
+            _pinned_: PhantomPinned,
+            rx_demand_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
+            tx_demand_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
+            rw_state_: RwState::new(capacity),
+            buf_cell_: UnsafeCell::new(buffer)
+        }
+    }
+
     pub fn try_new(buffer: B) -> Result<Self, usize> {
         let s = buffer.borrow().len();
         if s >= RwState::<O>::POS_MAX {
             return Result::Err(s);
         }
-        Result::Ok(BuffState {
-            _unuse_t_: PhantomData,
-            _pinned_: PhantomPinned,
-            rx_demand_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
-            tx_demand_: AtomicDemandPtr::new(AtomicPtr::new(ptr::null_mut())),
-            rw_state_: RwState::new(buffer.borrow().len()),
-            buf_cell_: UnsafeCell::new(buffer)
-        })
+        Result::Ok(Self::new_unchecked(buffer, s))
     }
 
     #[inline]
