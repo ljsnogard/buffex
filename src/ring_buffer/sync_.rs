@@ -19,7 +19,7 @@ use atomex::{
 
 use super::{RingBuffer, RxError, TxError, Dual};
 
-pub(super) type FnCheckState<O> = fn(&RwState<O>) -> bool;
+pub(super) type FnCheckState<O> = fn(&RwState<O>, usize) -> bool;
 pub(super) type AtomicDemandPtr<O> = AtomexPtrOwned<Demand<O>, O>;
 
 #[derive(Debug)]
@@ -36,25 +36,31 @@ where
     }
 }
 
-impl<O> FnOnce<(&RwState<O>, )> for CheckStateFn<O>
+impl<O> FnOnce<(&RwState<O>, usize,)> for CheckStateFn<O>
 where
     O: TrCmpxchOrderings,
 {
     type Output = bool;
 
-    extern "rust-call" fn call_once(self, args: (&RwState<O>,)) -> Self::Output {
+    extern "rust-call" fn call_once(
+        self,
+        args: (&RwState<O>, usize,),
+    ) -> Self::Output {
         let f = self.0;
-        f(args.0)
+        f(args.0, args.1)
     }
 }
 
-impl<O> FnMut<(&RwState<O>,)> for CheckStateFn<O>
+impl<O> FnMut<(&RwState<O>, usize,)> for CheckStateFn<O>
 where
     O: TrCmpxchOrderings,
 {
-    extern "rust-call" fn call_mut(&mut self, args: (&RwState<O>,)) -> Self::Output {
+    extern "rust-call" fn call_mut(
+        &mut self,
+        args: (&RwState<O>, usize,),
+    ) -> Self::Output {
         let f = self.0;
-        f(args.0)
+        f(args.0, args.1)
     }
 }
 
@@ -73,6 +79,7 @@ pub(super) struct Demand<O>
 where
     O: TrCmpxchOrderings,
 {
+    count_: usize,
     check_: CheckStateFn<O>,
     waker_: Option<Waker>,
 }
@@ -81,8 +88,14 @@ impl<O> Demand<O>
 where
     O: TrCmpxchOrderings,
 {
-    pub const fn new(check: FnCheckState<O>) -> Self {
+    pub const DEFAULT_PEEK_COUNT: usize = 1;
+
+    pub const fn new(
+        count: usize,
+        check: FnCheckState<O>,
+    ) -> Self {
         Demand {
+            count_: count,
             check_: CheckStateFn::new(check),
             waker_: Option::None,
         }
@@ -93,7 +106,7 @@ where
         rw_state: &RwState<O>,
     ) -> bool {
         let f = &mut self.check_;
-        f(rw_state)
+        f(rw_state, self.count_)
     }
 
     pub fn try_init_waker(
@@ -113,18 +126,26 @@ where
         self.waker_.take()
     }
 
-    pub fn producer_check(state: &RwState<O>) -> bool {
+    pub fn producer_check(
+        state: &RwState<O>,
+        demanded: usize,
+    ) -> bool {
         let i = state.load_state();
+        let a = cmp::min(state.capacity() >> 1, demanded >> 1);
         // #[cfg(test)]
         // log::trace!("[Demand::producer_check] {i:?}");
-        i.wl > 0usize
+        i.wl > a
     }
 
-    pub fn consumer_check(state: &RwState<O>) -> bool {
+    pub fn consumer_check(
+        state: &RwState<O>,
+        demanded: usize,
+    ) -> bool {
         let i = state.load_state();
+        let a = cmp::min(state.capacity() >> 1, demanded >> 1);
         // #[cfg(test)]
         // log::trace!("[Demand::consumer_check] {i:?}");
-        i.rl > 0usize
+        i.rl > a
     }
 }
 
@@ -777,7 +798,7 @@ where
     }
 
     #[inline]
-    pub fn capacity(&self) -> usize {
+    pub const fn capacity(&self) -> usize {
         self.capacity_
     }
 

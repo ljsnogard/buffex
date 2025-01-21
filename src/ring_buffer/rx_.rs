@@ -340,10 +340,14 @@ where
                     log::trace!("[ReadFuture::poll] not queued try_read_ err: {rx_err:?}");
                     return Poll::Ready(Result::Err(rx_err));
                 };
+                let demand = Demand::new(
+                    *this.length_,
+                    Demand::consumer_check,
+                );
                 let try_init = this
                     .io_ctx_
                     .as_mut()
-                    .try_init_demand(Demand::new(Demand::consumer_check));
+                    .try_init_demand(demand);
                 let Result::Ok(demand) = try_init else {
                     unreachable!("[ReadFuture::poll]")
                 };

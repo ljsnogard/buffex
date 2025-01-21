@@ -272,10 +272,14 @@ where
                     log::trace!("[PeekFuture::poll] not queued try_peek_ err: {rx_err:?}");
                     return Poll::Ready(Result::Err(rx_err));
                 };
+                let demand = Demand::new(
+                    Demand::<O>::DEFAULT_PEEK_COUNT,
+                    Demand::consumer_check,
+                );
                 let try_init = this
                     .io_ctx_
                     .as_mut()
-                    .try_init_demand(Demand::new(Demand::consumer_check));
+                    .try_init_demand(demand);
                 let Result::Ok(demand) = try_init else {
                     unreachable!("[PeekFuture::poll]")
                 };

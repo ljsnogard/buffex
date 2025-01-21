@@ -295,10 +295,14 @@ where
                     log::trace!("[WriteFuture::poll] not queued try_write err: {write_err:?}");
                     return Poll::Ready(Result::Err(write_err));
                 };
+                let demand = Demand::new(
+                    *this.length_,
+                    Demand::producer_check,
+                );
                 let try_init = this
                     .io_ctx_
                     .as_mut()
-                    .try_init_demand(Demand::new(Demand::producer_check));
+                    .try_init_demand(demand);
                 let Result::Ok(demand) = try_init else {
                     unreachable!("[WriteFuture::poll]")
                 };
