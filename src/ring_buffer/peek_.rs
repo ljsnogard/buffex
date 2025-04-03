@@ -10,9 +10,13 @@
 use pin_project::pin_project;
 use pin_utils::pin_mut;
 
-use abs_buff::{TrBuffIterPeek, TrBuffIterTryPeek};
-use abs_sync::cancellation::{
-    NonCancellableToken, TrCancellationToken, TrMayCancel};
+use abs_buff::{
+    x_deps::anylr,
+    TrBuffIterPeek, TrBuffIterTryPeek,
+};
+use abs_sync::cancellation::{NonCancellableToken, TrCancellationToken, TrMayCancel};
+use anylr::SomeOf;
+
 use atomex::TrCmpxchOrderings;
 use segm_buff::x_deps::{abs_buff, abs_sync};
 
@@ -99,11 +103,14 @@ where
     O: TrCmpxchOrderings,
 { 
     #[inline]
-    fn try_peek(&mut self) -> Result<
+    fn try_peek(&mut self) -> SomeOf<
         <Self as TrBuffIterPeek<T>>::Segments<'_>,
         <Self as TrBuffIterPeek<T>>::Err,
     > {
-        BuffPeek::try_peek(self)
+        match BuffPeek::try_peek(self) {
+            Result::Ok(segms) => SomeOf::Left(segms),
+            Result::Err(err) => SomeOf::Right(err),
+        }
     }
 }
 
@@ -214,15 +221,14 @@ where
     }
 }
 
-impl<'ctx, C, B, P, T, O> Future
-for PeekFuture<'ctx, '_, C, B, P, T, O>
+impl<'ctx, C, B, P, T, O> Future for PeekFuture<'ctx, '_, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,
     P: BorrowMut<[MaybeUninit<T>]>,
     O: TrCmpxchOrderings,
 {
-    type Output = Result<Dual<ReclSliceRef<'ctx, P, T, O>>, RxError<usize>>;
+    type Output = SomeOf<Dual<ReclSliceRef<'ctx, P, T, O>>, RxError<usize>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
@@ -233,19 +239,19 @@ where
         loop {
             if let Option::Some(demand) = this.io_ctx_.as_mut().demand_mut() {
                 let try_peek = ring_buf.try_peek_();
-                let Result::Err(rx_err) = try_peek else {
+                let SomeOf::Right(rx_err) = try_peek else {
                     // try_peek is ok
                     #[cfg(test)]
                     log::trace!("[PeekFuture::poll] enqueued({demand:p}) try_peek_ ok");
                     let _ = ring_buf.state().dequeue_rx(demand);
-                    return Poll::Ready(try_peek);
+                    return Poll::Ready(try_peek.into());
                 };
                 let RxError::Drained(p) = rx_err else {
                     // try_peek is not TxError::Stuffed
                     #[cfg(test)]
                     log::trace!("[PeekFuture::poll] enqueued({demand:p}) try_peek_ err: {rx_err:?}");
                     let _ = ring_buf.state().dequeue_rx(demand);
-                    return Poll::Ready(Result::Err(rx_err));
+                    return Poll::Ready(SomeOf::Right(rx_err));
                 };
                 let fut_cancel = this
                     .cancel_
@@ -257,12 +263,12 @@ where
                     #[cfg(test)]
                     log::trace!("[PeekFuture::poll] enqueued({demand:p}) cancelled");
                     let _ = ring_buf.state().dequeue_rx(demand);
-                    return Poll::Ready(Result::Err(RxError::Drained(p)));
+                    return Poll::Ready(SomeOf::Right(RxError::Drained(p)));
                 }
                 break Poll::Pending;
             } else {
                 let try_peek = ring_buf.try_peek_();
-                let Result::Err(rx_err) = try_peek else {
+                let SomeOf::Right(rx_err) = try_peek else {
                     // try_peek is ok
                     return Poll::Ready(try_peek);
                 };
@@ -270,7 +276,7 @@ where
                     // try_peek is not RxError::Drained
                     #[cfg(test)]
                     log::trace!("[PeekFuture::poll] not queued try_peek_ err: {rx_err:?}");
-                    return Poll::Ready(Result::Err(rx_err));
+                    return Poll::Ready(SomeOf::Right(rx_err));
                 };
                 let demand = Demand::new(
                     Demand::<O>::DEFAULT_PEEK_COUNT,

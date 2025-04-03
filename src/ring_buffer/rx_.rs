@@ -282,8 +282,7 @@ where
     }
 }
 
-impl<'ctx, C, B, P, T, O> Future
-for ReadFuture<'ctx, '_, C, B, P, T, O>
+impl<'ctx, C, B, P, T, O> Future for ReadFuture<'ctx, '_, C, B, P, T, O>
 where
     C: TrCancellationToken,
     B: Borrow<RingBuffer<P, T, O>>,

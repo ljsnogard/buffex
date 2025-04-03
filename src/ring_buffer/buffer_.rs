@@ -7,7 +7,9 @@
     ptr::NonNull,
 };
 
+use anylr::SomeOf;
 use atomex::{StrictOrderings, TrCmpxchOrderings};
+use segm_buff::x_deps::abs_buff::x_deps::anylr;
 
 use super::{
     reclaim_::{ReaderForwardFn, ReclSliceMut, ReclSliceRef, WriterForwardFn},
@@ -79,10 +81,7 @@ where
     T: fmt::Debug,
 {}
 
-type IoPair<B, P, T, O> = (
-    BuffTx<B, P, T, O>,
-    BuffRx<B, P, T, O>,
-);
+type IoPair<B, P, T, O> = (BuffTx<B, P, T, O>, BuffRx<B, P, T, O>);
 type TrySplitResult<B, P, T, O> = Result<IoPair<B, P, T, O>, B>;
 
 /// A ring buffer that support both sync and async operation.
@@ -207,17 +206,22 @@ where
 
     pub(super) fn try_peek_(
         &self,
-    ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
+    ) -> SomeOf<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
         let make_slice = |slice|
             ReclSliceRef::new(slice, Option::None);
-        let dual = self
-            .0
-            .try_peek()?
+        let try_peek_res = self.0.try_peek();
+        if let Result::Err(e) = try_peek_res {
+            return SomeOf::Right(e);
+        }
+        let Result::Ok(dual) = try_peek_res else {
+            unreachable!()
+        };
+        let dual = dual
             .into_iter()
             .map(|p| unsafe { p.as_ref() })
             .map(make_slice)
             .collect();
-        Result::Ok(dual)
+        SomeOf::Left(dual)
     }
 
     pub(super) fn try_write_(
