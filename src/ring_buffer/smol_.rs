@@ -1,0 +1,115 @@
+//! `futures_io::AsyncRead` / `futures_io::AsyncWrite` implementations
+//! (feature `smol`), usable by smol and every futures-io compatible runtime.
+
+extern crate std;
+
+use std::{
+    borrow::Borrow,
+    io,
+    ops::DerefMut,
+    pin::Pin,
+    ptr,
+    task::{Context, Poll},
+};
+
+use futures_io::{AsyncRead, AsyncWrite};
+
+use super::{
+    error_::{RxError, TxError},
+    rx_::RingRx,
+    state_::RingBuffer,
+    tx_::RingTx,
+};
+
+impl<H, B> AsyncRead for RingRx<H, B, u8>
+where
+    H: Borrow<RingBuffer<B, u8>>,
+    B: DerefMut<Target = [u8]>,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let ring: &RingBuffer<B, u8> = this.ring();
+        loop {
+            match ring.try_read_at(buf.len()) {
+                Ok((start, take)) => {
+                    let src = &ring.buffer_ref()[start..start + take];
+                    // SAFETY: `take <= buf.len()`.
+                    unsafe {
+                        ptr::copy_nonoverlapping(src.as_ptr(), buf.as_mut_ptr(), take);
+                    }
+                    ring.advance_read(take);
+                    return Poll::Ready(Ok(take));
+                }
+                Err(RxError::Drained(_)) => {
+                    let waiter = unsafe { &mut *this.waiter.get() };
+                    waiter.waker = Some(cx.waker().clone());
+                    ring.register_rx_user(waiter);
+                    return Poll::Pending;
+                }
+                // EOF
+                Err(RxError::Closing) => return Poll::Ready(Ok(0)),
+                Err(RxError::Argument) => unreachable!("[smol poll_read] Argument"),
+            }
+        }
+    }
+}
+
+impl<H, B> AsyncWrite for RingTx<H, B, u8>
+where
+    H: Borrow<RingBuffer<B, u8>>,
+    B: DerefMut<Target = [u8]>,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let ring: &RingBuffer<B, u8> = this.ring();
+        loop {
+            match ring.try_write_at(buf.len()) {
+                Ok((start, take)) => {
+                    let dst = ring.buffer_uninit();
+                    // SAFETY: `take <= dst.len() - start`.
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            buf.as_ptr(),
+                            dst[start..start + take].as_mut_ptr().cast::<u8>(),
+                            take,
+                        );
+                    }
+                    ring.advance_write(take);
+                    return Poll::Ready(Ok(take));
+                }
+                Err(TxError::Stuffed(_)) => {
+                    let waiter = unsafe { &mut *this.waiter.get() };
+                    waiter.waker = Some(cx.waker().clone());
+                    ring.register_tx_user(waiter);
+                    return Poll::Pending;
+                }
+                Err(TxError::Closing) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "tx end closed",
+                    )));
+                }
+                Err(TxError::Argument) => unreachable!("[smol poll_write] Argument"),
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // The ring has no internal buffering.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        this.close();
+        Poll::Ready(Ok(()))
+    }
+}

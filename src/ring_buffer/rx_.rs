@@ -1,362 +1,196 @@
-﻿use core::{
-    borrow::{Borrow, BorrowMut},
-    future::{Future, IntoFuture},
-    mem::MaybeUninit,
-    pin::Pin,
-    ptr::NonNull,
-    task::{Context, Poll},
+//! The read (rx) half of the ring buffer.
+
+use core::{
+    borrow::Borrow,
+    cell::UnsafeCell,
+    marker::PhantomPinned,
+    ops::DerefMut,
 };
 
-use pin_project::pin_project;
-use pin_utils::pin_mut;
+use anylr::SomeOf;
 
 use abs_buff::{
-    TrBuffIterPeek, TrBuffIterRead, TrBuffIterTryPeek, TrBuffIterTryRead,
+    x_deps::{anylr, abs_cancel},
+    Demand, TrBuffPeek, TrBuffRead, TrBuffTryPeek, TrBuffTryRead,
 };
-use abs_sync::cancellation::{
-    NonCancellableToken, TrCancellationToken, TrMayCancel};
-use atomex::TrCmpxchOrderings;
-use segm_buff::x_deps::{abs_buff, abs_sync};
 
 use super::{
-    buffer_::{RingBuffer, RxError},
-    peek_::{BuffPeek, PeekAsync},
-    reclaim_::ReclSliceRef,
-    sync_::{CtrlHint, Demand, IoCtx},
-    Dual,
+    error_::RxError,
+    futures_::{PeekAsync, ReadAsync},
+    reclaim_::{ReclPeekRef, ReclSliceRef},
+    state_::{RingBuffer, Waiter},
 };
 
-/// To move or pull data from the ring buffer.
-pub struct BuffRx<B, P, T, O>(IoCtx<B, P, T, O>)
+/// To move data out of the ring buffer (the consumer / user side).
+///
+/// The half holds a shared reference to the ring (`H: Borrow<RingBuffer>`),
+/// which may be `&RingBuffer` or `Arc<RingBuffer>`.
+pub struct RingRx<H, B, T = u8>
 where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings;
-
-impl<B, P, T, O> BuffRx<B, P, T, O>
-where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
+    H: Borrow<RingBuffer<B, T>>,
+    B: DerefMut<Target = [T]>,
 {
-    pub(super) fn new(ctx: IoCtx<B, P, T, O>) -> Self {
-        ctx.state().incr_use_count();
-        BuffRx(ctx)
+    _pin: PhantomPinned,
+    ring: H,
+    /// Waker slot used by the poll-based `AsyncRead` implementations.
+    pub(super) waiter: UnsafeCell<Waiter>,
+    /// Marker tying the element / buffer types.
+    _marker: core::marker::PhantomData<(B, T)>,
+}
+
+impl<H, B, T> RingRx<H, B, T>
+where
+    H: Borrow<RingBuffer<B, T>>,
+    B: DerefMut<Target = [T]>,
+{
+    pub(super) fn new(ring: H) -> Self {
+        RingRx {
+            _pin: PhantomPinned,
+            ring,
+            waiter: UnsafeCell::new(Waiter::new()),
+            _marker: core::marker::PhantomData,
+        }
     }
 
-    pub fn try_read(
-        &mut self,
-        length: usize,
-    ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
-        self.0.borrow().buffer().try_read_(length)
+    #[inline]
+    pub fn ring(&self) -> &RingBuffer<B, T> {
+        self.ring.borrow()
     }
 
-    pub fn read_async(
-        &mut self,
-        length: usize,
-    ) -> ReadAsync<'_, B, P, T, O> {
-        let mut io_ctx = unsafe {
-            let mut pointer = NonNull::new_unchecked(&mut self.0);
-            Pin::new_unchecked(pointer.as_mut())
-        };
-        let _ = io_ctx.as_mut().try_reset_demand();
-        ReadAsync::new(io_ctx, length)
+    /// Borrow up to `length` contiguous readable units. The returned segment
+    /// commits its whole borrowed region when it drops.
+    pub fn try_read(&mut self, length: usize) -> Result<ReclSliceRef<'_, T>, RxError<usize>> {
+        let ring = self.ring();
+        let (start, take) = ring.try_read_at(length)?;
+        Ok(ring.read_segm(start, take))
     }
 
-    pub fn try_peek(
-        &mut self,
-    ) -> Result<Dual<ReclSliceRef<'_, P, T, O>>, RxError<usize>> {
-        self.0.buffer().try_peek_()
+    /// Borrow up to `length` contiguous readable units in an async manner,
+    /// waiting for data (or closing) automatically.
+    pub fn read_async(&mut self, length: usize) -> ReadAsync<'_, H, B, T> {
+        ReadAsync::new(self, length)
     }
 
-    pub fn peek_async(&mut self) -> PeekAsync<'_, B, P, T, O> {
-        let mut io_ctx = unsafe {
-            let mut pointer = NonNull::new_unchecked(&mut self.0);
-            Pin::new_unchecked(pointer.as_mut())
-        };
-        let _ = io_ctx.as_mut().try_reset_demand();
-        PeekAsync::new(io_ctx)
+    /// Borrow all contiguous readable units without consuming them.
+    pub fn try_peek(&mut self) -> Result<ReclPeekRef<'_, T>, RxError<usize>> {
+        let ring = self.ring();
+        let (start, take) = ring.try_peek_at()?;
+        Ok(ring.peek_segm(start, take))
     }
 
-    pub fn as_peek(&mut self) -> BuffPeek<'_, B, P, T, O> {
-        BuffPeek::new(&mut self.0)
+    /// Borrow all contiguous readable units without consuming them, waiting
+    /// for data (or closing) automatically.
+    pub fn peek_async(&mut self) -> PeekAsync<'_, H, B, T> {
+        PeekAsync::new(self)
+    }
+
+    /// Close the rx end: no more data will be read by the user.
+    pub fn close(&mut self) {
+        self.ring().close_rx();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.ring().is_rx_closed()
+    }
+
+    /// The buffer length.
+    pub fn capacity(&self) -> usize {
+        self.ring().capacity()
+    }
+
+    /// The number of buffered items.
+    pub fn data_size(&self) -> usize {
+        self.ring().data_size()
     }
 }
 
-impl<B, P, T, O> Drop for BuffRx<B, P, T, O>
+impl<H, B, T> Drop for RingRx<H, B, T>
 where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
+    H: Borrow<RingBuffer<B, T>>,
+    B: DerefMut<Target = [T]>,
 {
     fn drop(&mut self) {
-        let ctx = &self.0;
-        let hint = ctx.state().decr_use_count();
-        if matches!(hint, CtrlHint::MarkClose(_)) {
-            ctx.buffer().state().mark_rx_closed()
-        }
-        #[cfg(test)]
-        log::trace!("[BuffRead::Drop] hint({hint})");
+        let ring = self.ring();
+        let waiter = unsafe { &*self.waiter.get() };
+        ring.deregister_rx_user(waiter);
+        ring.close_rx();
     }
 }
 
-impl<B, P, T, O> AsRef<RingBuffer<P, T, O>> for BuffRx<B, P, T, O>
-where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
-{
-    fn as_ref(&self) -> &RingBuffer<P, T, O> {
-        self.0.borrow().buffer()
-    }
-}
+// ---------------------------------------------------------------------------
+// abs_buff traits
+// ---------------------------------------------------------------------------
 
-impl<B, P, T, O> TrBuffIterRead<T> for BuffRx<B, P, T, O>
+impl<H, B, T> TrBuffRead<T> for RingRx<H, B, T>
 where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
+    H: Borrow<RingBuffer<B, T>>,
+    B: DerefMut<Target = [T]>,
 {
-    type SegmRef<'s> = ReclSliceRef<'s, P, T, O> where Self: 's;
-    type Segments<'s> = Dual<Self::SegmRef<'s>> where Self: 's;
-    type ReadAsync<'s> = ReadAsync<'s, B, P, T, O> where Self: 's;
+    type SegmRef<'a> = ReclSliceRef<'a, T> where Self: 'a;
     type Err = RxError<usize>;
 
-    #[inline]
-    fn read_async(&mut self, length: usize) -> Self::ReadAsync<'_> {
-        BuffRx::read_async(self, length)
+    fn is_drained(&self) -> bool {
+        // "Drained" means no more data will ever be emitted: the rx end is
+        // closed *and* the ring holds no buffered data.
+        self.ring().data_size() == 0 && self.ring().is_rx_closed()
     }
-}
 
-impl<B, P, T, O> TrBuffIterTryRead<T> for BuffRx<B, P, T, O>
-where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
-{
-    #[inline]
-    fn try_read(&mut self, length: usize) -> Result<
-        <Self as TrBuffIterRead<T>>::Segments<'_>,
-        <Self as TrBuffIterRead<T>>::Err,
+    fn read_async<'f>(
+        &'f mut self,
+        demand: &Demand<usize>,
+    ) -> impl abs_cancel::TrMayCancel<
+        'f,
+        MayCancelOutput = SomeOf<Self::SegmRef<'f>, Self::Err>,
     > {
-        BuffRx::try_read(self, length)
+        let length = demand.max().copied().unwrap_or(usize::MAX);
+        self.read_async(length)
     }
 }
 
-impl<B, P, T, O> TrBuffIterPeek<T> for BuffRx<B, P, T, O>
+impl<H, B, T> TrBuffTryRead<T> for RingRx<H, B, T>
 where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
+    H: Borrow<RingBuffer<B, T>>,
+    B: DerefMut<Target = [T]>,
 {
-    type SegmRef<'a> = ReclSliceRef<'a, P, T, O> where Self: 'a;
-    type Segments<'a> = Dual<Self::SegmRef<'a>> where Self: 'a;
-    type PeekAsync<'a> = PeekAsync<'a, B, P, T, O> where Self: 'a;
+    fn try_read<'f>(
+        &'f mut self,
+        demand: &Demand<usize>,
+    ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
+        let length = demand.max().copied().unwrap_or(usize::MAX);
+        match RingRx::try_read(self, length) {
+            Ok(segm) => SomeOf::new_left(segm),
+            Err(err) => SomeOf::new_right(err),
+        }
+    }
+}
+
+impl<H, B, T> TrBuffPeek<T> for RingRx<H, B, T>
+where
+    H: Borrow<RingBuffer<B, T>>,
+    B: DerefMut<Target = [T]>,
+{
+    type SegmPeek<'a> = ReclPeekRef<'a, T> where Self: 'a;
     type Err = RxError<usize>;
 
-    #[inline]
-    fn peek_async(&mut self) -> Self::PeekAsync<'_> {
-        BuffRx::peek_async(self)
-    }
-}
-
-impl<B, P, T, O> TrBuffIterTryPeek<T> for BuffRx<B, P, T, O>
-where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
-{
-    #[inline]
-    fn try_peek(&mut self) -> Result<
-        <Self as TrBuffIterPeek<T>>::Segments<'_>,
-        <Self as TrBuffIterPeek<T>>::Err,
+    fn peek_async<'f>(
+        &'f mut self,
+    ) -> impl abs_cancel::TrMayCancel<
+        'f,
+        MayCancelOutput = SomeOf<Self::SegmPeek<'f>, Self::Err>,
     > {
-        BuffRx::try_peek(self)
+        PeekAsync::new(self)
     }
 }
 
-pub struct ReadAsync<'a, B, P, T, O>
+impl<H, B, T> TrBuffTryPeek<T> for RingRx<H, B, T>
 where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
+    H: Borrow<RingBuffer<B, T>>,
+    B: DerefMut<Target = [T]>,
 {
-    io_ctx_: Pin<&'a mut IoCtx<B, P, T, O>>,
-    length_: usize,
-}
-
-impl<'a, B, P, T, O> ReadAsync<'a, B, P, T, O>
-where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
-{
-    pub(super) const fn new(
-        io_ctx: Pin<&'a mut IoCtx<B, P, T, O>>,
-        length: usize,
-    ) -> Self {
-        ReadAsync {
-            io_ctx_: io_ctx,
-            length_: length,
-        }
-    }
-
-    #[inline(always)]
-    pub fn may_cancel_with<'f, C>(
-        self,
-        cancel: Pin<&'f mut C>,
-    ) -> ReadFuture<'a, 'f, C, B, P, T, O>
-    where
-        C: TrCancellationToken,
-    {
-        ReadFuture::new(self.io_ctx_, self.length_, cancel)
-    }
-}
-
-impl<'a, B, P, T, O> IntoFuture for ReadAsync<'a, B, P, T, O>
-where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
-{
-    type IntoFuture = ReadFuture<'a, 'a, NonCancellableToken, B, P, T, O>;
-    type Output = <Self::IntoFuture as Future>::Output;
-
-    fn into_future(self) -> Self::IntoFuture {
-        let cancel = NonCancellableToken::pinned();
-        ReadFuture::new(self.io_ctx_, self.length_, cancel)
-    }
-}
-
-impl<'a, B, P, T, O> TrMayCancel<'a> for ReadAsync<'a, B, P, T, O>
-where
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
-{
-    type MayCancelOutput =
-        <<Self as IntoFuture>::IntoFuture as Future>::Output;
-
-    #[inline]
-    fn may_cancel_with<'f, C: TrCancellationToken>(
-        self,
-        cancel: Pin<&'f mut C>,
-    ) -> impl IntoFuture<Output = Self::MayCancelOutput>
-    where
-        Self: 'f,
-    {
-        ReadAsync::may_cancel_with(self, cancel)
-    }
-}
-
-#[pin_project]
-pub struct ReadFuture<'ctx, 'tok, C, B, P, T, O>
-where
-    C: TrCancellationToken,
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
-{
-    io_ctx_: Pin<&'ctx mut IoCtx<B, P, T, O>>,
-    length_: usize,
-    cancel_: Pin<&'tok mut C>,
-}
-
-impl<'ctx, 'tok, C, B, P, T, O> ReadFuture<'ctx, 'tok, C, B, P, T, O>
-where
-    C: TrCancellationToken,
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
-{
-    pub(super) const fn new(
-        io_ctx: Pin<&'ctx mut IoCtx<B, P, T, O>>,
-        length: usize,
-        cancel: Pin<&'tok mut C>,
-    ) -> Self {
-        ReadFuture {
-            io_ctx_: io_ctx,
-            length_: length,
-            cancel_: cancel,
-        }
-    }
-}
-
-impl<'ctx, C, B, P, T, O> Future for ReadFuture<'ctx, '_, C, B, P, T, O>
-where
-    C: TrCancellationToken,
-    B: Borrow<RingBuffer<P, T, O>>,
-    P: BorrowMut<[MaybeUninit<T>]>,
-    O: TrCmpxchOrderings,
-{
-    type Output = Result<Dual<ReclSliceRef<'ctx, P, T, O>>, RxError<usize>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let ring_buf: &'ctx RingBuffer<P, T, O> = unsafe {
-            let ptr = this.io_ctx_.as_mut().get_unchecked_mut();
-            NonNull::new_unchecked(ptr).as_ref().buffer()
-        };
-        loop {
-            if let Option::Some(demand) = this.io_ctx_.as_mut().demand_mut() {
-                let try_read = ring_buf.try_read_(*this.length_);
-                let Result::Err(rx_err) = try_read else {
-                    // try_read is ok
-                    #[cfg(test)]
-                    log::trace!("[ReadFuture::poll] enqueued({demand:p}) try_read_ ok");
-                    let _ = ring_buf.state().dequeue_rx(demand);
-                    return Poll::Ready(try_read);
-                };
-                let RxError::Drained(p) = rx_err else {
-                    // try_read is not RxError::Drained
-                    #[cfg(test)]
-                    log::trace!("[ReadFuture::poll] enqueued({demand:p}) try_read_ err: {rx_err:?}");
-                    let _ = ring_buf.state().dequeue_rx(demand);
-                    return Poll::Ready(Result::Err(rx_err));
-                };
-                let fut_cancel = this
-                    .cancel_
-                    .as_mut()
-                    .cancellation()
-                    .into_future();
-                pin_mut!(fut_cancel);
-                if fut_cancel.poll(cx).is_ready() {
-                    #[cfg(test)]
-                    log::trace!("[ReadFuture::poll] enqueued({demand:p}) cancelled");
-                    let _ = ring_buf.state().dequeue_rx(demand);
-                    return Poll::Ready(Result::Err(RxError::Drained(p)));
-                }
-                break Poll::Pending;
-            } else {
-                let try_read = ring_buf.try_read_(*this.length_);
-                let Result::Err(rx_err) = try_read else {
-                    // try_read is ok
-                    return Poll::Ready(try_read);
-                };
-                let RxError::Drained(_) = rx_err else {
-                    // try_read is not RxError::Drained
-                    #[cfg(test)]
-                    log::trace!("[ReadFuture::poll] not queued try_read_ err: {rx_err:?}");
-                    return Poll::Ready(Result::Err(rx_err));
-                };
-                let demand = Demand::new(
-                    *this.length_,
-                    Demand::consumer_check,
-                );
-                let try_init = this
-                    .io_ctx_
-                    .as_mut()
-                    .try_init_demand(demand);
-                let Result::Ok(demand) = try_init else {
-                    unreachable!("[ReadFuture::poll]")
-                };
-                let x = demand.try_init_waker(|| cx.waker().clone());
-                assert!(x.is_ok());
-                let x = ring_buf.state().enqueue_rx(demand);
-                assert!(x);
-                #[cfg(test)]
-                log::trace!("[ReadFuture::poll] enqueued demand({demand:p})");
-            }
+    fn try_peek<'f>(&'f mut self) -> SomeOf<Self::SegmPeek<'f>, Self::Err> {
+        match RingRx::try_peek(self) {
+            Ok(segm) => SomeOf::new_left(segm),
+            Err(err) => SomeOf::new_right(err),
         }
     }
 }
