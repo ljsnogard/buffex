@@ -52,11 +52,24 @@ pub(super) type SharedTx = RingTx<SharedRing, Box<[u8]>>;
 pub(super) type SharedRx = RingRx<SharedRing, Box<[u8]>>;
 
 /// Create a full-duplex-in-time ring (16-byte buffer) with the halves.
+///
+/// 设计思路：`try_split_shared` 要求以"唯一持有者"身份拆分（引用计数 == 1），
+/// 否则已存在的其它 clone 可能被再次拆分，产生多对生产者/消费者，破坏 SPSC。
+/// 因此这里把新建的 `Arc`（计数为 1）直接移入拆分；拆分成功后，调用方（例如
+/// 运行时侧驱动场景）仍需要一个 `Arc`，从写半区的共享句柄 clone 得到——此时
+/// 计数 >= 2，任何第二次拆分都会被拒绝，SPSC 依然成立。
 pub(super) fn make_ring() -> (SharedRing, SharedTx, SharedRx) {
     let ring = Arc::new(
         RingBuffer::<Box<[u8]>>::try_new(vec![0u8; RING_CAP].into_boxed_slice()).unwrap(),
     );
-    let (tx, rx) = RingBuffer::try_split_shared(ring.clone());
+    let (tx, rx) =
+        RingBuffer::try_split_shared(
+            ring,
+            std::sync::Arc::strong_count,
+            std::sync::Arc::weak_count,
+        )
+        .expect("新建 ring 的引用计数为 1，拆分必须成功");
+    let ring = tx.shared().clone();
     (ring, tx, rx)
 }
 

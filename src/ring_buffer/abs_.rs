@@ -1,4 +1,12 @@
+use core::ops::DerefMut;
+
 use abs_buff::{TrBuffTryPeek, TrBuffTryRead, TrBuffTryWrite};
+
+use super::{
+    rx_::RingRx,
+    state_::RingBuffer,
+    tx_::RingTx,
+};
 
 /// A full-duplex ring buffer that serves a pair of producer and consumer,
 /// offering a conceptually infinite buffer by cycling the owned heap buffers
@@ -25,4 +33,27 @@ pub trait TrRingBuffer<T = u8> {
     fn try_split_io(
         &mut self,
     ) -> Option<(Self::Tx<'_>, Self::Rx<'_>)>;
+}
+
+impl<B, T> TrRingBuffer<T> for RingBuffer<B, T>
+where
+    B: DerefMut<Target = [T]>,
+{
+    type Tx<'a> = RingTx<&'a Self, B, T> where Self: 'a;
+    type Rx<'a> = RingRx<&'a Self, B, T> where Self: 'a;
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        RingBuffer::capacity(self)
+    }
+
+    #[inline]
+    fn data_size(&self) -> usize {
+        RingBuffer::data_size(self)
+    }
+
+    fn try_split_io(&mut self) -> Option<(Self::Tx<'_>, Self::Rx<'_>)> {
+        let ring: &Self = self;
+        Option::Some((RingTx::new(ring), RingRx::new(ring)))
+    }
 }

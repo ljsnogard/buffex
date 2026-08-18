@@ -32,14 +32,20 @@ use super::{
 // Write
 // ---------------------------------------------------------------------------
 
-/// The write end's async borrow future (see [`RingTx::write_async`]).
+/// The write end's async borrow future (see [`RingTx::write_at_most_async`]).
+///
+/// Carries the `[min_len, max_len]` interval derived from the
+/// [`Demand`](abs_buff::Demand): the future stays pending until at least
+/// `min_len` free units are available (honouring `Demand::at_least`), and
+/// then borrows at most `max_len` units.
 pub struct WriteAsync<'a, H, B, T>
 where
     H: Borrow<RingBuffer<B, T>>,
     B: DerefMut<Target = [T]>,
 {
     tx: &'a mut RingTx<H, B, T>,
-    length: usize,
+    min_len: usize,
+    max_len: usize,
 }
 
 impl<'a, H, B, T> WriteAsync<'a, H, B, T>
@@ -47,8 +53,12 @@ where
     H: Borrow<RingBuffer<B, T>>,
     B: DerefMut<Target = [T]>,
 {
-    pub(super) fn new(tx: &'a mut RingTx<H, B, T>, length: usize) -> Self {
-        WriteAsync { tx, length }
+    pub(super) fn new(tx: &'a mut RingTx<H, B, T>, min_len: usize, max_len: usize) -> Self {
+        WriteAsync {
+            tx,
+            min_len,
+            max_len,
+        }
     }
 }
 
@@ -61,7 +71,12 @@ where
     type Output = SomeOf<ReclSliceMut<'a, T>, TxError<usize>>;
 
     fn into_future(self) -> Self::IntoFuture {
-        WriteFuture::new(self.tx, self.length, NonCancellableToken::shared_mut())
+        WriteFuture::new(
+            self.tx,
+            self.min_len,
+            self.max_len,
+            NonCancellableToken::shared_mut(),
+        )
     }
 }
 
@@ -81,7 +96,7 @@ where
         'f: 'a,
         C: TrCancellationToken + Clone,
     {
-        WriteFuture::new(self.tx, self.length, cancel)
+        WriteFuture::new(self.tx, self.min_len, self.max_len, cancel)
     }
 }
 
@@ -93,7 +108,10 @@ where
 {
     _pin: PhantomPinned,
     tx: &'ctx mut RingTx<H, B, T>,
-    length: usize,
+    /// Demand 的下限（无下限时为 0）：可写空间不足时不返回段。
+    min_len: usize,
+    /// Demand 的上限（无上限时为 `usize::MAX`）：最多借出这么多。
+    max_len: usize,
     cancel: &'tok mut C,
     park: Park<B, T>,
 }
@@ -103,13 +121,19 @@ where
     H: Borrow<RingBuffer<B, T>>,
     B: DerefMut<Target = [T]>,
 {
-    fn new(tx: &'ctx mut RingTx<H, B, T>, length: usize, cancel: &'tok mut C) -> Self {
+    fn new(
+        tx: &'ctx mut RingTx<H, B, T>,
+        min_len: usize,
+        max_len: usize,
+        cancel: &'tok mut C,
+    ) -> Self {
         WriteFuture {
             _pin: PhantomPinned,
             tx,
-            length,
+            min_len,
+            max_len,
             cancel,
-            park: Park::new(ParkSide::TxUser, super::state_::check_tx_writable),
+            park: Park::new(ParkSide::TxUser, super::state_::check_tx_writable_at_least),
         }
     }
 }
@@ -127,8 +151,20 @@ where
         let ring: &'ctx RingBuffer<B, T> =
             unsafe { &*(this.tx.ring() as *const RingBuffer<B, T>) };
         loop {
-            match ring.try_write_at(this.length) {
+            match ring.try_write_at(this.max_len) {
                 Ok((start, take)) => {
+                    // 尊重 demand 下限：可写空间不足 min_len 时不返回不满足要求的段，
+                    // 继续等待（等读者腾出空间后由 waker 重新唤醒检查）；
+                    if take < this.min_len {
+                        if this.cancel.is_cancelled() {
+                            this.park.deregister(ring);
+                            return Poll::Ready(SomeOf::new_right(TxError::Stuffed(0)));
+                        }
+                        if this.park.poll(cx, ring, this.min_len).is_pending() {
+                            return Poll::Pending;
+                        }
+                        continue;
+                    }
                     this.park.deregister(ring);
                     return Poll::Ready(SomeOf::new_left(ring.write_segm(start, take)));
                 }
@@ -137,7 +173,7 @@ where
                         this.park.deregister(ring);
                         return Poll::Ready(SomeOf::new_right(TxError::Stuffed(0)));
                     }
-                    if this.park.poll(cx, ring, this.length).is_pending() {
+                    if this.park.poll(cx, ring, this.min_len).is_pending() {
                         return Poll::Pending;
                     }
                 }
@@ -166,14 +202,22 @@ where
 // Read
 // ---------------------------------------------------------------------------
 
-/// The read end's async borrow future (see [`RingRx::read_async`]).
+/// The read end's async borrow future (see [`RingRx::read_at_most_async`]).
+///
+/// Carries the `[min_len, max_len]` interval derived from the
+/// [`Demand`](abs_buff::Demand): the future stays pending until at least
+/// `min_len` readable units are available (honouring `Demand::at_least`),
+/// and then borrows at most `max_len` units. If the rx end is closed (EOF),
+/// the future returns whatever data is available even if it is below
+/// `min_len` — no more data will ever arrive.
 pub struct ReadAsync<'a, H, B, T>
 where
     H: Borrow<RingBuffer<B, T>>,
     B: DerefMut<Target = [T]>,
 {
     rx: &'a mut RingRx<H, B, T>,
-    length: usize,
+    min_len: usize,
+    max_len: usize,
 }
 
 impl<'a, H, B, T> ReadAsync<'a, H, B, T>
@@ -181,8 +225,12 @@ where
     H: Borrow<RingBuffer<B, T>>,
     B: DerefMut<Target = [T]>,
 {
-    pub(super) fn new(rx: &'a mut RingRx<H, B, T>, length: usize) -> Self {
-        ReadAsync { rx, length }
+    pub(super) fn new(rx: &'a mut RingRx<H, B, T>, min_len: usize, max_len: usize) -> Self {
+        ReadAsync {
+            rx,
+            min_len,
+            max_len,
+        }
     }
 }
 
@@ -195,7 +243,12 @@ where
     type Output = SomeOf<ReclSliceRef<'a, T>, RxError<usize>>;
 
     fn into_future(self) -> Self::IntoFuture {
-        ReadFuture::new(self.rx, self.length, NonCancellableToken::shared_mut())
+        ReadFuture::new(
+            self.rx,
+            self.min_len,
+            self.max_len,
+            NonCancellableToken::shared_mut(),
+        )
     }
 }
 
@@ -215,7 +268,7 @@ where
         'f: 'a,
         C: TrCancellationToken + Clone,
     {
-        ReadFuture::new(self.rx, self.length, cancel)
+        ReadFuture::new(self.rx, self.min_len, self.max_len, cancel)
     }
 }
 
@@ -227,7 +280,10 @@ where
 {
     _pin: PhantomPinned,
     rx: &'ctx mut RingRx<H, B, T>,
-    length: usize,
+    /// Demand 的下限（无下限时为 0）：可读数据不足时不返回段。
+    min_len: usize,
+    /// Demand 的上限（无上限时为 `usize::MAX`）：最多借出这么多。
+    max_len: usize,
     cancel: &'tok mut C,
     park: Park<B, T>,
 }
@@ -237,13 +293,19 @@ where
     H: Borrow<RingBuffer<B, T>>,
     B: DerefMut<Target = [T]>,
 {
-    fn new(rx: &'ctx mut RingRx<H, B, T>, length: usize, cancel: &'tok mut C) -> Self {
+    fn new(
+        rx: &'ctx mut RingRx<H, B, T>,
+        min_len: usize,
+        max_len: usize,
+        cancel: &'tok mut C,
+    ) -> Self {
         ReadFuture {
             _pin: PhantomPinned,
             rx,
-            length,
+            min_len,
+            max_len,
             cancel,
-            park: Park::new(ParkSide::RxUser, super::state_::check_rx_readable),
+            park: Park::new(ParkSide::RxUser, super::state_::check_rx_readable_at_least),
         }
     }
 }
@@ -261,8 +323,25 @@ where
         let ring: &'ctx RingBuffer<B, T> =
             unsafe { &*(this.rx.ring() as *const RingBuffer<B, T>) };
         loop {
-            match ring.try_read_at(this.length) {
+            match ring.try_read_at(this.max_len) {
                 Ok((start, take)) => {
+                    if take < this.min_len {
+                        // 数据不足 demand 下限：
+                        // - 若 rx 已关闭（EOF），不会再有多余数据，返回现有部分；
+                        // - 否则继续等待（等写者补充数据后由 waker 重新唤醒检查）。
+                        if ring.is_rx_closed() {
+                            this.park.deregister(ring);
+                            return Poll::Ready(SomeOf::new_left(ring.read_segm(start, take)));
+                        }
+                        if this.cancel.is_cancelled() {
+                            this.park.deregister(ring);
+                            return Poll::Ready(SomeOf::new_right(RxError::Drained(0)));
+                        }
+                        if this.park.poll(cx, ring, this.min_len).is_pending() {
+                            return Poll::Pending;
+                        }
+                        continue;
+                    }
                     this.park.deregister(ring);
                     return Poll::Ready(SomeOf::new_left(ring.read_segm(start, take)));
                 }
@@ -271,7 +350,7 @@ where
                         this.park.deregister(ring);
                         return Poll::Ready(SomeOf::new_right(RxError::Drained(0)));
                     }
-                    if this.park.poll(cx, ring, this.length).is_pending() {
+                    if this.park.poll(cx, ring, this.min_len).is_pending() {
                         return Poll::Pending;
                     }
                 }

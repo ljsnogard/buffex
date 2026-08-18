@@ -80,17 +80,22 @@ impl BufferedUnixStream {
             RingBuffer::<Box<[u8]>>::try_new(vec![0u8; cap].into_boxed_slice())
                 .expect("read ring"),
         );
-        let (tx, _) = RingBuffer::try_split_shared(write_ring.clone());
-        let (_, rx) = RingBuffer::try_split_shared(read_ring.clone());
+        let (tx, _) = RingBuffer::try_split_shared(write_ring, Arc::strong_count, Arc::weak_count)
+            .expect("write ring must be sole-owned at split");
+        let (_, rx) = RingBuffer::try_split_shared(read_ring, Arc::strong_count, Arc::weak_count)
+            .expect("read ring must be sole-owned at split");
+        // 拆分要求调用方持有唯一引用（引用计数 == 1）：拆分内部会把 Arc clone 进
+        // 两个半区，若调用前已有其它 clone，就可能拆出第二对生产者/消费者，
+        // 破坏 SPSC。两个 ring 都是这里新建的，计数为 1，拆分必然成功。
+        // 拆分之后，驱动任务所需的 Arc 从半区 clone 得到（此时计数 >= 2，
+        // 不会再允许第二次拆分，SPSC 依然成立）。
+        let flush_ring = tx.shared().clone();
+        let fill_ring = rx.shared().clone();
 
         let error = Arc::new(Mutex::new(None::<io::Error>));
 
-        let flush = spawn(flush_task(
-            stream.clone(),
-            write_ring,
-            error.clone(),
-        ));
-        let fill = spawn(fill_task(stream.clone(), read_ring, error.clone()));
+        let flush = spawn(flush_task(stream.clone(), flush_ring, error.clone()));
+        let fill = spawn(fill_task(stream.clone(), fill_ring, error.clone()));
 
         BufferedUnixStream {
             tx,
@@ -166,8 +171,8 @@ impl TrBuffWrite<u8> for BufferedUnixStream {
         Self: 'a;
     type Err = TxError<usize>;
 
-    fn is_blocked(&self) -> bool {
-        self.tx.is_blocked()
+    fn is_blocked_closing(&self) -> bool {
+        self.tx.is_blocked_closing()
     }
 
     fn write_async<'f>(
@@ -196,8 +201,8 @@ impl TrBuffRead<u8> for BufferedUnixStream {
         Self: 'a;
     type Err = RxError<usize>;
 
-    fn is_drained(&self) -> bool {
-        self.rx.is_drained()
+    fn is_drained_closing(&self) -> bool {
+        self.rx.is_drained_closing()
     }
 
     fn read_async<'f>(

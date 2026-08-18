@@ -48,6 +48,8 @@
 //! dependency.
 
 use core::{
+    borrow::Borrow,
+    fmt,
     mem::MaybeUninit,
     ops::DerefMut,
     ptr,
@@ -55,9 +57,15 @@ use core::{
     task::{Context, Poll, Waker},
 };
 
-use abs_buff::buffer::{SegmMut, SegmRef};
-
-use super::reclaim_::{NoReclaim, ReaderReclaim, ReclPeekRef, ReclSliceMut, ReclSliceRef, WriterReclaim};
+use super::{
+    futures_::{WaitFlushed, WaitRxIdle},
+    reclaim_::{
+        ReadReclaim, ReaderReclaim, ReclPeekRef, ReclSliceMut, ReclSliceRef, SegmSlicesMut,
+        SegmSlicesRef, WriterReclaim,
+    },
+    rx_::RingRx,
+    tx_::RingTx,
+};
 
 /// Number of high bits reserved for the state flags.
 const FLAG_BITS: u32 = 4;
@@ -290,14 +298,14 @@ impl RingCore {
     }
 
     #[inline]
-    fn load_state(&self) -> usize {
+    fn load_state_(&self) -> usize {
         self.state.load(Ordering::Acquire)
     }
 
     /// Spin compare-exchange loop: replace the state word with `f(state)`,
     /// retrying on contention (the `atomic_sync` way of updating packed
     /// flags).
-    fn update_state(&self, f: impl Fn(usize) -> usize) {
+    fn update_state_(&self, f: impl Fn(usize) -> usize) {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
             match self.state.compare_exchange_weak(
@@ -312,8 +320,8 @@ impl RingCore {
         }
     }
 
-    fn set_flag(&self, flag: usize) {
-        self.update_state(|s| s | flag);
+    fn set_flag_(&self, flag: usize) {
+        self.update_state_(|s| s | flag);
     }
 
     /// The ring is shared by both the user pipe ends and the runtime drivers,
@@ -329,7 +337,7 @@ impl RingCore {
     /// Atomically advance the writer position by `amount` (mod `cap`),
     /// preserving the flags.
     pub(super) fn advance_write(&self, cap: usize, amount: usize) {
-        self.update_state(|s| {
+        self.update_state_(|s| {
             let (rp, wp) = unpack(s);
             debug_assert!(rp < cap && wp < cap);
             pack(rp, (wp + amount) % cap) | (s & FLAG_MASK)
@@ -340,7 +348,7 @@ impl RingCore {
     /// Atomically advance the reader position by `amount` (mod `cap`),
     /// preserving the flags.
     pub(super) fn advance_read(&self, cap: usize, amount: usize) {
-        self.update_state(|s| {
+        self.update_state_(|s| {
             let (rp, wp) = unpack(s);
             debug_assert!(rp < cap && wp < cap);
             pack((rp + amount) % cap, wp) | (s & FLAG_MASK)
@@ -349,12 +357,12 @@ impl RingCore {
     }
 
     fn close_tx(&self) {
-        self.set_flag(TX_CLOSED);
+        self.set_flag_(TX_CLOSED);
         self.signal_all();
     }
 
     fn close_rx(&self) {
-        self.set_flag(RX_CLOSED);
+        self.set_flag_(RX_CLOSED);
         self.signal_all();
     }
 
@@ -400,6 +408,22 @@ impl<B, T> RingBuffer<B, T>
 where
     B: DerefMut<Target = [T]>,
 {
+    // ==================================================================
+    // All `RingBuffer` methods live in this single impl block, grouped by
+    // role so the whole API can be reviewed at once. Visibility tiers:
+    //
+    // * `pub`         — the minimal safe API surface for end users;
+    // * `pub(crate)`  — state-machine primitives used by the halves, the
+    //                   async adapters and the kernel handoff; kept out of
+    //                   the public API because misusing them (e.g. advancing
+    //                   positions out of bounds) would corrupt the ring;
+    // * `pub(super)`  — helpers shared within `ring_buffer` only.
+    // ==================================================================
+
+    // ------------------------------------------------------------------
+    // construction & sizing (public)
+    // ------------------------------------------------------------------
+
     /// Create a ring buffer from one owned heap buffer.
     ///
     /// Returns `Err(len)` if the buffer is too large (longer than
@@ -407,91 +431,98 @@ where
     pub fn try_new(buffer: B) -> Result<Self, usize> {
         let cap = buffer.len();
         if cap > MAX_CAPACITY {
-            return Err(cap);
+            return Result::Err(cap);
         }
-        Ok(RingBuffer {
+        Result::Ok(RingBuffer {
             buffer,
             core: RingCore::new(),
         })
     }
 
-    /// The buffer length (the ring's capacity).
-    #[inline]
-    fn cap(&self) -> usize {
-        self.buffer.len()
-    }
-
     /// The buffer length.
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.cap()
+        self.buffer.len()
     }
 
     /// A snapshot of the number of buffered items.
     #[inline]
     pub fn data_size(&self) -> usize {
-        let (rp, wp) = unpack(self.core.load_state());
+        let (rp, wp) = unpack(self.core.load_state_());
         self.data_(rp, wp)
     }
 
     /// The number of free slots.
     #[inline]
     pub fn free_size(&self) -> usize {
-        let (rp, wp) = unpack(self.core.load_state());
+        let (rp, wp) = unpack(self.core.load_state_());
         self.free_(rp, wp)
     }
 
-    #[inline]
-    fn data_(&self, rp: usize, wp: usize) -> usize {
-        (wp + self.cap() - rp) % self.cap()
-    }
-
-    /// Free slots; the single-gap scheme always keeps one slot unused.
-    #[inline]
-    fn free_(&self, rp: usize, wp: usize) -> usize {
-        self.cap() - 1 - self.data_(rp, wp)
-    }
-
-    /// The reader position.
-    pub fn reader_pos(&self) -> usize {
-        unpack(self.core.load_state()).0
-    }
-
-    /// The writer position.
-    pub fn writer_pos(&self) -> usize {
-        unpack(self.core.load_state()).1
-    }
+    // ------------------------------------------------------------------
+    // state queries (public: read-only, cannot corrupt the ring)
+    // ------------------------------------------------------------------
 
     pub fn is_tx_closed(&self) -> bool {
-        has_flag(self.core.load_state(), TX_CLOSED)
+        has_flag(self.core.load_state_(), TX_CLOSED)
     }
 
     pub fn is_rx_closed(&self) -> bool {
-        has_flag(self.core.load_state(), RX_CLOSED)
+        has_flag(self.core.load_state_(), RX_CLOSED)
     }
 
+    // Raw position snapshots. Crate-internal: they expose the packed-layout
+    // detail and are only used by tests / debugging; the public state
+    // queries are `data_size` / `free_size` / `is_*_closed`.
+    #[allow(dead_code)] // kept as the counterpart of `writer_pos` for debugging
+    pub(crate) fn reader_pos(&self) -> usize {
+        unpack(self.core.load_state_()).0
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // used by the test suite
+    pub(crate) fn writer_pos(&self) -> usize {
+        unpack(self.core.load_state_()).1
+    }
+
+    // ------------------------------------------------------------------
+    // position advancement (crate-internal)
+    //
+    // These mutate the packed positions without bounds checking: the caller
+    // (the segments' reclaim, the async adapters) must pass amounts no
+    // larger than the free / readable region. Public exposure would let a
+    // caller forge readable data (`advance_write(n)` with `n` larger than
+    // the free space), so they are crate-internal only.
+    // ------------------------------------------------------------------
+
     /// Atomically advance the writer position by `amount` (mod `cap`).
-    pub fn advance_write(&self, amount: usize) {
-        self.core.advance_write(self.cap(), amount);
+    pub(crate) fn advance_write(&self, amount: usize) {
+        self.core.advance_write(self.capacity(), amount);
     }
 
     /// Atomically advance the reader position by `amount` (mod `cap`).
-    pub fn advance_read(&self, amount: usize) {
-        self.core.advance_read(self.cap(), amount);
+    pub(crate) fn advance_read(&self, amount: usize) {
+        self.core.advance_read(self.capacity(), amount);
     }
 
     // ------------------------------------------------------------------
-    // user side: write (contiguous borrow)
+    // user side: write (borrow of the whole writable region)
+    //
+    // The returned `(start, take)` may describe a region that wraps around
+    // the buffer end; the two-piece segment types ([`ReclSliceMut`]) express
+    // it as one logical segment.
     // ------------------------------------------------------------------
 
-    /// Borrow up to `length` contiguous writable items starting at `wp`.
+    /// Borrow up to `length` writable items starting at `wp`.
+    ///
+    /// The region may wrap around the buffer end; the caller must build a
+    /// two-piece segment via [`RingBuffer::write_segm`].
     ///
     /// * `TxError::Stuffed` — the ring is full (or the writable region is
     ///   reserved by the runtime for a kernel read).
     /// * `TxError::Closing` — the tx end is closed.
-    pub fn try_write_at(&self, length: usize) -> Result<(usize, usize), super::TxError<usize>> {
+    pub(crate) fn try_write_at(&self, length: usize) -> Result<(usize, usize), super::TxError<usize>> {
         use super::TxError;
-        let state = self.core.load_state();
+        let state = self.core.load_state_();
         let (rp, wp) = unpack(state);
         let free = self.free_(rp, wp);
         if free == 0 || has_flag(state, RECV_IN_FLIGHT) {
@@ -500,19 +531,23 @@ where
             }
             return Err(TxError::Stuffed(wp));
         }
-        let take = core::cmp::min(length, core::cmp::min(free, self.cap() - wp));
+        // 取整个可写区域（最多 `length`），跨末端环绕时由两段式写段表达；
+        let take = core::cmp::min(length, free);
         debug_assert!(take > 0);
         Ok((wp, take))
     }
 
     // ------------------------------------------------------------------
-    // user side: read (contiguous borrow)
+    // user side: read (borrow of the whole readable region)
     // ------------------------------------------------------------------
 
-    /// Borrow up to `length` contiguous readable items starting at `rp`.
-    pub fn try_read_at(&self, length: usize) -> Result<(usize, usize), super::RxError<usize>> {
+    /// Borrow up to `length` readable items starting at `rp`.
+    ///
+    /// The region may wrap around the buffer end; the caller must build a
+    /// two-piece segment via [`RingBuffer::read_segm`].
+    pub(crate) fn try_read_at(&self, length: usize) -> Result<(usize, usize), super::RxError<usize>> {
         use super::RxError;
-        let state = self.core.load_state();
+        let state = self.core.load_state_();
         let (rp, wp) = unpack(state);
         let data = self.data_(rp, wp);
         if data == 0 || has_flag(state, SEND_IN_FLIGHT) {
@@ -521,15 +556,16 @@ where
             }
             return Err(RxError::Drained(rp));
         }
-        let take = core::cmp::min(length, core::cmp::min(data, self.cap() - rp));
+        // 取整个可读区域（最多 `length`）；
+        let take = core::cmp::min(length, data);
         debug_assert!(take > 0);
         Ok((rp, take))
     }
 
-    /// Borrow all contiguous readable items starting at `rp` (for peeking).
-    pub fn try_peek_at(&self) -> Result<(usize, usize), super::RxError<usize>> {
+    /// Borrow the whole readable region starting at `rp` (for peeking).
+    pub(crate) fn try_peek_at(&self) -> Result<(usize, usize), super::RxError<usize>> {
         use super::RxError;
-        let state = self.core.load_state();
+        let state = self.core.load_state_();
         let (rp, wp) = unpack(state);
         let data = self.data_(rp, wp);
         if data == 0 || has_flag(state, SEND_IN_FLIGHT) {
@@ -538,13 +574,22 @@ where
             }
             return Err(RxError::Drained(rp));
         }
-        let take = core::cmp::min(data, self.cap() - rp);
+        // 取整个可读区域；
+        let take = data;
         debug_assert!(take > 0);
         Ok((rp, take))
     }
 
     // ------------------------------------------------------------------
     // runtime side: kernel submission (scatter / gather)
+    //
+    // Crate-internal (used by `crate::unix_stream::BufferedUnixStream`).
+    // These hand out `&'static` slices over the ring's own memory: the
+    // lifetime is not bound to the ring, so the caller must return the
+    // reservation (`put_back_*`) before the last reference to the ring is
+    // dropped, and must not let a live reservation overlap a user segment.
+    // They are kept out of the public API until this ownership is reworked
+    // into a lifetime-bound reservation guard.
     // ------------------------------------------------------------------
 
     /// Take the readable region as an iovec pair for a kernel `writev`.
@@ -558,8 +603,8 @@ where
     ///
     /// With `T = u8` the slices can be submitted to compio directly, e.g.
     /// `socket.write_vectored((a, b)).await` — a single syscall.
-    pub fn take_send_iovecs(&self) -> Option<(&'static [T], &'static [T])> {
-        let mut state = self.core.load_state();
+    pub(crate) fn take_send_iovecs(&self) -> Option<(&'static [T], &'static [T])> {
+        let mut state = self.core.load_state_();
         loop {
             let (rp, wp) = unpack(state);
             let data = self.data_(rp, wp);
@@ -583,9 +628,9 @@ where
 
     /// Return the reserved region after the kernel `writev` completed,
     /// advancing the reader position by `written`.
-    pub fn put_back_send(&self, written: usize) {
-        let cap = self.cap();
-        self.core.update_state(|s| {
+    pub(crate) fn put_back_send(&self, written: usize) {
+        let cap = self.capacity();
+        self.core.update_state_(|s| {
             let (rp, wp) = unpack(s);
             debug_assert!(has_flag(s, SEND_IN_FLIGHT));
             let nr = (rp + written) % cap;
@@ -602,8 +647,8 @@ where
     /// (`TxError::Stuffed`). After the kernel completes, call
     /// [`RingBuffer::put_back_recv`] with the number of bytes actually read,
     /// which advances the writer position.
-    pub fn take_recv_iovecs(&self) -> Option<(&'static mut [T], &'static mut [T])> {
-        let mut state = self.core.load_state();
+    pub(crate) fn take_recv_iovecs(&self) -> Option<(&'static mut [T], &'static mut [T])> {
+        let mut state = self.core.load_state_();
         loop {
             let (rp, wp) = unpack(state);
             let free = self.free_(rp, wp);
@@ -627,9 +672,9 @@ where
 
     /// Return the reserved region after the kernel `readv` completed,
     /// advancing the writer position by `received`.
-    pub fn put_back_recv(&self, received: usize) {
-        let cap = self.cap();
-        self.core.update_state(|s| {
+    pub(crate) fn put_back_recv(&self, received: usize) {
+        let cap = self.capacity();
+        self.core.update_state_(|s| {
             let (rp, wp) = unpack(s);
             debug_assert!(has_flag(s, RECV_IN_FLIGHT));
             let nw = (wp + received) % cap;
@@ -639,10 +684,21 @@ where
         self.core.signal_all();
     }
 
+    #[inline]
+    fn data_(&self, rp: usize, wp: usize) -> usize {
+        (wp + self.capacity() - rp) % self.capacity()
+    }
+
+    /// Free slots; the single-gap scheme always keeps one slot unused.
+    #[inline]
+    fn free_(&self, rp: usize, wp: usize) -> usize {
+        self.capacity() - 1 - self.data_(rp, wp)
+    }
+
     /// The readable region `[rp, rp+len)` as up to two slices.
     fn readable_slices_(&self, rp: usize, len: usize) -> (&'static [T], &'static [T]) {
         let base = self.buffer.as_ptr();
-        let first = core::cmp::min(len, self.cap() - rp);
+        let first = core::cmp::min(len, self.capacity() - rp);
         let a = unsafe { core::slice::from_raw_parts(base.add(rp), first) };
         let b = if first < len {
             unsafe { core::slice::from_raw_parts(base, len - first) }
@@ -655,7 +711,7 @@ where
     /// The writable region `[wp, wp+len)` as up to two slices.
     fn writable_slices_(&self, wp: usize, len: usize) -> (&'static mut [T], &'static mut [T]) {
         let base = self.buffer.as_ptr().cast_mut();
-        let first = core::cmp::min(len, self.cap() - wp);
+        let first = core::cmp::min(len, self.capacity() - wp);
         let a = unsafe { core::slice::from_raw_parts_mut(base.add(wp), first) };
         let b = if first < len {
             unsafe { core::slice::from_raw_parts_mut(base, len - first) }
@@ -668,21 +724,23 @@ where
     /// A read view over the whole buffer (used by the framework adapters).
     #[inline]
     pub(super) fn buffer_ref(&self) -> &[T] {
-        unsafe { core::slice::from_raw_parts(self.buffer.as_ptr(), self.cap()) }
+        unsafe { core::slice::from_raw_parts(self.buffer.as_ptr(), self.capacity()) }
     }
 
     /// A write view over the whole buffer (used by the framework adapters).
     ///
-    /// The ring is shared (`&self`), but the write region is exclusively
-    /// owned by the single producer while the positions say so; the view is
-    /// handed out through the raw buffer pointer (interior-mutability style).
+    /// The ring is shared (`&self`) but the view is handed out through the
+    /// raw buffer pointer (interior-mutability style). This is only sound
+    /// while the caller respects the SPSC ownership protocol: the writable
+    /// region must not overlap a live write segment, a runtime recv
+    /// reservation, or the reader's region.
     #[inline]
     #[allow(clippy::mut_from_ref)]
     pub(super) fn buffer_uninit(&self) -> &mut [MaybeUninit<T>] {
         unsafe {
             core::slice::from_raw_parts_mut(
                 self.buffer.as_ptr().cast_mut().cast::<MaybeUninit<T>>(),
-                self.cap(),
+                self.capacity(),
             )
         }
     }
@@ -694,68 +752,249 @@ where
 
     /// Buffered data is available for a kernel `writev`.
     pub(super) fn has_tx_data(&self) -> bool {
-        let state = self.core.load_state();
+        let state = self.core.load_state_();
         let (rp, wp) = unpack(state);
         self.data_(rp, wp) > 0 && !has_flag(state, SEND_IN_FLIGHT)
     }
 
     /// Free space is available for a kernel `readv`.
     pub(super) fn has_recv_space(&self) -> bool {
-        let state = self.core.load_state();
+        let state = self.core.load_state_();
         let (rp, wp) = unpack(state);
         self.free_(rp, wp) > 0 && !has_flag(state, RECV_IN_FLIGHT)
     }
 
-    /// Borrow a write segment over `[start, start + take)`.
-    ///
-    /// The segment's buffer is the ring's own memory. When it drops it
-    /// commits the amount actually consumed to the ring (the `abs_buff`
-    /// per-piece reclaim granularity).
-    pub(super) fn write_segm<'a>(&'a self, start: usize, take: usize) -> ReclSliceMut<'a, T> {
-        let whole: &'a mut [MaybeUninit<T>] = self.buffer_uninit();
-        let slice: &'a mut [MaybeUninit<T>] = &mut whole[start..start + take];
-        SegmMut::new(slice, WriterReclaim::new(&self.core, self.cap()))
+    /// The writable space is at least `amount` units (and not reserved by the
+    /// runtime for a kernel read). Used to honour the lower bound of a
+    /// [`Demand`](abs_buff::Demand).
+    pub(super) fn has_free_at_least(&self, amount: usize) -> bool {
+        let state = self.core.load_state_();
+        let (rp, wp) = unpack(state);
+        self.free_(rp, wp) >= amount && !has_flag(state, RECV_IN_FLIGHT)
     }
 
-    /// Borrow a read segment over `[start, start + take)`.
+    /// The readable data is at least `amount` units (and not reserved by the
+    /// runtime for a kernel write). Used to honour the lower bound of a
+    /// [`Demand`](abs_buff::Demand).
+    pub(super) fn has_data_at_least(&self, amount: usize) -> bool {
+        let state = self.core.load_state_();
+        let (rp, wp) = unpack(state);
+        self.data_(rp, wp) >= amount && !has_flag(state, SEND_IN_FLIGHT)
+    }
+
+    /// Borrow a write segment over the region `[start, start + take)`, which
+    /// may wrap around the buffer end (then it is a two-piece segment, see
+    /// [`reclaim_`](self)).
+    ///
+    /// The segment's buffer is the ring's own memory. When it drops it
+    /// commits the amount actually consumed to the ring (the per-piece
+    /// reclaim granularity).
+    pub(super) fn write_segm<'a>(&'a self, start: usize, take: usize) -> ReclSliceMut<'a, T> {
+        let whole: &'a mut [MaybeUninit<T>] = self.buffer_uninit();
+        let cap = self.capacity();
+        let first = core::cmp::min(take, cap - start);
+        let pieces = if first < take {
+            // 跨末端环绕：两段物理空间 [start, cap) + [0, take - first)；
+            // 先用 split_at_mut 切出 [0, start)，再从中取环绕段。
+            let (head, tail) = whole.split_at_mut(start);
+            let b = &mut head[..take - first];
+            SegmSlicesMut::Two(tail, b)
+        } else {
+            SegmSlicesMut::One(&mut whole[start..start + take])
+        };
+        ReclSliceMut::new(pieces, WriterReclaim::new(&self.core, cap))
+    }
+
+    /// Borrow a read segment over the region `[start, start + take)`, which
+    /// may wrap around the buffer end (then it is a two-piece segment).
     ///
     /// The segment's buffer is the ring's own memory. When it drops it
     /// commits the amount actually consumed to the ring.
     ///
     /// # Safety
     ///
-    /// The returned `SegmRef` wraps `&'a mut [T]` over the readable region.
-    /// This is sound as long as the caller never overlaps a live segment
-    /// with a runtime reservation ([`RingBuffer::take_send_iovecs`]) or with
-    /// another reader, which the SPSC contract of the ring rules out.
+    /// The returned segment wraps `&'a mut [T]` over the readable region.
+    /// This is **not** enforced by the ring: the caller must ensure the
+    /// region is not concurrently touched by a runtime reservation
+    /// (`RingBuffer::take_send_iovecs`) or by another reader / writer while
+    /// the segment is alive, and must not overlap two live segments. The SPSC
+    /// contract of the ring is meant to rule this out, but it is a caller
+    /// obligation, not a type-level guarantee.
     pub(super) fn read_segm<'a>(&'a self, start: usize, take: usize) -> ReclSliceRef<'a, T> {
-        // SAFETY: the readable region `[start, start + take)` is exclusively
-        // owned by the reader while the returned segment is alive (SPSC
-        // single consumer; the runtime's send reservation blocks concurrent
-        // kernel reads).
+        // SAFETY: the caller obtained `start`/`take` from `try_read_at`, so
+        // the region is within the buffer; the aliasing obligation is
+        // documented above.
         let base = self.buffer.as_ptr().cast_mut();
-        let slice: &'a mut [T] = unsafe { core::slice::from_raw_parts_mut(base.add(start), take) };
-        SegmRef::new(slice, ReaderReclaim::new(&self.core, self.cap()))
+        let cap = self.capacity();
+        let first = core::cmp::min(take, cap - start);
+        let pieces = if first < take {
+            let a = unsafe { core::slice::from_raw_parts_mut(base.add(start), first) };
+            let b = unsafe { core::slice::from_raw_parts_mut(base, take - first) };
+            SegmSlicesRef::Two(a, b)
+        } else {
+            let a = unsafe { core::slice::from_raw_parts_mut(base.add(start), take) };
+            SegmSlicesRef::One(a)
+        };
+        ReclSliceRef::new(
+            pieces,
+            ReadReclaim::Consume(ReaderReclaim::new(&self.core, cap)),
+        )
     }
 
-    /// Borrow a peek segment (no reclaim) over `[start, start + take)`.
+    /// Borrow a peek segment (drop does not move the reader) over the region
+    /// `[start, start + take)`, which may wrap around the buffer end.
     pub(super) fn peek_segm<'a>(&'a self, start: usize, take: usize) -> ReclPeekRef<'a, T> {
         let base = self.buffer.as_ptr().cast_mut();
-        let slice: &'a mut [T] = unsafe { core::slice::from_raw_parts_mut(base.add(start), take) };
-        SegmRef::new(slice, NoReclaim)
+        let cap = self.capacity();
+        let first = core::cmp::min(take, cap - start);
+        let pieces = if first < take {
+            let a = unsafe { core::slice::from_raw_parts_mut(base.add(start), first) };
+            let b = unsafe { core::slice::from_raw_parts_mut(base, take - first) };
+            SegmSlicesRef::Two(a, b)
+        } else {
+            let a = unsafe { core::slice::from_raw_parts_mut(base.add(start), take) };
+            SegmSlicesRef::One(a)
+        };
+        ReclSliceRef::new(pieces, ReadReclaim::Peek)
     }
 
     // ------------------------------------------------------------------
-    // closing
+    // splitting into halves
+    //
+    // public: `try_split_shared` (the shared-ring pattern, e.g. over
+    // `Arc<RingBuffer>`). The `&mut self` borrow splits and the single-half
+    // variants are crate-internal for now: nothing outside the crate uses
+    // them, and the shared pattern covers the same needs.
+    //
+    // The split must be guarded by a strong-reference-count check: splitting
+    // clones the shared handle into the two halves, so a successful split
+    // creates exactly one producer/consumer *pair*. If the handle had already
+    // been cloned elsewhere (count > 1), those clones could be split into a
+    // second (or further) pair, turning SPSC into MPMC and breaking the
+    // lock-free state machine (two writers racing on `wp`, two readers on
+    // `rp`, overlapping segments). Requiring the caller to be the sole owner
+    // (count == 1) rules that out.
+    // ------------------------------------------------------------------
+
+    /// Split a ring shared through the smart pointer `S` (e.g. `Arc<Self>`)
+    /// into a write half and a read half.
+    ///
+    /// `strong_count` must return the number of strong references on the
+    /// shared allocation behind `ring_buff` (e.g. `|a| Arc::strong_count(a)`
+    /// for `S = Arc<Self>`). The split is only allowed while that count is
+    /// exactly `1` — i.e. the caller must hold the sole reference — so that
+    /// no second producer/consumer pair can ever be created from another
+    /// clone (see the section comment above). On failure the handle is
+    /// returned unchanged in `Err`.
+    ///
+    /// For non-refcounted handles (e.g. `&Self`, where the borrow checker
+    /// already prevents a second split) pass `|_| 1` and rely on the caller's
+    /// own exclusivity guarantee.
+    #[allow(clippy::type_complexity)] // the tuple of two generic halves is inherent to the API
+    pub fn try_split_shared<S>(
+        ring_buff: S,
+        strong_count: impl Fn(&S) -> usize,
+        weak_count: impl Fn(&S) -> usize,
+    ) -> Result<(RingTx<S, B, T>, RingRx<S, B, T>), S>
+    where
+        S: Borrow<Self> + Clone + Send + Sync,
+    {
+        if strong_count(&ring_buff) == 1 && weak_count(&ring_buff) == 0 {
+            Result::Ok((RingTx::new(ring_buff.clone()), RingRx::new(ring_buff)))
+        } else {
+            Result::Err(ring_buff)
+        }
+    }
+
+    /// Split off only the write half from a shared ring. Guarded like
+    /// [`RingBuffer::try_split_shared`] so that at most one producer exists.
+    #[allow(dead_code)] // unused in-crate so far; kept as internal API
+    pub(crate) fn try_split_shared_tx<S>(
+        ring_buff: S,
+        strong_count: impl Fn(&S) -> usize,
+    ) -> Result<RingTx<S, B, T>, S>
+    where
+        S: Borrow<Self> + Send + Sync,
+    {
+        if strong_count(&ring_buff) == 1 {
+            Result::Ok(RingTx::new(ring_buff))
+        } else {
+            Result::Err(ring_buff)
+        }
+    }
+
+    /// Split off only the read half from a shared ring. Guarded like
+    /// [`RingBuffer::try_split_shared`] so that at most one consumer exists.
+    #[allow(dead_code)] // unused in-crate so far; kept as internal API
+    pub(crate) fn try_split_shared_rx<S>(
+        ring_buff: S,
+        strong_count: impl Fn(&S) -> usize,
+    ) -> Result<RingRx<S, B, T>, S>
+    where
+        S: Borrow<Self> + Send + Sync,
+    {
+        if strong_count(&ring_buff) == 1 {
+            Result::Ok(RingRx::new(ring_buff))
+        } else {
+            Result::Err(ring_buff)
+        }
+    }
+
+    /// Split the ring into a write half and a read half, borrowing the ring
+    /// for `'a`.
+    #[cfg_attr(not(test), allow(dead_code))] // used by the test suite
+    pub(crate) fn split(&mut self) -> (RingTx<&Self, B, T>, RingRx<&Self, B, T>) {
+        let ring: &Self = self;
+        (RingTx::new(ring), RingRx::new(ring))
+    }
+
+    /// Split off only the write half.
+    #[allow(dead_code)] // unused in-crate so far; kept as internal API
+    pub(crate) fn split_tx(&mut self) -> RingTx<&Self, B, T> {
+        let ring: &Self = self;
+        RingTx::new(ring)
+    }
+
+    /// Split off only the read half.
+    #[allow(dead_code)] // unused in-crate so far; kept as internal API
+    pub(crate) fn split_rx(&mut self) -> RingRx<&Self, B, T> {
+        let ring: &Self = self;
+        RingRx::new(ring)
+    }
+
+    // ------------------------------------------------------------------
+    // runtime-side waiting
+    //
+    // Crate-internal: they pair with the (also crate-internal) kernel
+    // handoff, e.g. the `crate::unix_stream::BufferedUnixStream` driver
+    // tasks. They are not part of the public API while the `&'static`
+    // reservation lifetime of the handoff is under rework.
+    // ------------------------------------------------------------------
+
+    /// Wait until buffered data is available for a kernel `writev` (or the tx
+    /// end is closed).
+    pub(crate) fn wait_flushed(&self) -> WaitFlushed<'_, B, T> {
+        WaitFlushed::new(self)
+    }
+
+    /// Wait until free space is available for a kernel `readv` (or the rx end
+    /// is closed).
+    pub(crate) fn wait_rx_idle(&self) -> WaitRxIdle<'_, B, T> {
+        WaitRxIdle::new(self)
+    }
+
+    // ------------------------------------------------------------------
+    // closing (crate-internal: users close through `RingTx::close` /
+    // `RingRx::close`)
     // ------------------------------------------------------------------
 
     /// Close the tx end: no more data will be written by the user.
-    pub fn close_tx(&self) {
+    pub(crate) fn close_tx(&self) {
         self.core.close_tx();
     }
 
     /// Close the rx end: no more data will be read by the user.
-    pub fn close_rx(&self) {
+    pub(crate) fn close_rx(&self) {
         self.core.close_rx();
     }
 
@@ -817,6 +1056,25 @@ where
     ring.try_peek_at().is_ok() || ring.is_rx_closed()
 }
 
+/// Demand 下限版的 [`check_tx_writable`]：可写空间必须至少 `arg` 格（`arg` 为
+/// `Demand::min`，无下限时传 0）才允许写者继续。用于尊重 `Demand::at_least`
+/// 语义：空间不足下限时，等待中的写者不会被放行（保持 Pending）。
+pub(super) fn check_tx_writable_at_least<B, T>(ring: &RingBuffer<B, T>, arg: usize) -> bool
+where
+    B: DerefMut<Target = [T]>,
+{
+    ring.has_free_at_least(arg.max(1))
+}
+
+/// Demand 下限版的 [`check_rx_readable`]：可读数据必须至少 `arg` 格（`arg` 为
+/// `Demand::min`，无下限时传 0），或 rx 已关闭（EOF），才允许读者继续。
+pub(super) fn check_rx_readable_at_least<B, T>(ring: &RingBuffer<B, T>, arg: usize) -> bool
+where
+    B: DerefMut<Target = [T]>,
+{
+    ring.has_data_at_least(arg.max(1)) || ring.is_rx_closed()
+}
+
 /// The runtime can proceed if buffered data is available for a kernel write,
 /// or the tx end is closed.
 pub(super) fn check_tx_flushed<B, T>(ring: &RingBuffer<B, T>, _: usize) -> bool
@@ -854,6 +1112,27 @@ where
 {
 }
 
+impl<B, T> fmt::Debug for RingBuffer<B, T>
+where
+    B: DerefMut<Target = [T]>,
+{
+    /// Print the positions and state flags (diagnostics only; the buffer
+    /// contents are not printed).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.core.load_state_();
+        let (rp, wp) = unpack(state);
+        f.debug_struct("RingBuffer")
+            .field("capacity", &self.capacity())
+            .field("rp", &rp)
+            .field("wp", &wp)
+            .field("tx_closed", &has_flag(state, TX_CLOSED))
+            .field("rx_closed", &has_flag(state, RX_CLOSED))
+            .field("send_in_flight", &has_flag(state, SEND_IN_FLIGHT))
+            .field("recv_in_flight", &has_flag(state, RECV_IN_FLIGHT))
+            .finish()
+    }
+}
+
 impl<B, T> Drop for RingBuffer<B, T>
 where
     B: DerefMut<Target = [T]>,
@@ -863,7 +1142,7 @@ where
         // slices. Returning them (put_back_*) before the last reference to
         // the ring drops is part of the protocol; dropping the ring
         // otherwise would dangle those references.
-        let state = self.core.load_state();
+        let state = self.core.load_state_();
         debug_assert!(
             !has_flag(state, SEND_IN_FLIGHT) && !has_flag(state, RECV_IN_FLIGHT),
             "[RingBuffer::drop] a region is still reserved by the runtime"

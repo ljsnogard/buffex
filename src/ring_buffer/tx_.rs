@@ -57,22 +57,54 @@ where
         self.ring.borrow()
     }
 
-    /// Borrow up to `length` contiguous writable units.
+    /// The underlying shared handle (`H`), e.g. `&Arc<RingBuffer>`.
     ///
-    /// The returned segment commits its *whole* borrowed region to the ring
-    /// when it drops (the abs_buff per-piece reclaim granularity). When the ring wraps, only the
-    /// contiguous part starting at the writer position is returned; call
-    /// again to obtain the wrapped part.
-    pub fn try_write(&mut self, length: usize) -> Result<ReclSliceMut<'_, T>, TxError<usize>> {
+    /// Used after a `try_split_shared` split to clone the handle for a
+    /// runtime-side (kernel handoff) task. Cloning keeps the strong count
+    /// above one, so a further `try_split_shared` is rejected — the
+    /// one-pair SPSC invariant is preserved.
+    #[inline]
+    pub(crate) fn shared(&self) -> &H {
+        &self.ring
+    }
+
+    pub fn is_blocked_closing(&self) -> bool {
+        !self.ring().has_tx_space() || self.ring().is_tx_closed()
+    }
+
+    pub fn write_async<'f>(
+        &'f mut self,
+        demand: &Demand<usize>,
+    ) -> WriteAsync<'f, H, B, T> {
+        // 尊重 Demand 的 [min, max] 区间：可写空间不足 min 时未来保持 Pending；
+        let min_len = demand.min().copied().unwrap_or(0);
+        let max_len = demand.max().copied().unwrap_or(usize::MAX);
+        WriteAsync::new(self, min_len, max_len)
+    }
+
+    /// Borrow up to `length` writable units (no more than `length`).
+    ///
+    /// The region may wrap around the buffer end; the returned segment is
+    /// then a two-piece segment that treats the two physical slices as one
+    /// logical segment, so a single borrow can cover the whole free space.
+    /// When it drops, the segment commits exactly the amount consumed
+    /// (the per-piece reclaim granularity).
+    ///
+    /// The name carries `_at_most` to tell it apart from the
+    /// [`TrBuffTryWrite::try_write`] trait method, which takes a
+    /// [`Demand`](abs_buff::Demand) instead of a plain length.
+    pub fn try_write_at_most(&mut self, length: usize) -> Result<ReclSliceMut<'_, T>, TxError<usize>> {
         let ring = self.ring();
         let (start, take) = ring.try_write_at(length)?;
         Ok(ring.write_segm(start, take))
     }
 
-    /// Borrow up to `length` contiguous writable units in an async manner,
-    /// waiting for free space automatically.
-    pub fn write_async(&mut self, length: usize) -> WriteAsync<'_, H, B, T> {
-        WriteAsync::new(self, length)
+    /// Borrow up to `length` writable units in an async manner, waiting for
+    /// free space automatically. See [`RingTx::try_write_at_most`] for the
+    /// `_at_most` naming (vs the [`TrBuffWrite::write_async`] trait method
+    /// which takes a [`Demand`](abs_buff::Demand)).
+    pub fn write_at_most_async(&mut self, length: usize) -> WriteAsync<'_, H, B, T> {
+        WriteAsync::new(self, 0, length)
     }
 
     /// Close the tx end: no more data will be written by the user.
@@ -125,19 +157,19 @@ where
     type SegmMut<'a> = ReclSliceMut<'a, T> where Self: 'a;
     type Err = TxError<usize>;
 
-    fn is_blocked(&self) -> bool {
-        !self.ring().has_tx_space()
+    #[inline]
+    fn is_blocked_closing(&self) -> bool {
+        RingTx::is_blocked_closing(&self)
     }
 
+    #[inline]
     fn write_async<'f>(
         &'f mut self,
         demand: &Demand<usize>,
-    ) -> impl abs_cancel::TrMayCancel<
-        'f,
-        MayCancelOutput = SomeOf<Self::SegmMut<'f>, Self::Err>,
-    > {
-        let length = demand.max().copied().unwrap_or(usize::MAX);
-        self.write_async(length)
+    ) -> impl abs_cancel::TrMayCancel<'f, MayCancelOutput =
+        SomeOf<Self::SegmMut<'f>, Self::Err>>
+    {
+        RingTx::write_async(self, demand)
     }
 }
 
@@ -150,9 +182,24 @@ where
         &'f mut self,
         demand: &Demand<usize>,
     ) -> SomeOf<Self::SegmMut<'f>, Self::Err> {
-        let length = demand.max().copied().unwrap_or(usize::MAX);
-        match RingTx::try_write(self, length) {
-            Ok(segm) => SomeOf::new_left(segm),
+        // 尊重 Demand 的 [min, max] 区间：可写空间不足 min 时按 Stuffed 处理，
+        // 不返回一个不满足下限要求的段；
+        let min_len = demand.min().copied().unwrap_or(0);
+        let max_len = demand.max().copied().unwrap_or(usize::MAX);
+        let ring = self.ring();
+        match ring.try_write_at(max_len) {
+            Ok((start, take)) => {
+                if take < min_len {
+                    let e = if ring.is_tx_closed() {
+                        TxError::Closing
+                    } else {
+                        TxError::Stuffed(start)
+                    };
+                    SomeOf::new_right(e)
+                } else {
+                    SomeOf::new_left(ring.write_segm(start, take))
+                }
+            }
             Err(err) => SomeOf::new_right(err),
         }
     }

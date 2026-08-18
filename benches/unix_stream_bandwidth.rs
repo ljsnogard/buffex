@@ -24,12 +24,11 @@ fn main() {
         vec::Vec,
     };
     use abs_buff::{
-        x_deps::{abs_cancel, anylr},
+        x_deps::abs_cancel,
         Demand,
         TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite,
     };
     use abs_cancel::{NonCancellableToken, TrMayCancel};
-    use anylr::SomeOf;
 
     use buffex::unix_stream::BufferedUnixStream;
 

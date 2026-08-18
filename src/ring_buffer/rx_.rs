@@ -13,6 +13,7 @@ use abs_buff::{
     x_deps::{anylr, abs_cancel},
     Demand, TrBuffPeek, TrBuffRead, TrBuffTryPeek, TrBuffTryRead,
 };
+use abs_cancel::TrMayCancel;
 
 use super::{
     error_::RxError,
@@ -57,18 +58,52 @@ where
         self.ring.borrow()
     }
 
-    /// Borrow up to `length` contiguous readable units. The returned segment
-    /// commits its whole borrowed region when it drops.
-    pub fn try_read(&mut self, length: usize) -> Result<ReclSliceRef<'_, T>, RxError<usize>> {
+    /// The underlying shared handle (`H`), e.g. `&Arc<RingBuffer>`.
+    ///
+    /// Used after a `try_split_shared` split to clone the handle for a
+    /// runtime-side (kernel handoff) task. Cloning keeps the strong count
+    /// above one, so a further `try_split_shared` is rejected — the
+    /// one-pair SPSC invariant is preserved.
+    #[inline]
+    pub(crate) fn shared(&self) -> &H {
+        &self.ring
+    }
+
+    pub fn is_drained_closing(&self) -> bool {
+        // "Drained" means no more data will ever be emitted: the rx end is
+        // closed *and* the ring holds no buffered data.
+        self.ring().data_size() == 0 && self.ring().is_rx_closed()
+    }
+
+    pub fn read_async(&mut self, demand: &Demand<usize>) -> ReadAsync<'_, H, B, T> {
+        // 尊重 Demand 的 [min, max] 区间：可读数据不足 min 时未来保持 Pending；
+        let min_len = demand.min().copied().unwrap_or(0);
+        let max_len = demand.max().copied().unwrap_or(usize::MAX);
+        ReadAsync::new(self, min_len, max_len)
+    }
+
+    /// Borrow up to `length` readable units (no more than `length`).
+    ///
+    /// The region may wrap around the buffer end; the returned segment is
+    /// then a two-piece segment that treats the two physical slices as one
+    /// logical segment. When it drops, the segment commits exactly the amount
+    /// consumed (the per-piece reclaim granularity).
+    ///
+    /// The name carries `_at_most` to tell it apart from the
+    /// [`TrBuffTryRead::try_read`] trait method, which takes a
+    /// [`Demand`](abs_buff::Demand) instead of a plain length.
+    pub fn try_read_at_most(&mut self, length: usize) -> Result<ReclSliceRef<'_, T>, RxError<usize>> {
         let ring = self.ring();
         let (start, take) = ring.try_read_at(length)?;
         Ok(ring.read_segm(start, take))
     }
 
-    /// Borrow up to `length` contiguous readable units in an async manner,
-    /// waiting for data (or closing) automatically.
-    pub fn read_async(&mut self, length: usize) -> ReadAsync<'_, H, B, T> {
-        ReadAsync::new(self, length)
+    /// Borrow up to `length` readable units in an async manner, waiting for
+    /// data (or closing) automatically. See [`RingRx::try_read_at_most`] for
+    /// the `_at_most` naming (vs the [`TrBuffRead::read_async`] trait method
+    /// which takes a [`Demand`](abs_buff::Demand)).
+    pub fn read_at_most_async(&mut self, length: usize) -> ReadAsync<'_, H, B, T> {
+        ReadAsync::new(self, 0, length)
     }
 
     /// Borrow all contiguous readable units without consuming them.
@@ -129,21 +164,19 @@ where
     type SegmRef<'a> = ReclSliceRef<'a, T> where Self: 'a;
     type Err = RxError<usize>;
 
-    fn is_drained(&self) -> bool {
-        // "Drained" means no more data will ever be emitted: the rx end is
-        // closed *and* the ring holds no buffered data.
-        self.ring().data_size() == 0 && self.ring().is_rx_closed()
+    #[inline]
+    fn is_drained_closing(&self) -> bool {
+        RingRx::is_drained_closing(self)
     }
 
+    #[inline]
     fn read_async<'f>(
         &'f mut self,
         demand: &Demand<usize>,
-    ) -> impl abs_cancel::TrMayCancel<
-        'f,
-        MayCancelOutput = SomeOf<Self::SegmRef<'f>, Self::Err>,
-    > {
-        let length = demand.max().copied().unwrap_or(usize::MAX);
-        self.read_async(length)
+    ) -> impl TrMayCancel<'f, MayCancelOutput =
+        SomeOf<Self::SegmRef<'f>, Self::Err>>
+    {
+        RingRx::read_async(self, demand)
     }
 }
 
@@ -156,9 +189,24 @@ where
         &'f mut self,
         demand: &Demand<usize>,
     ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
-        let length = demand.max().copied().unwrap_or(usize::MAX);
-        match RingRx::try_read(self, length) {
-            Ok(segm) => SomeOf::new_left(segm),
+        // 尊重 Demand 的 [min, max] 区间：可读数据不足 min 时按 Drained 处理，
+        // 不返回一个不满足下限要求的段；
+        let min_len = demand.min().copied().unwrap_or(0);
+        let max_len = demand.max().copied().unwrap_or(usize::MAX);
+        let ring = self.ring();
+        match ring.try_read_at(max_len) {
+            Ok((start, take)) => {
+                if take < min_len {
+                    let e = if ring.is_rx_closed() {
+                        RxError::Closing
+                    } else {
+                        RxError::Drained(start)
+                    };
+                    SomeOf::new_right(e)
+                } else {
+                    SomeOf::new_left(ring.read_segm(start, take))
+                }
+            }
             Err(err) => SomeOf::new_right(err),
         }
     }
@@ -174,10 +222,9 @@ where
 
     fn peek_async<'f>(
         &'f mut self,
-    ) -> impl abs_cancel::TrMayCancel<
-        'f,
-        MayCancelOutput = SomeOf<Self::SegmPeek<'f>, Self::Err>,
-    > {
+    ) -> impl abs_cancel::TrMayCancel<'f, MayCancelOutput =
+        SomeOf<Self::SegmPeek<'f>, Self::Err>>
+    {
         PeekAsync::new(self)
     }
 }

@@ -36,9 +36,12 @@ where
         loop {
             match ring.try_read_at(buf.remaining()) {
                 Ok((start, take)) => {
-                    let src = &ring.buffer_ref()[start..start + take];
+                    // try_read_at 可能返回跨末端环绕的区域；适配层只取连续前缀，
+                    // 剩余的环绕部分由下一次 poll 继续读取。
+                    let first = core::cmp::min(take, ring.capacity() - start);
+                    let src = &ring.buffer_ref()[start..start + first];
                     buf.put_slice(src);
-                    ring.advance_read(take);
+                    ring.advance_read(first);
                     return Poll::Ready(Ok(()));
                 }
                 Err(RxError::Drained(_)) => {
@@ -70,17 +73,19 @@ where
         loop {
             match ring.try_write_at(buf.len()) {
                 Ok((start, take)) => {
+                    // 同读侧：只取连续前缀，环绕部分由下一次 poll 写入。
+                    let first = core::cmp::min(take, ring.capacity() - start);
                     let dst = ring.buffer_uninit();
-                    // SAFETY: `take <= dst.len() - start`.
+                    // SAFETY: `first <= dst.len() - start`.
                     unsafe {
                         ptr::copy_nonoverlapping(
                             buf.as_ptr(),
-                            dst[start..start + take].as_mut_ptr().cast::<u8>(),
-                            take,
+                            dst[start..start + first].as_mut_ptr().cast::<u8>(),
+                            first,
                         );
                     }
-                    ring.advance_write(take);
-                    return Poll::Ready(Ok(take));
+                    ring.advance_write(first);
+                    return Poll::Ready(Ok(first));
                 }
                 Err(TxError::Stuffed(_)) => {
                     let waiter = unsafe { &mut *this.waiter.get() };
