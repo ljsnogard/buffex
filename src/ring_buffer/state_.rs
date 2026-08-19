@@ -427,10 +427,11 @@ where
     /// Create a ring buffer from one owned heap buffer.
     ///
     /// Returns `Err(len)` if the buffer is too large (longer than
-    /// [`MAX_CAPACITY`]).
+    /// [`MAX_CAPACITY`], 0x3FFFFFFF on 64 bit platform), or too small
+    /// (shorter than 2)
     pub fn try_new(buffer: B) -> Result<Self, usize> {
         let cap = buffer.len();
-        if cap > MAX_CAPACITY {
+        if !(2..=MAX_CAPACITY).contains(&cap) {
             return Result::Err(cap);
         }
         Result::Ok(RingBuffer {

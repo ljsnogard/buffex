@@ -159,7 +159,7 @@ where
 
     #[inline]
     fn is_blocked_closing(&self) -> bool {
-        RingTx::is_blocked_closing(&self)
+        RingTx::is_blocked_closing(self)
     }
 
     #[inline]

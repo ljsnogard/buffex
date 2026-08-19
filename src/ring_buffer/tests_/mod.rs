@@ -23,6 +23,7 @@ mod unix_stream_;
 mod frameworks_;
 mod mini_exec;
 mod pipe_retry_;
+mod smoke_tests_;
 mod scenario_;
 mod sync_;
 

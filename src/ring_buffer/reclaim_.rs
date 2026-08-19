@@ -12,12 +12,10 @@
 //! 当前物理段的一个子段，父段的 offset 在子段 drop 时累计，段整体 drop 时
 //! 按已消费量提交给 ring（逐段回收粒度）。
 
-use core::{mem::MaybeUninit, ops::Try};
+use core::{mem::MaybeUninit, ops::Try, pin::Pin};
 
 use abs_buff::{
-    Demand,
-    buffer::{SegmMut, SegmRef, TrBuffSegmMut, TrBuffSegmRef, TrBuffSegmView, TrReclaim},
-    // x_deps::abs_iter,
+    Demand, buffer::{SegmMut, SegmReclaim, SegmRef, TrBuffSegmMut, TrBuffSegmRef, TrBuffSegmView, TrReclaim}
 };
 // use abs_iter::TrAsSlice;
 
@@ -163,7 +161,7 @@ impl<'a> WriterReclaim<'a> {
 }
 
 impl TrReclaim for WriterReclaim<'_> {
-    fn reclaim(&self, amount: usize) -> usize {
+    fn reclaim(&mut self, amount: usize) -> usize {
         self.core.advance_write(self.cap, amount);
         0
     }
@@ -182,7 +180,7 @@ impl<'a> ReaderReclaim<'a> {
 }
 
 impl TrReclaim for ReaderReclaim<'_> {
-    fn reclaim(&self, amount: usize) -> usize {
+    fn reclaim(&mut self, amount: usize) -> usize {
         self.core.advance_read(self.cap, amount);
         0
     }
@@ -196,31 +194,7 @@ pub(super) enum ReadReclaim<'a> {
     Peek,
 }
 
-/// 子段的回收器：子段 drop 时把其已消费量累计到父段的 `offset`。
-///
-/// 与 abs_buff 内部的 `SegmReclaim` 行为一致，但这里是 buffex 自己的类型
-/// （`SegmReclaim::new` 对 buffex 不可见），用于 `as_segm_ref` /
-/// `as_segm_mut` 产生的子段。
-pub struct ChildReclaim<'a>(&'a mut usize);
-
-impl<'a> ChildReclaim<'a> {
-    fn new(p: &'a mut usize) -> Self {
-        ChildReclaim(p)
-    }
-}
-
-impl TrReclaim for ChildReclaim<'_> {
-    fn reclaim(&self, amount: usize) -> usize {
-        // 借由 &self 写入 &mut usize 需要经过裸指针（与 abs_buff 内部
-        // SegmReclaim 的做法一致）；该 &mut 的生命周期被本类型独占持有。
-        unsafe {
-            let p = self.0 as *const _ as *mut usize;
-            let prev = *p;
-            *p += amount;
-            prev
-        }
-    }
-}
+pub type ChildReclaim<'a> = SegmReclaim<'a>;
 
 // ---------------------------------------------------------------------------
 // 写段
@@ -275,7 +249,7 @@ impl<'a, T> ReclSliceMut<'a, T> {
         // 直接借用 `self.pieces` 与 `self.offset`（不同字段，借用检查器
         // 可判定互斥），与 abs_buff 内部 `SegmRef::as_segm_ref` 的做法一致。
         let slice = self.pieces.current_mut(self.offset);
-        let reclaim = ChildReclaim::new(&mut self.offset);
+        let reclaim = ChildReclaim::new(Pin::new(&mut self.offset));
         SegmMut::new(slice, reclaim)
     }
 
@@ -294,7 +268,7 @@ impl<'a, T> ReclSliceMut<'a, T> {
         let cur = self.pieces.current_mut(self.offset);
         let take = core::cmp::min(*max_len, cur.len());
         let slice = &mut cur[..take];
-        let reclaim = ChildReclaim::new(&mut self.offset);
+        let reclaim = ChildReclaim::new(Pin::new(&mut self.offset));
         Option::Some(SegmMut::new(slice, reclaim))
     }
 
@@ -311,7 +285,7 @@ impl<'a, T> ReclSliceMut<'a, T> {
 
 impl<'a, T> Drop for ReclSliceMut<'a, T> {
     fn drop(&mut self) {
-        let Option::Some(r) = self.reclaim.take() else {
+        let Option::Some(mut r) = self.reclaim.take() else {
             return;
         };
         r.reclaim(self.offset);
@@ -419,14 +393,14 @@ impl<'a, T> ReclSliceRef<'a, T> {
         let cur = self.pieces.current_mut(self.offset);
         let take = core::cmp::min(*max_len, cur.len());
         let slice = &mut cur[..take];
-        let reclaim = ChildReclaim::new(&mut self.offset);
+        let reclaim = ChildReclaim::new(Pin::new(&mut self.offset));
         Option::Some(SegmRef::new(slice, reclaim))
     }
 
     /// 当前物理段的剩余部分作为一个 abs_buff 子段（同写段的设计）。
     pub fn as_segm_ref<'f>(&'f mut self) -> SegmRef<'f, T, ChildReclaim<'f>> {
         let slice = self.pieces.current_mut(self.offset);
-        let reclaim = ChildReclaim::new(&mut self.offset);
+        let reclaim = ChildReclaim::new(Pin::new(&mut self.offset));
         SegmRef::new(slice, reclaim)
     }
 
@@ -446,7 +420,7 @@ impl<'a, T> Drop for ReclSliceRef<'a, T> {
             return;
         };
         match r {
-            ReadReclaim::Consume(r) => {
+            ReadReclaim::Consume(mut r) => {
                 r.reclaim(self.offset);
             }
             ReadReclaim::Peek => {}
