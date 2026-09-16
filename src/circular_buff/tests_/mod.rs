@@ -17,25 +17,17 @@ mod pos_tests_;
 mod pump_;
 mod sync_;
 
-use core::{fmt, mem::MaybeUninit, pin::Pin};
+use core::{mem::MaybeUninit, pin::Pin};
 use std::{
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+        atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, Wake, Waker},
     vec::Vec,
 };
 
-use abs_buff::{
-    buffer::{TrBuffSegmMut, TrBuffSegmRef, TrReclaim},
-    error::{ReadErrTag, TrTaggedError, WriteErrTag},
-    io::{TrInput, TrOutput},
-    x_deps::{
-        abs_cancel::{TrCancellationToken, TrMayCancel},
-        anylr::SomeOf,
-    },
-};
+use abs_buff::buffer::{TrBuffSegmMut, TrBuffSegmRef, TrReclaim};
 
 use mm_ptr::Owned;
 
@@ -58,141 +50,13 @@ pub(super) type DefaultBuilder =
 // 测试设备（TrInput / TrOutput）
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Boom 仅作为错误类型存在，测试设备从不真的失败
-pub(super) enum TestErr {
-    Boom,
-}
-
-impl fmt::Display for TestErr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TestErr::Boom => write!(f, "boom"),
-        }
-    }
-}
-
-impl core::error::Error for TestErr {}
-
-impl TrTaggedError<ReadErrTag> for TestErr {
-    fn err_tag(&self) -> ReadErrTag {
-        ReadErrTag::Unknown
-    }
-}
-
-impl TrTaggedError<WriteErrTag> for TestErr {
-    fn err_tag(&self) -> WriteErrTag {
-        WriteErrTag::Unknown
-    }
-}
-
-/// 一个立即就绪的 `TrMayCancel` future（测试设备的异步操作返回它）。
-pub(super) struct ReadySegm<S, E>(Option<SomeOf<S, E>>);
-
-impl<S, E> ReadySegm<S, E> {
-    fn new(value: SomeOf<S, E>) -> Self {
-        ReadySegm(Option::Some(value))
-    }
-}
-
-impl<S, E> core::future::Future for ReadySegm<S, E> {
-    type Output = SomeOf<S, E>;
-
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        Poll::Ready(this.0.take().expect("ready future polled once"))
-    }
-}
-
-impl<'f, S: 'f, E: 'f> TrMayCancel<'f> for ReadySegm<S, E> {
-    type MayCancelFuture<'g, C> = ReadySegm<S, E>
-    where
-        Self: 'g,
-        C: TrCancellationToken + Clone,
-        C: 'f,
-        C: 'g,
-        'g: 'f;
-    type MayCancelOutput = SomeOf<S, E>;
-
-    fn may_cancel_with<'g, C>(
-        self,
-        _cancel: &'g mut C,
-    ) -> Self::MayCancelFuture<'g, C>
-    where
-        Self: 'g,
-        'g: 'f,
-        C: TrCancellationToken + Clone,
-    {
-        self
-    }
-}
-
-/// 测试输入设备：内部数据与读取位置放在 `Arc` 里，**设备被缓冲拥有期间**，
-/// 测试仍能通过自己持有的 `Arc` 观察进度（设备 move 进核心后测试无法直接
-/// 访问它）。
-pub(super) struct TestInput {
-    pub data: Arc<Mutex<Vec<u8>>>,
-    pub pos: Arc<AtomicUsize>,
-}
-
-impl TestInput {
-    pub fn new(data: Vec<u8>) -> Self {
-        TestInput {
-            data: Arc::new(Mutex::new(data)),
-            pos: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-}
-
-impl TrInput<u8> for TestInput {
-    type ReadAsync<'f> = ReadySegm<usize, TestErr> where Self: 'f;
-    type Err = TestErr;
-
-    fn read_async<'f>(
-        &'f mut self,
-        target: &'f mut [MaybeUninit<u8>],
-    ) -> Self::ReadAsync<'f> {
-        let data = self.data.lock().unwrap();
-        let pos = self.pos.load(Ordering::Relaxed);
-        let n = core::cmp::min(target.len(), data.len() - pos);
-        for (i, slot) in target[..n].iter_mut().enumerate() {
-            *slot = MaybeUninit::new(data[pos + i]);
-        }
-        self.pos.store(pos + n, Ordering::Relaxed);
-        ReadySegm::new(SomeOf::new_left(n))
-    }
-}
-
-/// 测试输出设备：收下的数据放在 `Arc` 里，测试可随时观察。
-pub(super) struct TestOutput {
-    pub data: Arc<Mutex<Vec<u8>>>,
-}
-
-impl TestOutput {
-    pub fn new() -> Self {
-        TestOutput {
-            data: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-}
-
-impl TrOutput<u8> for TestOutput {
-    type WriteAsync<'f> = ReadySegm<usize, TestErr> where Self: 'f;
-    type Err = TestErr;
-
-    fn write_async<'f>(
-        &'f mut self,
-        source: &'f [MaybeUninit<u8>],
-    ) -> Self::WriteAsync<'f> {
-        let n = source.len();
-        let mut data = self.data.lock().unwrap();
-        for m in source {
-            // SAFETY: 测试数据为 u8，无 drop 需求。
-            data.push(unsafe { m.assume_init_read() });
-        }
-        ReadySegm::new(SomeOf::new_left(n))
-    }
-}
+// 测试设备直接复用 abs_buff 的实现，避免各 crate 各抄一份后逐渐漂移
+// （此前本文件的 `ReadySegm` 就停留在 `abs_cancel` v0.1 的 trait 形态上）：
+// * `ReadySegm` 是 abs_buff 的正式公开类型（立即就绪的 `SomeOf` future）；
+// * `TestErr` / `TestInput` / `TestOutput` 来自 abs_buff 的共享测试模块，
+//   由 dev-dependencies 里的 `segm-tests` feature 打开。
+pub(super) use abs_buff::ReadySegm;
+pub(super) use abs_buff_testkit::{TestErr, TestInput, TestOutput};
 
 // ---------------------------------------------------------------------------
 // 段操作辅助（两段式 ReclSliceMut / ReclSliceRef）

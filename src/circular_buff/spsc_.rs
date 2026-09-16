@@ -155,8 +155,8 @@ where
     ///
     /// 返回由 `gen_may_cancel_future` 生成的异步 future，可通过
     /// `may_cancel_with(&mut token)` 中断排空过程；一旦取消，关闭标志已设置。
-    pub fn close_async<'f>(&'f mut self) -> ProducerCloseAsync<'f, C, B, T, A> {
-        ProducerCloseAsync(self)
+    pub fn close_async<'f>(&'f mut self) -> ProducerCloseAsync<'f, 'f, C, B, T, A> {
+        ProducerCloseAsync::new(self)
     }
 }
 
@@ -171,8 +171,8 @@ where
     pub fn write_async<'f>(
         &'f mut self,
         demand: &'f Demand<usize>,
-    ) -> ProducerWriteAsync<'f, C, B, T, A> {
-        ProducerWriteAsync(self, demand)
+    ) -> ProducerWriteAsync<'f, 'f, C, B, T, A> {
+        ProducerWriteAsync::new(self, demand)
     }
 
     #[allow(clippy::type_complexity)]
@@ -234,11 +234,11 @@ where
     }
 }
 
-#[gen_may_cancel_future(ProducerWrite)]
+#[gen_may_cancel_future(ProducerWrite, pub)]
 async fn producer_write_async_<'f, K, B, T, A, C>(
     producer: &'f mut Producer<K, B, T, A>,
     demand: &'f Demand<usize>,
-    cancel: &'f mut C,
+    cancel: C,
 ) -> SomeOf<
     ReclSliceMut<'f, T,
         WriterReclaim<'f, CircCore<BufProducer<T>, K, B, T>> >,
@@ -249,7 +249,7 @@ async fn producer_write_async_<'f, K, B, T, A, C>(
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
     T: Send + Sync + 'static,
     A: Send + Sync + TrMalloc + Clone,
-    C: TrCancellationToken + Clone,
+    C: TrCancellationToken,
 {
     producer.core_ref_
         .write_async_(demand)
@@ -257,17 +257,18 @@ async fn producer_write_async_<'f, K, B, T, A, C>(
         .await
 }
 
-#[gen_may_cancel_future(ProducerClose)]
+#[allow(clippy::needless_lifetimes)]
+#[gen_may_cancel_future(ProducerClose, pub)]
 async fn producer_close_async_<'f, K, B, T, A, C>(
     producer: &'f mut Producer<K, B, T, A>,
-    cancel: &'f mut C,
+    cancel: C,
 ) -> ()
 where
     K: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
     T: Send + Sync + 'static,
     A: Send + Sync + TrMalloc + Clone,
-    C: TrCancellationToken + Clone,
+    C: TrCancellationToken,
 {
     producer.core_ref_.close_tx_async(cancel).await;
 }
@@ -314,8 +315,8 @@ where
     }
 
     /// 关闭读端：不再读取，触发生产端事件（`ConsumerClose`）。
-    pub fn close_async(&mut self) -> ConsumerCloseAsync<'_, P, B, T, A> {
-        ConsumerCloseAsync(self)
+    pub fn close_async(&mut self) -> ConsumerCloseAsync<'_, '_, P, B, T, A> {
+        ConsumerCloseAsync::new(self)
     }
 }
 
@@ -330,8 +331,8 @@ where
     pub fn read_async<'f>(
         &'f mut self,
         demand: &'f Demand<usize>,
-    ) -> ConsumerReadAsync<'f, P, B, T, A> {
-        ConsumerReadAsync(self, demand)
+    ) -> ConsumerReadAsync<'f, 'f, P, B, T, A> {
+        ConsumerReadAsync::new(self, demand)
     }
 
     #[allow(clippy::type_complexity)]
@@ -393,11 +394,11 @@ where
     }
 }
 
-#[gen_may_cancel_future(ConsumerRead)]
+#[gen_may_cancel_future(ConsumerRead, pub)]
 async fn consumer_read_async_<'f, P, B, T, A, C>(
     consumer: &'f mut Consumer<P, B, T, A>,
     demand: &'f Demand<usize>,
-    cancel: &'f mut C,
+    cancel: C,
 ) -> SomeOf<ReclSliceRef<'f, T,
     ReaderReclaim<'f, CircCore<P, BufConsumer<T>, B, T>> >,
     ConsumerError<usize>>
@@ -407,7 +408,7 @@ where
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
     T: Send + Sync + 'static,
     A: Send + Sync + TrMalloc + Clone,
-    C: TrCancellationToken + Clone,
+    C: TrCancellationToken,
 {
     consumer.core_ref_
         .read_async_(demand)
@@ -415,10 +416,11 @@ where
         .await
 }
 
-#[gen_may_cancel_future(ConsumerClose)]
+#[allow(clippy::needless_lifetimes)]
+#[gen_may_cancel_future(ConsumerClose, pub)]
 async fn consumer_close_async_<'f, P, B, T, A, C>(
     consumer: &'f mut Consumer<P, B, T, A>,
-    _cancel: &'f mut C,
+    _cancel: C,
 ) -> ()
 where
     P: Send + Sync + TrProducer<Data = T>,
@@ -426,7 +428,7 @@ where
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
     T: Send + Sync + 'static,
     A: Send + Sync + TrMalloc + Clone,
-    C: TrCancellationToken + Clone,
+    C: TrCancellationToken,
 {
     consumer.core_ref_.close_rx();
 }
@@ -553,8 +555,8 @@ where
 
     /// 启动背压缓存开始搬运数据。只能通过 cancellation token 来中断搬运，否则
     /// future 会一直运行直到两端中有一方停止。
-    pub fn pipe_async(&mut self) -> PipelineAsync<'_, I, O, B, T, A> {
-        PipelineAsync(self)
+    pub fn pipe_async(&mut self) -> PipelineAsync<'_, '_, I, O, B, T, A> {
+        PipelineAsync::new(self)
     }
 }
 
@@ -592,10 +594,11 @@ where
     }
 }
 
-#[gen_may_cancel_future(Pipeline)]
+#[allow(clippy::needless_lifetimes)]
+#[gen_may_cancel_future(Pipeline, pub)]
 async fn pipeline_piping_async_<'f, I, O, B, T, A, C>(
     pipeline: &'f mut Pipeline<I, O, B, T, A>,
-    cancel: &'f mut C,
+    cancel: C,
 ) -> Option<PipelineError<usize>>
 where
     I: Send + Sync + TrInput<T>,
@@ -603,7 +606,7 @@ where
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
     T: Send + Sync + 'static,
     A: Send + Sync + TrMalloc + Clone,
-    C: TrCancellationToken + Clone,
+    C: TrCancellationToken,
 {
     // 泵循环：**由两端设备驱动**——每次 `await` 设备的 `read_async` /
     // `write_async`，设备就绪即流动、阻塞即挂起（executor 在设备 waker
@@ -652,7 +655,8 @@ where
     T: Send + Sync + 'static,
     A: Send + Sync + TrMalloc + Clone,
 {
-    type WriteAsync<'f> = ProducerWriteAsync<'f, C, B, T, A> where Self: 'f;
+    type WriteAsync<'f> = ProducerWriteAsync<'f, 'f, C, B, T, A>
+    where Self: 'f;
 
     type SegmMut<'f> = ReclSliceMut<'f, T,
         WriterReclaim<'f, CircCore<BufProducer<T>, C, B, T>>>
@@ -699,7 +703,7 @@ where
     T: Send + Sync + 'static,
     A: Send + Sync + TrMalloc + Clone,
 {
-    type ReadAsync<'f> = ConsumerReadAsync<'f, P, B, T, A> where Self: 'f;
+    type ReadAsync<'f> = ConsumerReadAsync<'f, 'f, P, B, T, A> where Self: 'f;
 
     type SegmRef<'f> = ReclSliceRef<'f, T,
         ReaderReclaim<'f, CircCore<P, BufConsumer<T>, B, T>>>

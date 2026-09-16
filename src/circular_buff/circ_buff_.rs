@@ -245,23 +245,23 @@ where
     pub(super) fn init_async<'f, TyCore>(
         &'f mut self,
         core: &'f TyCore,
-    ) -> DevProducerInitAsync<'f, TyInput, T, TyCore>
+    ) -> DevProducerInitAsync<'f, 'f, TyInput, T, TyCore>
     where
         TyCore: TrCircBuffCore<Data = T>,
     {
-        DevProducerInitAsync(self, core)
+        DevProducerInitAsync::new(self, core)
     }
 
     pub(super) fn react_async<'a, 'f, TySegm>(
         &'f mut self,
         segm_mut: &'f mut TySegm,
-    ) -> DevProducerReactAsync<'a, 'f, TyInput, T, TySegm>
+    ) -> DevProducerReactAsync<'a, 'f, 'f, TyInput, T, TySegm>
     where
         'a: 'f,
         TySegm: 'a + TrBuffSegmMut<'a, T>,
     {
         // 宏为 where-only 生命周期 'a 追加了 PhantomData 标记字段（位置型）。
-        DevProducerReactAsync(self, segm_mut, PhantomData)
+        DevProducerReactAsync::new(self, segm_mut)
     }
 }
 
@@ -318,23 +318,23 @@ where
     pub(super) fn init_async<'f, TyCore>(
         &'f mut self,
         core: &'f TyCore,
-    ) -> DevConsumerInitAsync<'f, TyOutput, T, TyCore>
+    ) -> DevConsumerInitAsync<'f, 'f, TyOutput, T, TyCore>
     where
         TyCore: TrCircBuffCore<Data = T>,
     {
-        DevConsumerInitAsync(self, core)
+        DevConsumerInitAsync::new(self, core)
     }
 
     pub(super) fn react_async<'a, 'f, TySegm>(
         &'f mut self,
         segm_ref: &'f mut TySegm,
-    ) -> DevConsumerReactAsync<'a, 'f, TyOutput, T, TySegm>
+    ) -> DevConsumerReactAsync<'a, 'f, 'f, TyOutput, T, TySegm>
     where
         'a: 'f,
         TySegm: 'a + TrBuffSegmRef<'a, T>,
         T: 'f,
     {
-        DevConsumerReactAsync(self, segm_ref, PhantomData)
+        DevConsumerReactAsync::new(self, segm_ref)
     }
 }
 
@@ -514,18 +514,21 @@ where
 {
     type Data = T;
 
-    type InitAsync<'f, TyCore> = DevProducerInitAsync<'f, TyInput, T, TyCore>
+    type InitAsync<'f, TyCore> =
+        DevProducerInitAsync<'f, 'f, TyInput, T, TyCore>
     where
         Self: 'f,
         TyCore: 'f + TrCircBuffCore<Data = Self::Data>;
 
-    type ReactAsync<'a, 'f, TySegm> = DevProducerReactAsync<'a, 'f, TyInput, T, TySegm>
+    type ReactAsync<'a, 'f, TySegm> =
+        DevProducerReactAsync<'a, 'f, 'f, TyInput, T, TySegm>
     where
         Self: 'f,
         TySegm: 'a + TrBuffSegmMut<'a, Self::Data>,
         'a: 'f;
 
-    type PumpAsync<'f, TyCore> = DevProducerPumpAsync<'f, TyInput, T, TyCore>
+    type PumpAsync<'f, TyCore> =
+        DevProducerPumpAsync<'f, 'f, TyInput, T, TyCore>
     where
         Self: 'f,
         TyCore: 'f + TrCircBuffCore<Data = Self::Data>;
@@ -534,7 +537,7 @@ where
     fn init_async<'f, TyCore>(
         &'f mut self,
         core: &'f TyCore,
-    ) -> DevProducerInitAsync<'f, TyInput, T, TyCore>
+    ) -> DevProducerInitAsync<'f, 'f, TyInput, T, TyCore>
     where
         TyCore: TrCircBuffCore<Data = Self::Data>,
     {
@@ -545,11 +548,11 @@ where
     fn pump_async<'f, TyCore>(
         &'f mut self,
         core: &'f TyCore,
-    ) -> DevProducerPumpAsync<'f, TyInput, T, TyCore>
+    ) -> DevProducerPumpAsync<'f, 'f, TyInput, T, TyCore>
     where
         TyCore: TrCircBuffCore<Data = Self::Data>,
     {
-        DevProducerPumpAsync(self, core)
+        DevProducerPumpAsync::new(self, core)
     }
 
     #[inline]
@@ -594,18 +597,18 @@ where
 {
     type Data = T;
 
-    type InitAsync<'f, C> = DevConsumerInitAsync<'f, O, T, C>
+    type InitAsync<'f, C> = DevConsumerInitAsync<'f, 'f, O, T, C>
     where
         Self: 'f,
         C: 'f + TrCircBuffCore<Data = Self::Data>;
 
-    type ReactAsync<'a, 'f, S> = DevConsumerReactAsync<'a, 'f, O, T, S>
+    type ReactAsync<'a, 'f, S> = DevConsumerReactAsync<'a, 'f, 'f, O, T, S>
     where
         Self: 'f,
         S: 'a + TrBuffSegmRef<'a, Self::Data>,
         'a: 'f;
 
-    type PumpAsync<'f, C> = DevConsumerPumpAsync<'f, O, T, C>
+    type PumpAsync<'f, C> = DevConsumerPumpAsync<'f, 'f, O, T, C>
     where
         Self: 'f,
         C: 'f + TrCircBuffCore<Data = Self::Data>;
@@ -618,18 +621,18 @@ where
     where
         C: TrCircBuffCore<Data = Self::Data>,
     {
-        DevConsumerInitAsync(self, core)
+        DevConsumerInitAsync::new(self, core)
     }
 
     #[inline]
     fn pump_async<'f, C>(
         &'f mut self,
         core: &'f C,
-    ) -> DevConsumerPumpAsync<'f, O, T, C>
+    ) -> DevConsumerPumpAsync<'f, 'f, O, T, C>
     where
         C: TrCircBuffCore<Data = Self::Data>,
     {
-        DevConsumerPumpAsync(self, core)
+        DevConsumerPumpAsync::new(self, core)
     }
 
     #[inline]
@@ -670,17 +673,17 @@ where
     }
 }
 
-#[gen_may_cancel_future(DevProducerInit)]
+#[gen_may_cancel_future(DevProducerInit, pub)]
 async fn dev_producer_init_async_<'f, I, T, C, K>(
     producer: &'f mut DevProducer<I, T>,
     core_ref: &'f C,
-    cancel: &'f mut K,
+    cancel: K,
 ) -> Result<(), ()>
 where
     I: TrInput<T>,
     T: 'static,
     C: TrCircBuffCore<Data = T>,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken,
 {
     if let Some(mut segm_mut) = core_ref.try_write_init() {
         // 构建期只做一次非阻塞探测：设备 Pending 就放弃本轮，不等设备。
@@ -695,24 +698,24 @@ where
     Result::Ok(())
 }
 
-#[gen_may_cancel_future(DevProducerPump)]
+#[gen_may_cancel_future(DevProducerPump, pub)]
 async fn dev_producer_pump_async_<'f, I, T, C, K>(
     producer: &'f mut DevProducer<I, T>,
     core_ref: &'f C,
-    cancel: &'f mut K,
+    cancel: K,
 ) -> usize
 where
     I: TrInput<T>,
     T: 'static,
     C: TrCircBuffCore<Data = T>,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken,
 {
     let mut total = 0usize;
     while let Some(mut segm_mut) = core_ref.try_write_init() {
         let before = segm_mut.least_count();
         let r = producer
             .react_async(&mut segm_mut)
-            .may_cancel_with(cancel)
+            .may_cancel_with(cancel.child_token())
             .await;
         let moved = before - segm_mut.least_count();
         drop(segm_mut); // 提交，触发 fire_consumer
@@ -724,18 +727,18 @@ where
     total
 }
 
-#[gen_may_cancel_future(DevProducerReact)]
+#[gen_may_cancel_future(DevProducerReact, pub)]
 async fn dev_producer_react_async_<'a, 'f, I, T, S, K>(
     producer: &'f mut DevProducer<I, T>,
     segm_mut: &'f mut S,
-    cancel: &'f mut K,
+    cancel: K,
 ) -> ReceiverReact
 where
     'a: 'f,
     I: TrInput<T>,
     T: 'static,
     S: 'a + TrBuffSegmMut<'a, T>,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken,
 {
     let mut moved = 0usize;
     while !segm_mut.is_empty() {
@@ -743,7 +746,7 @@ where
         let x = segm_mut
             .as_segm_mut()
             .move_items_from_input_async(&mut producer.input_, &demand)
-            .may_cancel_with(cancel)
+            .may_cancel_with(cancel.child_token())
             .await;
         // 设备错误：本轮视为无数据。
         if x.as_ref().pick_right().is_some() {
@@ -762,17 +765,17 @@ where
     }
 }
 
-#[gen_may_cancel_future(DevConsumerInit)]
+#[gen_may_cancel_future(DevConsumerInit, pub)]
 async fn dev_consumer_init_async_<'f, O, T, C, K>(
     consumer: &'f mut DevConsumer<O, T>,
     core_ref: &'f C,
-    cancel: &'f mut K,
+    cancel: K,
 ) -> Result<(), ()>
 where
     O: TrOutput<T>,
     T: 'static,
     C: TrCircBuffCore<Data = T>,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken,
 {
     if let Some(mut segm_ref) = core_ref.try_read_init() {
         // 构建期只做一次非阻塞探测：设备 Pending 就放弃本轮，不等设备。
@@ -787,24 +790,24 @@ where
     Result::Ok(())
 }
 
-#[gen_may_cancel_future(DevConsumerPump)]
+#[gen_may_cancel_future(DevConsumerPump, pub)]
 async fn dev_consumer_pump_async_<'f, O, T, C, K>(
     consumer: &'f mut DevConsumer<O, T>,
     core_ref: &'f C,
-    cancel: &'f mut K,
+    cancel: K,
 ) -> usize
 where
     O: TrOutput<T>,
     T: 'static,
     C: TrCircBuffCore<Data = T>,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken,
 {
     let mut total = 0usize;
     while let Some(mut segm_ref) = core_ref.try_read_init() {
         let before = segm_ref.least_count();
         let r = consumer
             .react_async(&mut segm_ref)
-            .may_cancel_with(cancel)
+            .may_cancel_with(cancel.child_token())
             .await;
         let moved = before - segm_ref.least_count();
         drop(segm_ref); // 提交，触发 fire_producer
@@ -816,18 +819,18 @@ where
     total
 }
 
-#[gen_may_cancel_future(DevConsumerReact)]
+#[gen_may_cancel_future(DevConsumerReact, pub)]
 async fn dev_consumer_react_async_<'a, 'f, O, T, S, K>(
     consumer: &'f mut DevConsumer<O, T>,
     segm_ref: &'f mut S,
-    cancel: &'f mut K,
+    cancel: K,
 ) -> ReceiverReact
 where
     'a: 'f,
     O: TrOutput<T>,
     T: 'static,
     S: 'a + TrBuffSegmRef<'a, T>,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken,
 {
     let mut moved = 0usize;
     while !segm_ref.is_empty() {
@@ -835,7 +838,7 @@ where
         let x = segm_ref
             .as_segm_ref()
             .move_items_to_output_async(&mut consumer.output_, &demand)
-            .may_cancel_with(cancel)
+            .may_cancel_with(cancel.child_token())
             .await;
         // 设备错误：本轮视为不能接收。
         if x.as_ref().pick_right().is_some() {

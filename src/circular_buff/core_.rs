@@ -94,7 +94,7 @@ use abs_buff::{
     gen_may_cancel_future,
     x_deps::{anylr, abs_cancel},
 };
-use abs_cancel::{NonCancellableToken, TrCancellationToken, TrMayCancel};
+use abs_cancel::{TrCancellationToken, TrMayCancel};
 use abs_sync::ok_or::XtOkOr;
 
 use anylr::SomeOf;
@@ -331,7 +331,7 @@ where
     _pinning_: PhantomPinned,
 }
 
-/// 设计为只给 SPSC 中的 Consumer<P, C, B, T, A> 或者 Producer<P, C, B, T, A> 
+/// 设计为只给 SPSC 中的 Consumer<P, C, B, T, A> 或者 Producer<P, C, B, T, A>
 /// 调用。实际上不可并发调用。
 impl<C, B, T> CircCore<BufProducer<T>, C, B, T>
 where
@@ -368,8 +368,8 @@ where
     pub fn write_async_<'f>(
         &'f self,
         demand: &'f Demand<usize>,
-    ) -> CorePassiveWriteAsync<'f, C, B, T> {
-        CorePassiveWriteAsync(self, demand)
+    ) -> CorePassiveWriteAsync<'f, 'f, C, B, T> {
+        CorePassiveWriteAsync::new(self, demand)
     }
 
     pub fn on_buf_producer_drop_(&self) {
@@ -418,8 +418,8 @@ where
     pub fn read_async_<'f>(
         &'f self,
         demand: &'f Demand<usize>,
-    ) -> CorePassiveReadAsync<'f, P, B, T> {
-        CorePassiveReadAsync(self, demand)
+    ) -> CorePassiveReadAsync<'f, 'f, P, B, T> {
+        CorePassiveReadAsync::new(self, demand)
     }
 
     pub fn on_buf_consumer_drop_(&self) {
@@ -617,9 +617,7 @@ where
             let mut segm = self.create_write_segm(pos.wp, free);
             let producer = unsafe { &mut *self.producer_.get() };
             let outcome = {
-                let may_fut = producer
-                    .react_async(&mut segm)
-                    .may_cancel_with(NonCancellableToken::shared_mut());
+                let may_fut = producer.react_async(&mut segm);
                 let mut fut = pin!(may_fut.into_future());
                 poll_once(fut.as_mut())
             };
@@ -669,9 +667,7 @@ where
             let mut segm = self.create_read_segm(pos.rp, data);
             let consumer = unsafe { &mut *self.consumer_.get() };
             let outcome = {
-                let may_fut = consumer
-                    .react_async(&mut segm)
-                    .may_cancel_with(NonCancellableToken::shared_mut());
+                let may_fut = consumer.react_async(&mut segm);
                 let mut fut = pin!(may_fut.into_future());
                 poll_once(fut.as_mut())
             };
@@ -691,12 +687,9 @@ where
     /// # 调用上下文
     /// 供被动生产端在关闭 / shutdown 前调用，确保残留数据真正到达输出设备。
     /// 设备 Pending 时本方法会 `await`，由设备自己的 waker 唤醒。
-    async fn drain_output_async_<'f, K>(
-        &'f self,
-        cancel: &'f mut K,
-    )
+    async fn drain_output_async_<K>(&self, cancel: K)
     where
-        K: TrCancellationToken + Clone,
+        K: TrCancellationToken,
     {
         loop {
             if cancel.is_cancelled() {
@@ -705,7 +698,7 @@ where
             let consumer = unsafe { &mut *self.consumer_.get() };
             let moved = consumer
                 .pump_async(self)
-                .may_cancel_with(cancel)
+                .may_cancel_with(cancel.child_token())
                 .await;
             if self.data_size() == 0 && self.is_rx_closed() {
                 break;
@@ -902,12 +895,9 @@ where
     ///
     /// 调用者可通过 `cancel` 中断排空；一旦取消，立即停止排空并返回，
     /// 关闭标志已经设置，最终收尾由调用方 / Drop 路径继续完成。
-    pub(super) async fn close_tx_async<'f, K>(
-        &'f self,
-        cancel: &'f mut K,
-    )
+    pub(super) async fn close_tx_async<K>(&self, cancel: K)
     where
-        K: TrCancellationToken + Clone,
+        K: TrCancellationToken,
     {
         self.close_tx();
         self.drain_output_async_(cancel).await;
@@ -1080,11 +1070,7 @@ where
         // SAFETY: 流水线独占驱动（双主动无其他访问者）；区域不与活段重叠。
         let dst = &mut self.buffer_view_mut()[pos.wp..pos.wp + take];
         let producer = unsafe { &mut *self.producer_.get() };
-        let x = producer
-            .input_mut()
-            .read_async(dst)
-            .may_cancel_with(NonCancellableToken::shared_mut())
-            .await;
+        let x = producer.input_mut().read_async(dst).await;
         let n = x.pick_left().unwrap_or(0);
         if n == 0 {
             return 0; // 设备暂无数据 / 错误
@@ -1113,7 +1099,6 @@ where
         let x = consumer
             .output_mut()
             .write_async(src)
-            .may_cancel_with(NonCancellableToken::shared_mut())
             .await;
         let n = x.pick_left().unwrap_or(0);
         if n == 0 {
@@ -1342,11 +1327,11 @@ use super::circ_buff_::{BufConsumer, BufProducer, DevConsumer, DevProducer};
 /// - 若对端是主动端，`pump_async` 会在这里 await 设备；若对端是被动端，
 ///   它返回 0，本函数进入普通被动 park；
 /// - 被 `fire_consumer` 唤醒后回到循环，重新尝试读取。
-#[gen_may_cancel_future(CorePassiveRead)]
+#[gen_may_cancel_future(CorePassiveRead, pub)]
 async fn core_passive_read_async_<'f, P, B, T, C>(
     core: &'f CircCore<P, BufConsumer<T>, B, T>,
     demand: &'f Demand<usize>,
-    cancel: &'f mut C,
+    cancel: C,
 ) -> SomeOf<
     ReclSliceRef<'f, T, ReaderReclaim<'f, CircCore<P, BufConsumer<T>, B, T>>>,
     ConsumerError<usize>,
@@ -1355,7 +1340,7 @@ where
     P: Send + Sync + TrProducer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
     T: Send + Sync + 'static,
-    C: TrCancellationToken + Clone,
+    C: TrCancellationToken,
 {
     loop {
         let x = core.try_read_(demand);
@@ -1371,7 +1356,10 @@ where
         // 主动端会在这里 await 设备，设备 Pending 时由设备自己的 waker 唤醒。
         {
             let producer = unsafe { &mut *core.producer_.get() };
-            let moved = producer.pump_async(core).may_cancel_with(cancel).await;
+            let moved = producer
+                .pump_async(core)
+                .may_cancel_with(cancel.child_token())
+                .await;
             if moved > 0 {
                 continue;
             }
@@ -1412,7 +1400,7 @@ where
             Poll::Pending
         });
         // 守卫在此已被 drop：槽位注销、armed 清除、demand 复位。
-        if res.ok_or(cancel.cancellation()).await.is_err() {
+        if res.ok_or(cancel.child_token().cancellation()).await.is_err() {
             return SomeOf::new_right(ConsumerError::Cancelled);
         }
         // 被唤醒后回到循环，重新检查 / 再次 pump_async。
@@ -1426,11 +1414,11 @@ where
 /// - 若对端是主动端，`pump_async` 会在这里 await 设备；若对端是被动端，
 ///   它返回 0，本函数进入普通被动 park；
 /// - 被 `fire_producer` 唤醒后回到循环，重新尝试写入。
-#[gen_may_cancel_future(CorePassiveWrite)]
+#[gen_may_cancel_future(CorePassiveWrite, pub)]
 async fn core_passive_write_async_<'f, K, B, T, C>(
     core: &'f CircCore<BufProducer<T>, K, B, T>,
     demand: &'f Demand<usize>,
-    cancel: &'f mut C,
+    cancel: C,
 ) -> SomeOf<
     ReclSliceMut<'f, T, WriterReclaim<'f, CircCore<BufProducer<T>, K, B, T>>>,
     ProducerError<usize>,
@@ -1439,7 +1427,7 @@ where
     K: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
     T: Send + Sync + 'static,
-    C: TrCancellationToken + Clone,
+    C: TrCancellationToken,
 {
     loop {
         let x = core.try_write_(demand);
@@ -1455,7 +1443,10 @@ where
         // 主动端会在这里 await 设备，设备 Pending 时由设备自己的 waker 唤醒。
         {
             let consumer = unsafe { &mut *core.consumer_.get() };
-            let moved = consumer.pump_async(core).may_cancel_with(cancel).await;
+            let moved = consumer
+                .pump_async(core)
+                .may_cancel_with(cancel.child_token())
+                .await;
             if moved > 0 {
                 continue;
             }
@@ -1496,7 +1487,7 @@ where
             Poll::Pending
         });
         // 守卫在此已被 drop：槽位注销、armed 清除、demand 复位。
-        if res.ok_or(cancel.cancellation()).await.is_err() {
+        if res.ok_or(cancel.child_token().cancellation()).await.is_err() {
             return SomeOf::new_right(ProducerError::Cancelled);
         }
         // 被唤醒后回到循环，重新检查 / 再次 pump_async。

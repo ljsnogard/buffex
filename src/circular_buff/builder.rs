@@ -506,19 +506,20 @@ where
     /// 补位）；被动生产 × 主动消费 → 仅生产端半部（写入即自动驱动输出泵排空）；
     /// 主动 × 主动 → [`Pipeline`]（流水线 future：交给运行时 spawn 后持续
     /// 由两端设备驱动流动，直到一端出错 / 关闭或调用者请求断开）。
-    pub fn build_async<'f>(&'f mut self) -> EssentialBuildAsync<'f, P, C, B, T, A>
+    pub fn build_async<'f>(&'f mut self) -> EssentialBuildAsync<'f, 'f, P, C, B, T, A>
     where
         (): BuildOutcome<P, C, B, T, A>,
     {
         let es = self.essential_.as_mut().expect("");
-        EssentialBuildAsync(es)
+        EssentialBuildAsync::new(es)
     }
 }
 
-#[gen_may_cancel_future(EssentialBuild)]
+#[allow(clippy::needless_lifetimes)]
+#[gen_may_cancel_future(EssentialBuild, pub)]
 async fn essential_build_async_<'f, P, C, B, T, A, K>(
     essential: &'f mut BuildEssential<P, C, B, T, A>,
-    cancel: &'f mut K,
+    cancel: K,
 ) -> Result<
         <() as BuildOutcome<P, C, B, T, A>>::Output,
         BuilderError<()>>
@@ -529,7 +530,7 @@ where
     T: Send + Sync + 'static,
     A: Send + Sync + TrMalloc + Clone,
     (): BuildOutcome<P, C, B, T, A>,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken,
 {
     let producer = essential.producer_.take().expect("");
     let consumer = essential.consumer_.take().expect("");
@@ -546,7 +547,7 @@ where
             .producer_ptr()
             .as_mut()
             .init_async(&core)
-            .may_cancel_with(cancel)
+            .may_cancel_with(cancel.child_token())
             .await;
         if init_producer.is_err() {
             return Result::Err(BuilderError::ProducerInit);
@@ -555,7 +556,7 @@ where
             .consumer_ptr()
             .as_mut()
             .init_async(&core)
-            .may_cancel_with(cancel)
+            .may_cancel_with(cancel.child_token())
             .await;
         if init_consumer.is_err() {
             return Result::Err(BuilderError::ConsumerInit);

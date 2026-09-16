@@ -210,24 +210,18 @@ impl core::future::Future for BlockingRead<'_> {
     }
 }
 
-impl<'f> TrMayCancel<'f> for BlockingRead<'f> {
-    type MayCancelFuture<'g, C> = BlockingRead<'f>
+impl<'a> TrMayCancel<'a> for BlockingRead<'a> {
+    type MayCancelFuture<'f, C> = BlockingRead<'a>
     where
-        Self: 'g,
-        C: TrCancellationToken + Clone,
-        C: 'f,
-        C: 'g,
-        'g: 'f;
+        'f: 'a,
+        Self: 'f,
+        C: 'f + TrCancellationToken;
+
     type MayCancelOutput = SomeOf<usize, TestErr>;
 
-    fn may_cancel_with<'g, C>(
-        self,
-        _cancel: &'g mut C,
-    ) -> Self::MayCancelFuture<'g, C>
+    fn may_cancel_with<C>(self, _: C) -> Self::MayCancelFuture<'a, C>
     where
-        Self: 'g,
-        'g: 'f,
-        C: TrCancellationToken + Clone,
+        C: 'a + TrCancellationToken,
     {
         self
     }
@@ -580,24 +574,18 @@ impl core::future::Future for DualHeadRead<'_> {
     }
 }
 
-impl<'f> TrMayCancel<'f> for DualHeadRead<'f> {
-    type MayCancelFuture<'g, C> = DualHeadRead<'f>
+impl<'a> TrMayCancel<'a> for DualHeadRead<'a> {
+    type MayCancelFuture<'f, C> = DualHeadRead<'f>
     where
-        Self: 'g,
-        C: TrCancellationToken + Clone,
-        C: 'f,
-        C: 'g,
-        'g: 'f;
+        'f: 'a,
+        Self: 'f,
+        C: 'f + TrCancellationToken;
+
     type MayCancelOutput = SomeOf<usize, TestErr>;
 
-    fn may_cancel_with<'g, C>(
-        self,
-        _cancel: &'g mut C,
-    ) -> Self::MayCancelFuture<'g, C>
+    fn may_cancel_with<C>(self, _: C) -> Self::MayCancelFuture<'a, C>
     where
-        Self: 'g,
-        'g: 'f,
-        C: TrCancellationToken + Clone,
+        C: 'a + TrCancellationToken,
     {
         self
     }
