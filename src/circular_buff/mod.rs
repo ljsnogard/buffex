@@ -225,7 +225,7 @@ mod abs_comp_;
 mod circ_buff_;
 mod core_;
 mod error_;
-pub mod reclaim_;
+mod reclaim_;
 mod spsc_;
 
 pub mod builder;
@@ -233,7 +233,7 @@ pub use circ_buff_::{
     BufConsumer, BufProducer, DevConsumer, DevProducer,
 };
 pub use error_::{ConsumerError, ProducerError};
-pub use reclaim_::{ReclSliceMut, ReclSliceRef};
+pub use reclaim_::{NoReclaim, ReclSliceMut, ReclSliceRef, ReclPeekRef};
 pub use spsc_::{Consumer, Producer, Pipeline, SpscPair};
 
 

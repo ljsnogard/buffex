@@ -344,19 +344,15 @@ where
         &'f self,
         demand: &'f Demand<usize>,
     ) -> SomeOf<ReclSliceMut<'f, T, WriterReclaim<'f, Self>>, ProducerError<usize>> {
-        let x: SomeOf<
-            ReclSliceMut<'_, T, WriterReclaim<'_, Self>>,
-            ProducerError<usize>,
-        > = self
+        let x = self
             .try_write_at(demand)
-            .map(|(start, take)| self.create_write_segm(start, take))
-            .into();
-        if x.contains_left() {
-            return x;
+            .map(|(start, take)| self.create_write_segm(start, take));
+        if x.is_ok() {
+            return x.into();
         };
-        let err = x.as_ref().pick_right().expect("");
+        let err = x.as_ref().err().expect("");
         if err.err_tag().should_terminate() {
-            return x;
+            return x.into();
         };
         // 对端主动消费时，先非阻塞排空一轮，再重试写入。
         self.pump_output_sync();
@@ -385,7 +381,6 @@ where
 impl<P, B, T> CircCore<P, BufConsumer<T>, B, T>
 where
     P: Send + Sync + TrProducer<Data = T>,
-    // C: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
     T: Send + Sync,
 {
@@ -394,19 +389,15 @@ where
         demand: &'f Demand<usize>,
     ) -> SomeOf<ReclSliceRef<'f, T, ReaderReclaim<'f, Self>>, ConsumerError<usize>> {
         // #[allow(clippy::type_complexity)]
-        let x: SomeOf<
-            ReclSliceRef<'_, T, ReaderReclaim<'_, Self>>,
-            ConsumerError<usize>,
-        > = self
+        let x = self
             .try_read_at(demand)
-            .map(|(start, take)| self.create_read_segm(start, take))
-            .into();
-        if x.contains_left() {
-            return x;
+            .map(|(start, take)| self.create_read_segm(start, take));
+        if x.is_ok() {
+            return x.into();
         };
-        let err = x.as_ref().pick_right().expect("");
+        let err = x.as_ref().err().expect("");
         if err.err_tag().should_terminate() {
-            return x;
+            return x.into();
         };
         // 对端主动生产时，先非阻塞补入一轮，再重试读取。
         self.pump_input_sync();

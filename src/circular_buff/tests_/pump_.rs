@@ -162,6 +162,7 @@ struct BlockingInput {
 }
 
 impl BlockingInput {
+    #[allow(clippy::type_complexity)]
     fn new() -> (
         Self,
         std::sync::Arc<std::sync::Mutex<Vec<u8>>>,

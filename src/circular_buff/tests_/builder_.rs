@@ -11,7 +11,6 @@
 //! 必须产生与原有链完全一致的结果。
 
 use std::{
-    mem::MaybeUninit,
     pin::pin,
     sync::atomic::Ordering,
     vec,
@@ -19,20 +18,14 @@ use std::{
 };
 
 use abs_buff::{Demand, TrBuffTryRead, TrBuffTryWrite,};
-use abs_mm::mem_alloc::CoreAlloc;
-use mm_ptr::Owned;
 
 use crate::circular_buff::{
-    ReclSliceRef,
     builder,
-    core_::CircCore,
-    reclaim_::ReaderReclaim,
     tests_::{
         DefaultBuilder, Pair, TestInput, TestOutput, TestWaker, fill_segm,
         poll_once, take_segm,
     },
 };
-use crate::x_deps::{abs_mm, mm_ptr};
 
 /// 默认双端被动：不 pipe 任何设备，`with_capacity(...).build_async()` 直接得到
 /// 一对可用的 Producer / Consumer（经典手动管道）。
@@ -194,12 +187,10 @@ fn consumer_passive_then_pipe_from_input() {
     loop {
         let demand = Demand::at_least(1);
         let some = TrBuffTryRead::try_read(&mut rx, &demand);
-        let mut rs: ReclSliceRef<'_, u8,
-            ReaderReclaim<'_, CircCore<_, _, Owned<[MaybeUninit<u8>], CoreAlloc>>>> =
-            match some.pick_left() {
-                Some(s) => s,
-                None => break,
-            };
+        let mut rs = match some.pick_left() {
+            Some(s) => s,
+            None => break,
+        };
         let n = rs.least_count();
         total.extend(take_segm(&mut rs, n));
         drop(rs);
