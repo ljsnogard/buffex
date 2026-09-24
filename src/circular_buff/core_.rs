@@ -463,7 +463,7 @@ where
 
     /// 当前可读数据量。
     #[inline]
-    pub(super) fn data_size(&self) -> usize {
+    pub(crate) fn data_size(&self) -> usize {
         let state = self.atm_stat_.value();
         let pos = IoPos::unpack(state, self.capacity());
         pos.data_size()
