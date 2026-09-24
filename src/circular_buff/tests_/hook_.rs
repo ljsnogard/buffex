@@ -162,3 +162,49 @@ async fn read_async_returns_closing_on_eof_() {
 }
 
 dual_runtime_test_!(read_async_returns_closing_on_eof_);
+
+/// 测试 `close()` 会**唤醒**已 park 的被动读者（用计数 waker 当量具）。
+///
+/// - 测试目标：写端关闭必须 signal 已挂起的读等待——这正是 `BufConsumer::check`
+///   漏掉 `ProducerClose` 的 signal 时坏掉的行为。
+/// - 测试手段：在**真实运行时**里建好半部对（构造 `.await`）；随后**手动** poll 一次
+///   读等待，配一个会置位的 [`super::TestWaker`]。这里 waker 是**量具**而不是驱动器：
+///   被观测的是「实现有没有 signal」这一实现细节（真实运行时的 waker 无法计数）。
+///   然后调用 `close()`，检查标志位。
+/// - 判定标准：首次 poll 为 `Pending`；`close()` 之后标志位被置起；再次 poll 立即就绪
+///   且返回 [`ConsumerError::Closing`]。
+async fn close_wakes_parked_reader_via_wakeslot_() {
+    use core::{
+        future::{Future, IntoFuture},
+        pin::pin,
+        task::{Context, Poll},
+    };
+    use std::sync::atomic::Ordering;
+
+    let (mut tx, mut rx) = make_pair_::<8>().await;
+
+    let demand = Demand::at_least(3);
+    let mut read = pin!(rx.read_async(&demand).into_future());
+    let (waker, flag) = super::TestWaker::make_waker_tuple();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(
+        matches!(read.as_mut().poll(&mut cx), Poll::Pending),
+        "空环上读等待应先 park"
+    );
+    assert!(!flag.load(Ordering::Acquire), "尚未关闭，不应被唤醒");
+
+    tx.close();
+
+    assert!(
+        flag.load(Ordering::Acquire),
+        "close() 必须 signal 已 park 的被动读者（BufConsumer::check 的 ProducerClose 分支）"
+    );
+    let res = match read.as_mut().poll(&mut cx) {
+        Poll::Ready(res) => res,
+        Poll::Pending => panic!("被唤醒后应立即就绪"),
+    };
+    assert!(matches!(res.pick_right(), Some(ConsumerError::Closing)));
+}
+
+dual_runtime_test_!(close_wakes_parked_reader_via_wakeslot_);
