@@ -12,9 +12,16 @@
 #[cfg(test)]
 extern crate std;
 
+// `channels` 用 `alloc` 侧容器承载**等待队列**（`atomic_sync` 的协作式锁 / 自旋
+// 锁内部会分配等待节点），消息本身仍存放在 `circular_buff` 的环形缓冲里。
+// `alloc` 只是语言层面的 crate，最终是否需要分配器由链接方决定。
+extern crate alloc;
+
+pub mod channels;
 pub mod circular_buff;
 
 pub mod x_deps {
+    pub use abs_async_iter;
     pub use abs_buff;
     pub use abs_buff::x_deps::{abs_cancel, anylr};
     pub use atomic_sync;

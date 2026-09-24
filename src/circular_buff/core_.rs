@@ -457,7 +457,7 @@ where
     // ------------------------------------------------------------------
 
     #[inline]
-    pub(super) fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         self.buffer_.borrow().len()
     }
 
@@ -471,7 +471,7 @@ where
 
     /// 当前可写空间量。
     #[inline]
-    pub(super) fn free_size(&self) -> usize {
+    pub(crate) fn free_size(&self) -> usize {
         let state = self.atm_stat_.value();
         let pos = IoPos::unpack(state, self.capacity());
         pos.free_size()

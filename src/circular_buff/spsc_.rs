@@ -131,6 +131,16 @@ where
         self.core_ref_.free_size()
     }
 
+    /// 核心的共享句柄（供 crate 内其它模块在**不借用半部**的前提下保活核心）。
+    ///
+    /// `channels` 需要它：写段被交给调用者后仍要保证核心存活（见
+    /// `channels::mpsc_` 对产出物生命周期的说明），而把半部本身借出去会与
+    /// `try_write` 的 `&mut self` 冲突。
+    #[inline]
+    pub(crate) fn core_ref_of_(&self) -> CoreRef<BufProducer<T>, C, B, T, A> {
+        self.core_ref_.clone()
+    }
+
     /// 当前可读数据量（观察用）。
     pub fn data_size(&self) -> usize {
         self.core_ref_.data_size()

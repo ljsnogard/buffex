@@ -221,11 +221,14 @@
 //! （内核）两侧的管道；`CircularBuff` 面向**构造期固定模式与设备**、由 hook
 //! 联动的唤醒式缓冲。规划上 `ring_buffer` 将来会被 `CircularBuff` 取代。
 
-mod abs_comp_;
+// `pub(crate)`：`crate::channels` 需要复用写段 / 读段的提交器类型与两个端契约
+// trait（`Producer` / `Consumer` 的公开 impl 块本就带这些约束，但它们的名字在这个
+// 私有模块里）。对外仍不可达——`circ_buff_` / `error_` / `builder` 才是公开面。
+pub(crate) mod abs_comp_;
 mod circ_buff_;
-mod core_;
+pub(crate) mod core_;
 mod error_;
-mod reclaim_;
+pub(crate) mod reclaim_;
 mod spsc_;
 
 pub mod builder;
