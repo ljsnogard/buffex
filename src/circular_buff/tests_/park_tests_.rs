@@ -8,7 +8,7 @@
 //! `Pending`；对端提交触发 hook 唤醒后重查条件。本模块测试等待侧的两个不变量：
 //!
 //! 1. **park 返回 Pending**：需求不满足（空环读 / 可写空间不足）时，等待
-//!    future 必须挂起（`Poll::Pending`），且 demand 已登记、waker 已注册；
+//!    future 必须挂起，且 demand 已登记、waker 已注册；
 //! 2. **drop 收尾可重入**：等待 future 被 drop（取消）后，必须注销槽位并
 //!    复位 demand——否则下一次 park 的 `try_set_demand`（CAS null → 非空）
 //!    会失败（触发「并发调用」断言），或 `WakeSlot::register` 因槽位残留
@@ -16,124 +16,124 @@
 //!
 //! # 构造与判定
 //!
-//! * **构造**：经公共半部链（`Consumer::read_async` / `Producer::write_async`
-//!   → `gen_may_cancel_future` 生成的 future → `core_passive_*_async_`）驱动
-//!   被测函数；用 [`poll_once`] 轮询、[`TestWaker`] 提供 waker。
-//! * **判定**：第一次 park 必须 `Pending`；drop 后**再次 park 必须同样
-//!   `Pending`**——若收尾缺失，第二次 park 会 panic（demand 未复位）或死锁
-//!   （槽位未注销、`register` 自旋），测试即失败。连续两次 poll（spurious
-//!   唤醒）也必须保持 `Pending` 且不报错（`register` 幂等）。
+//! 用例一律写成 `async fn`，由
+//! [`dual_runtime_test_`](crate::test_support_::dual_runtime_test_) 在 **tokio** 与
+//! **compio** 两种**真实运行时**下各跑一遍；不 `block_on`、不手动构造 waker。
+//!
+//! * **park 的观测**：等待 future 无法用 `await` 观察到「挂起」这一中间态，
+//!   于是用 `futures_util::future::select(等待, 让出一次)`——`select` 按
+//!   **左优先**顺序在同一运行时任务内先轮询等待 future（它因此登记 demand、
+//!   注册**运行时提供的** waker 并返回 `Pending`），随后让出侧完成并胜出。
+//!   `select` 返回右侧即证明等待 future 此刻确实挂起；返回的未完成 future
+//!   随即被 drop（模拟取消、且不唤醒），这正是原先「先 poll 断言 `Pending`
+//!   再 drop」的等价形态。
+//! * **可重入的观测**：紧接着**再**做一次同样的 park——若 drop 收尾缺失，
+//!   第二次 park 会 panic（demand 未复位）或死锁（槽位未注销、`register`
+//!   自旋）。
+//! * **唤醒的观测**：读侧最后用 `futures_util::join!` 让「读等待」与「先让出
+//!   一次、再提交写入」真实并发，断言数据最终送达——waker 由运行时驱动。
 
-use std::pin::pin;
+use std::vec;
 
-use abs_buff::Demand;
+use abs_buff::{Demand, TrBuffTryWrite};
 
-use super::{
-    DefaultBuilder, TestWaker, Pair, poll_once,
-};
+use super::{DefaultBuilder, Pair, fill_segm, take_segm};
+use crate::test_support_::dual_runtime_test_;
 
 /// 构建一个容量 `N` 的被动 × 被动半部对（测试辅助）。
 ///
-/// `build` 已改为异步（`build_async`）：同步测试用
-/// `futures_lite::future::block_on` 驱动构建 future 到完成。
-fn make_pair<const N: usize>() -> Pair {
+/// `build_async` 在真实运行时里被 `.await` 驱动到完成。
+async fn make_pair_<const N: usize>() -> Pair {
     let mut ready = DefaultBuilder::with_capacity(N)
         .unwrap()
         .producer_passive()
         .consumer_passive();
-    futures_lite::future::block_on(ready.build_async().into_future()).unwrap()
+    ready.build_async().await.unwrap()
 }
 
-/// # 被测约定
-/// 读侧 park：空环上 `read_async` 无法满足需求（`Drained` 且未关闭），必须
-/// 挂起为 `Pending`——demand 登记进 `BufConsumer`、waker 注册进其唤醒槽位；
-/// 对端写入提交触发 hook 后才会被唤醒。
+/// 把等待 future 驱动到「首次挂起」后原样 drop（模拟取消，且不唤醒）。
 ///
-/// # 构造
-/// 空环（`cap = 8`，未写入任何数据）上请求 `Demand::at_least(1)`；经
-/// `rx.read_async(&demand)` 的完整生成 future 链驱动到 `core_passive_read_async_`。
-/// 轮询一次断言挂起；随后**不唤醒直接 drop**（模拟取消）；再新建一个等待
-/// future 重复同样的 park。
-///
-/// # 判定
-/// (1) 第一次 poll 为 `Pending`；(2) drop 后再 park 仍为 `Pending` 且不
-/// panic / 不死锁——这验证 drop 收尾确实注销了槽位并复位了 demand
-/// （否则第二次 `try_set_demand` 触发 `unreachable!`，或 `register` 因残留
-/// 指针自旋）。
-#[test]
-fn read_async_parks_on_empty_and_reparks_after_drop() {
-    let (mut _tx, mut rx) = make_pair::<8>();
+/// 手段：`select(等待, 让出一次)` 左优先——等待 future 必先被轮询一次
+/// （登记 demand、注册运行时 waker），让出侧随后完成并胜出。
+/// 返回 `true` 表示等待 future 确实处于挂起态（未被唤醒、未就绪）；
+/// 未完成的 future 在 `select` 结果离开作用域时被 drop。
+async fn park_then_drop_<F>(fut: F) -> bool
+where
+    F: core::future::Future,
+{
+    let stop = async { futures_lite::future::yield_now().await };
+    futures_util::pin_mut!(fut, stop);
+    matches!(
+        futures_util::future::select(fut, stop).await,
+        futures_util::future::Either::Right(_)
+    )
+}
 
-    // 第一次等待：空环 → Pending。用内层作用域让 future（含 pin! 的隐藏
-    // 局部）在离开作用域时被 drop，从而触发守卫的 drop 收尾。
+/// 读侧 park：空环上 `read_async` 无法满足需求（`Drained` 且未关闭）时必须
+/// 挂起；drop（取消）后必须能**再次** park；随后对端写入要能通过运行时 waker
+/// 把它唤醒并交付数据。
+/// - 手段：连续两次「park 后 drop」，再用 `join!` 让第三次读等待与「先让出
+///   一次、再写入 1 字节」并发。
+/// - 判断：(1) 两次 park 都挂起——第二次成功即证明 drop 收尾注销了槽位并复位
+///   demand（否则 panic 或死锁）；(2) 第三次读到 `[42]`。
+async fn read_async_parks_on_empty_and_reparks_after_drop_() {
+    let (mut tx, mut rx) = make_pair_::<8>().await;
     let demand = Demand::at_least(1);
-    {
-        let fut = rx.read_async(&demand);
-        let mut fut = pin!(fut.into_future());
-        let (waker, _flag) = TestWaker::make_waker_tuple();
-        assert!(
-            poll_once(fut.as_mut(), &waker).is_pending(),
-            "空环上读等待必须挂起（需求未满足）"
-        );
-        // spurious 轮询：waker 未变、条件未变，仍应 Pending（register 幂等）。
-        assert!(
-            poll_once(fut.as_mut(), &waker).is_pending(),
-            "条件未变时重复轮询仍应 Pending"
-        );
-    } // 取消：守卫注销槽位 + 复位 demand。
 
-    // 第二次等待：能再次 park，说明第一次的收尾完整。
-    let demand = Demand::at_least(1);
-    {
-        let fut = rx.read_async(&demand);
-        let mut fut = pin!(fut.into_future());
-        let (waker, _flag) = TestWaker::make_waker_tuple();
-        assert!(
-            poll_once(fut.as_mut(), &waker).is_pending(),
-            "drop 后再次读等待仍应能 park（demand 已复位、槽位已注销）"
-        );
-    }
+    // 第一次 park：空环 → 必须挂起；随后原样 drop（取消，且不唤醒）。
+    assert!(
+        park_then_drop_(rx.read_async(&demand).into_future()).await,
+        "空环上读等待必须挂起（需求未满足）"
+    );
+
+    // 第二次 park：仍应挂起，说明第一次的收尾完整。
+    assert!(
+        park_then_drop_(rx.read_async(&demand).into_future()).await,
+        "drop 后再次读等待仍应能 park（demand 已复位、槽位已注销）"
+    );
+
+    // 第三次：真正由对端写入唤醒——验证 park 之后确实收到数据。
+    let read = async {
+        let res = rx.read_async(&demand).await;
+        let mut rs = res.pick_left().expect("写入后读等待应成功");
+        assert_eq!(take_segm(&mut rs, 1), vec![42]);
+    };
+    let write = async {
+        // 先让出一次，确保读者已经挂起并注册 waker。
+        futures_lite::future::yield_now().await;
+        let demand = Demand::at_least(1);
+        let mut ws = TrBuffTryWrite::try_write(&mut tx, &demand)
+            .pick_left()
+            .expect("应可写");
+        fill_segm(&mut ws, &[42]);
+        drop(ws); // 提交 → 触发消费端 hook 唤醒读者
+    };
+    let ((), ()) = futures_util::join!(read, write);
 }
 
-/// # 被测约定
-/// 写侧 park：可写空间不足需求下限（`Stuffed` 且未关闭）时，`write_async`
-/// 必须挂起为 `Pending`——demand 登记进 `BufProducer`、waker 注册进其唤醒
-/// 槽位；对端读取提交释放空间后触发 hook 才会被唤醒。
-///
-/// # 构造
-/// 空环（`cap = 8`，可写空间 8）上请求 `Demand::at_least(9)`——下限超过
-/// 当前可写空间，`try_write_at` 返回 `Stuffed`（非终止错误），进入 park。
-/// 经 `tx.write_async(&demand)` 的完整生成 future 链驱动到
-/// `core_passive_write_async_`；轮询断言挂起后 drop，再重复一次 park。
-///
-/// # 判定
-/// 同读侧：(1) 第一次 poll 为 `Pending`；(2) drop 后再次 park 仍为 `Pending`
-/// 且不 panic / 不死锁——验证写侧 drop 收尾（注销槽位 + 复位 demand）完整。
-#[test]
-fn write_async_parks_when_space_insufficient_and_reparks_after_drop() {
-    let (mut tx, mut _rx) = make_pair::<8>();
+dual_runtime_test_!(read_async_parks_on_empty_and_reparks_after_drop_);
 
-    // 第一次等待：free=8 < 9 → Pending。
+/// 写侧 park：可写空间不足需求下限（`Stuffed` 且未关闭）时 `write_async` 必须
+/// 挂起；drop（取消）后必须能**再次** park。
+/// - 手段：容量 8（可写空间 8）上请求 `Demand::at_least(9)`（下限超过容量，
+///   永远无法在本地满足，因此只观察 park / 可重入），连续两次「park 后 drop」。
+/// - 判断：两次 park 都挂起——第二次成功即验证写侧 drop 收尾（注销槽位 +
+///   复位 demand）完整。
+async fn write_async_parks_when_space_insufficient_and_reparks_after_drop_() {
+    let (mut tx, mut _rx) = make_pair_::<8>().await;
     let demand = Demand::at_least(9);
-    {
-        let fut = tx.write_async(&demand);
-        let mut fut = pin!(fut.into_future());
-        let (waker, _flag) = TestWaker::make_waker_tuple();
-        assert!(
-            poll_once(fut.as_mut(), &waker).is_pending(),
-            "可写空间不足下限时写等待必须挂起"
-        );
-    } // 取消：守卫注销槽位 + 复位 demand。
 
-    // 第二次等待：能再次 park，说明第一次的收尾完整。
-    let demand = Demand::at_least(9);
-    {
-        let fut = tx.write_async(&demand);
-        let mut fut = pin!(fut.into_future());
-        let (waker, _flag) = TestWaker::make_waker_tuple();
-        assert!(
-            poll_once(fut.as_mut(), &waker).is_pending(),
-            "drop 后再次写等待仍应能 park"
-        );
-    }
+    // 第一次 park：free = 8 < 9 → 必须挂起；随后原样 drop（取消，且不唤醒）。
+    assert!(
+        park_then_drop_(tx.write_async(&demand).into_future()).await,
+        "可写空间不足下限时写等待必须挂起"
+    );
+
+    // 第二次 park：仍应挂起，说明第一次的收尾完整。
+    assert!(
+        park_then_drop_(tx.write_async(&demand).into_future()).await,
+        "drop 后再次写等待仍应能 park"
+    );
 }
+
+dual_runtime_test_!(write_async_parks_when_space_insufficient_and_reparks_after_drop_);

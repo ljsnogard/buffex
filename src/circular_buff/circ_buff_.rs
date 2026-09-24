@@ -475,22 +475,34 @@ where
     }
 
     fn check(&self, event: ConsumerHookEvent) -> bool {
-        let ConsumerHookEvent::Available(ready) = event else {
-            return true;
-        };
-        if ready == 0 {
-            return false;
-        }
-        let Option::Some(demand_ptr) = self.buf_obsv_.demand_.load() else {
-            return false;
-        };
-        let demand = unsafe { demand_ptr.as_ref() };
-        let min = demand.min().copied().unwrap_or(0);
-        if ready >= min {
-            self.wakeslot_.signal();
-            true
-        } else {
-            false
+        match event {
+            // 写端关闭：必须唤醒挂在槽位上的被动读者。
+            //
+            // 它唤醒后才会重查状态并看到 EOF（`ConsumerError::Closing`），也才会把
+            // 关闭前已提交的残留数据取走。此前这里对非 `Available` 事件直接
+            // `return true` 而**没有 signal**，于是 `Producer::close()` 唤不醒被动
+            // 读者——读者永久挂起。对照主动消费者 `DevConsumer::check`：它对
+            // `ProducerClose` 明确感兴趣并 signal（「写端关闭后必须把残留数据排空」）。
+            ConsumerHookEvent::ProducerClose(_) => {
+                self.wakeslot_.signal();
+                true
+            }
+            ConsumerHookEvent::Available(ready) => {
+                if ready == 0 {
+                    return false;
+                }
+                let Option::Some(demand_ptr) = self.buf_obsv_.demand_.load() else {
+                    return false;
+                };
+                let demand = unsafe { demand_ptr.as_ref() };
+                let min = demand.min().copied().unwrap_or(0);
+                if ready >= min {
+                    self.wakeslot_.signal();
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 

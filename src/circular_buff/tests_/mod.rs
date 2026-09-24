@@ -2,16 +2,23 @@
 //!
 //! * [`sync_`]——被动 × 被动：读写往返、`Demand` 语义、跨末端环绕、异步等待；
 //! * [`pump_`]——主动模式：输入泵、输出泵、全主动流水线；
-//! * [`socket_pump_`]——真实 tokio socket 接入：被动生产 × 主动消费的数据滞留
-//!   （`#[ignore]`）、全被动环 + 调用方泵（可用）、主动生产 × 被动消费的泵停滞
-//!   （`#[ignore]`）；
+//! * [`socket_pump_`]——真实 tokio socket 接入（**仅 tokio**）：被动生产 × 主动
+//!   消费的数据滞留（`#[ignore]`）、全被动环 + 调用方泵（可用）、主动生产 ×
+//!   被动消费的泵停滞（`#[ignore]`）；
 //! * [`hook_`]——关闭 / EOF 事件与被动唤醒；
 //! * [`builder_`]——构建器顺序灵活性：两端任意换序、`pipe_between`、
 //!   默认双端被动；
 //! * [`pos_tests_`]——`IoPos` 位置状态（REVERSION 约定）的单元测试。
 //!
+//! 需要异步的用例一律写成普通 `async fn`，经
+//! [`dual_runtime_test_`](crate::test_support_::dual_runtime_test_) 在 **tokio** 与
+//! **compio** 两种**真实运行时**下各跑一遍；不 `block_on`、不手动构造 waker
+//! 轮询。
+//!
 //! 本文件提供测试共用的辅助：测试设备（[`TestInput`] / [`TestOutput`]）、
-//! 段操作（[`fill_segm`] / [`take_segm`]）与最小执行器。
+//! 段操作（[`fill_segm`] / [`take_segm`]）与唤醒接收端（[`TestWaker`]）。后者
+//! 只在 `pump_` 的**同步**唤醒协议用例（`dev_wakeslot_and_stndby_protocol`）里
+//! 充当「唤醒标志位」的接收者，不用于轮询任何 future。
 
 mod builder_;
 mod hook_;
@@ -21,13 +28,13 @@ mod pump_;
 mod socket_pump_;
 mod sync_;
 
-use core::{mem::MaybeUninit, pin::Pin};
+use core::mem::MaybeUninit;
 use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    task::{Context, Poll, Wake, Waker},
+    task::{Wake, Waker},
     vec::Vec,
 };
 
@@ -110,14 +117,17 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// 最小执行器（异步等待测试用）
+// 唤醒接收端（同步唤醒协议用例）
 // ---------------------------------------------------------------------------
 
 /// 测试 waker：唤醒时置位一个 `AtomicBool`。
+///
+/// 仅用于**同步**观察 `WakeSlot::signal` 是否唤醒已注册的等待者
+/// （`pump_::dev_wakeslot_and_stndby_protocol`），不用于轮询 future。
 pub(super) struct TestWaker(Arc<AtomicBool>);
 
 impl TestWaker {
-    /// 创建 waker 与其唤醒标志（测试轮询后检查标志以确认被唤醒）。
+    /// 创建 waker 与其唤醒标志（测试检查标志以确认被唤醒）。
     pub(super) fn make_waker_tuple() -> (Waker, Arc<AtomicBool>) {
         let flag = Arc::new(AtomicBool::new(false));
         let waker = Waker::from(Arc::new(TestWaker(flag.clone())));
@@ -135,11 +145,3 @@ impl Wake for TestWaker {
     }
 }
 
-/// 轮询一次 future：返回其 `Poll` 结果（配合 [`TestWaker`] 检查唤醒）。
-pub(super) fn poll_once<F: core::future::Future>(
-    fut: Pin<&mut F>,
-    waker: &Waker,
-) -> Poll<F::Output> {
-    let mut cx = Context::from_waker(waker);
-    fut.poll(&mut cx)
-}

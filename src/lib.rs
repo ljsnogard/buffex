@@ -20,6 +20,9 @@ extern crate alloc;
 pub mod channels;
 pub mod circular_buff;
 
+#[cfg(test)]
+mod test_support_;
+
 pub mod x_deps {
     pub use abs_async_iter;
     pub use abs_buff;

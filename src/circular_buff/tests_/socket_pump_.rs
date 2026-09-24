@@ -1,5 +1,13 @@
 //! 真实 tokio UNIX domain socket 设备接入 `circular_buff` 的实测（socket 泵）。
 //!
+//! # 仅 tokio
+//!
+//! 本文件**仅**在 tokio 下运行（`#[tokio::test]`）：socket 设备直接包装
+//! `tokio::net::UnixStream` 并依赖 tokio reactor 唤醒，无法在 compio 下跑
+//! （除非给 compio 开 net feature，本仓库刻意不改 `Cargo.toml`）；因此这里的
+//! 用例**不**走 `dual_runtime_test_` 的双运行时形态。有界超时用
+//! `tokio::time::timeout`（同样仅 tokio）。
+//!
 //! [`pump_`](super::pump_) 里的设备（`TestInput` / `TestOutput`）是**永远就绪**的
 //! 内存设备：`read_async` / `write_async` 立即返回 `Ready`，所以「提交路径上的单次
 //! 非阻塞 poll」就能搬完。真实 socket 不同：无数据 / 发送缓冲满时返回 `Pending`，

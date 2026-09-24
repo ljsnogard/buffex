@@ -5,12 +5,24 @@
 //!
 //! 主动端**不产出半部**：`build_async` 只把被动端的半部交给调用者（主动生产 ×
 //! 被动消费 → 仅消费端；被动生产 × 主动消费 → 仅生产端；主动 × 主动 →
-//! `Pipeline` future）。`build` 已改为异步（`build_async`，主动端在构建期
-//! 完成异步初始化），同步测试用 `futures_lite::future::block_on` 驱动。
+//! `Pipeline` future）。
+//!
+//! # 运行时与驱动方式
+//!
+//! 需要 `build_async` / `read_async` / `write_async` 的用例一律写成 `async fn`，
+//! 由 [`dual_runtime_test_`](crate::test_support_::dual_runtime_test_) 在 **tokio**
+//! 与 **compio** 两种**真实运行时**下各跑一遍；不 `block_on`、不手动构造 waker。
+//!
+//! 全主动流水线（`Pipeline`）是**永不结束**的设备驱动 future，无法被 `await`
+//! 到完成：这类用例把它与一个「让出若干次 / 直到可观测结果成立」的探测 future
+//! 用 `futures_util::future::select` 并发，由运行时按 `select` 的**左优先**顺序
+//! 反复轮询流水线；探测 future 完成即代表搬运窗口已给足，随后断言最终结果。
+//! 需要「等待侧先生效、再被对端唤醒」的用例则用 `futures_util::join!` + 一次
+//! `yield_now().await`，让等待侧先撞上等待条件。
 //!
 //! 设备 move 进核心后测试无法直接访问，经 `Arc` 观察其内部状态。
 
-use std::{pin::{pin, Pin}, sync::atomic::Ordering, vec, vec::Vec};
+use std::{pin::Pin, sync::atomic::Ordering, vec, vec::Vec};
 
 use abs_buff::{
     Demand, TrBuffTryRead, TrBuffTryWrite,
@@ -31,16 +43,19 @@ use super::{
         BufProducer, CoreAlloc, DevConsumer,
     },
     DefaultBuilder, ReadySegm, TestErr, TestInput, TestOutput, TestWaker, fill_segm,
-    poll_once, take_segm,
+    take_segm,
 };
+use crate::test_support_::dual_runtime_test_;
 
 /// 主动生产 × 被动消费：构造（`init_async`）即把 `TrInput` 现有数据灌满缓冲；
 /// 消费端每读取一次，读取提交（`advance_read`）驱动主动生产者**重复拉取**补满
 /// 空位；输入耗尽后停止。
+/// - 手段：输入 20 字节、容量 8；构建后循环读空，每次提交后再看缓冲是否补满。
+/// - 判断：读回序列为 0..20；输入被读走 20、缓冲读空为 0；未耗尽时每次提交都
+///   补满到 8。
 ///
 /// `build_async` 只返回消费端半部——主动生产端由设备驱动，不产出写半部。
-#[test]
-fn pipe_from_input_fills_and_refills() {
+async fn pipe_from_input_fills_and_refills_() {
     let input = TestInput::new((0..20).collect());
     let data = input.data.clone();
     let pos = input.pos.clone();
@@ -49,8 +64,7 @@ fn pipe_from_input_fills_and_refills() {
         .unwrap()
         .pipe_from_input(input)
         .consumer_passive();
-    let mut rx =
-        futures_lite::future::block_on(ready.build_async().into_future()).unwrap();
+    let mut rx = ready.build_async().await.unwrap();
 
     // 构造完成即已填满：容量 8 全部可用（REVERSION 约定，不再空一槽）→ 8 格。
     assert_eq!(rx.data_size(), 8);
@@ -81,12 +95,15 @@ fn pipe_from_input_fills_and_refills() {
     assert_eq!(data.lock().unwrap().len(), 20);
 }
 
+dual_runtime_test_!(pipe_from_input_fills_and_refills_);
+
 /// 被动生产 × 主动消费：写入提交（`advance_write`）驱动主动消费者**重复推送**
 /// 到 `TrOutput`——写入后立即排空。
+/// - 手段：构建后写 3 字节再连续三轮各写 2 字节。
+/// - 判断：每次提交后输出设备立即拿到全部数据，缓冲始终为 0。
 ///
 /// `build_async` 只返回生产端半部——主动消费端由设备驱动，不产出读半部。
-#[test]
-fn pipe_into_output_drains_on_write() {
+async fn pipe_into_output_drains_on_write_() {
     let output = TestOutput::new();
     let out_data = output.data.clone();
 
@@ -94,8 +111,7 @@ fn pipe_into_output_drains_on_write() {
         .unwrap()
         .producer_passive()
         .pipe_into_output(output);
-    let mut tx =
-        futures_lite::future::block_on(ready.build_async().into_future()).unwrap();
+    let mut tx = ready.build_async().await.unwrap();
 
     // 写 3 字节 → 写段 drop 提交 → advance_write 驱动输出泵排空。
     let demand = Demand::at_least(3);
@@ -126,10 +142,14 @@ fn pipe_into_output_drains_on_write() {
     );
 }
 
+dual_runtime_test_!(pipe_into_output_drains_on_write_);
+
 /// 主动 × 主动：`TrInput → 缓冲 → TrOutput` 流水线。`build_async` 返回
-/// [`Pipeline`] future；首个 poll 即由设备驱动把当前可用的输入全部流到输出。
-#[test]
-fn pipe_both_active_pipeline() {
+/// [`Pipeline`] future——由设备驱动把当前可用的输入全部流到输出。
+/// - 手段：容量 8、输入 20 字节；用 `select(流水线, 探测)` 让运行时左优先反复
+///   轮询流水线，探测直到输入被读空为止。
+/// - 判断：输出设备收到 0..20；输入被读走 20 字节。
+async fn pipe_both_active_pipeline_() {
     let input = TestInput::new((0..20).collect());
     let pos = input.pos.clone();
     let output = TestOutput::new();
@@ -139,18 +159,26 @@ fn pipe_both_active_pipeline() {
         .unwrap()
         .pipe_from_input(input)
         .pipe_into_output(output);
-    let mut pipeline =
-        futures_lite::future::block_on(ready.build_async().into_future()).unwrap();
+    let mut pipeline = ready.build_async().await.unwrap();
 
-    // 首个 poll：输入泵 + 输出泵跑完整个流水线（非阻塞设备立即就绪）。
-    let (waker, _wake_flag) = TestWaker::make_waker_tuple();
-    let fut = pipeline.pipe_async().into_future();
-    let mut pinned = pin!(fut);
-    let _ = poll_once(pinned.as_mut(), &waker);
+    // 首个轮询即由输入泵 + 输出泵把整个流水线跑完（非阻塞设备立即就绪）。
+    let drive = pipeline.pipe_async().into_future();
+    let stop = async {
+        for _ in 0..64 {
+            futures_lite::future::yield_now().await;
+            if pos.load(Ordering::Relaxed) == 20 {
+                return;
+            }
+        }
+    };
+    futures_util::pin_mut!(drive, stop);
+    let _ = futures_util::future::select(drive, stop).await;
 
     assert_eq!(*out_data.lock().unwrap(), (0..20).collect::<Vec<_>>());
     assert_eq!(pos.load(Ordering::Relaxed), 20, "输入设备已全部读完");
 }
+
+dual_runtime_test_!(pipe_both_active_pipeline_);
 
 /// 阻塞式输入设备：无数据时 `read_async` 挂起（注册 waker）；调用方经 `Arc`
 /// 压入数据并唤醒后，下一次 poll 即有数据可读。用于验证「由设备驱动」的
@@ -182,6 +210,8 @@ impl BlockingInput {
     }
 }
 
+/// [`BlockingInput`] 的读 future（设备侧的 `poll` 实现：无数据即注册 waker 并
+/// 挂起——这是**被测设备的语义**，不是测试在手动驱动被测 future）。
 struct BlockingRead<'f> {
     input: &'f mut BlockingInput,
     target: &'f mut [core::mem::MaybeUninit<u8>],
@@ -245,12 +275,12 @@ impl abs_buff::io::TrInput<u8> for BlockingInput {
 
 /// 双端全主动：数据流动**由两端设备驱动**——`Pipeline` future 存活期间持续
 /// 搬运（`pipeline.pipe_async()` 交出由设备驱动的流水线 future）。
-///
-/// 1. 输入设备无数据 → 流水线挂起（await 输入设备的 `read_async`，Pending）；
-/// 2. 压入数据并唤醒 → 流水线自动把数据流到输出（无需任何显式 drive）；
-/// 3. 再次压入 → 再次流动。
-#[test]
-fn pipeline_flows_driven_by_devices() {
+/// - 手段：让流水线与「探测」future 在同一个运行时任务里用 `select` 并发；
+///   探测先让出一次（确认无数据时输出为空），再分两批压入数据并**唤醒设备**，
+///   每次唤醒后让出一次，把控制权交回运行时——由运行时 waker 驱动流水线。
+/// - 判断：无数据时输出为空；每批数据被压入并唤醒后，输出设备依次拿到
+///   `[1,2,3]` 与 `[1,2,3,4,5]`（数据自动流动，无需任何显式 drive）。
+async fn pipeline_flows_driven_by_devices_() {
     let (input, in_data, in_waker) = BlockingInput::new();
     let output = TestOutput::new();
     let out_data = output.data.clone();
@@ -258,44 +288,47 @@ fn pipeline_flows_driven_by_devices() {
     let mut ready = DefaultBuilder::with_capacity(8)
         .unwrap()
         .pipe_between(input, output);
-    let mut pipeline =
-        futures_lite::future::block_on(ready.build_async().into_future()).unwrap();
+    let mut pipeline = ready.build_async().await.unwrap();
 
-    let (waker, _wake_flag) = TestWaker::make_waker_tuple();
-    let fut = pipeline.pipe_async().into_future();
-    let mut pinned = pin!(fut);
+    let drive = pipeline.pipe_async().into_future();
+    let probe = async {
+        // 先让出一次：确保流水线已被轮询并挂在输入设备上（注册 waker）。
+        futures_lite::future::yield_now().await;
+        assert!(
+            out_data.lock().unwrap().is_empty(),
+            "输入设备无数据时不应有输出"
+        );
 
-    // 输入设备无数据：流水线挂起，等待输入设备唤醒。
-    assert!(
-        poll_once(pinned.as_mut(), &waker).is_pending(),
-        "输入设备无数据时应挂起"
-    );
-    assert!(out_data.lock().unwrap().is_empty());
+        // 设备就绪（压入数据 + 唤醒）：流水线由输入设备驱动，数据自动流到输出。
+        in_data.lock().unwrap().extend_from_slice(&[1, 2, 3]);
+        if let Some(w) = in_waker.lock().unwrap().take() {
+            w.wake();
+        }
+        futures_lite::future::yield_now().await;
+        assert_eq!(
+            *out_data.lock().unwrap(),
+            vec![1, 2, 3],
+            "设备就绪后数据应由运行时 waker 驱动自动流动"
+        );
 
-    // 设备就绪（压入数据 + 唤醒）：流水线由输入设备驱动，数据自动流到输出。
-    in_data.lock().unwrap().extend_from_slice(&[1, 2, 3]);
-    if let Some(w) = in_waker.lock().unwrap().take() {
-        w.wake();
-    }
-    assert!(poll_once(pinned.as_mut(), &waker).is_pending());
-    assert_eq!(
-        *out_data.lock().unwrap(),
-        vec![1, 2, 3],
-        "设备就绪后数据应自动流动"
-    );
-
-    // 第二批数据：同样自动流动（输入设备再次就绪）。
-    in_data.lock().unwrap().extend_from_slice(&[4, 5]);
-    if let Some(w) = in_waker.lock().unwrap().take() {
-        w.wake();
-    }
-    assert!(poll_once(pinned.as_mut(), &waker).is_pending());
-    assert_eq!(*out_data.lock().unwrap(), vec![1, 2, 3, 4, 5]);
+        // 第二批数据：同样自动流动（输入设备再次就绪）。
+        in_data.lock().unwrap().extend_from_slice(&[4, 5]);
+        if let Some(w) = in_waker.lock().unwrap().take() {
+            w.wake();
+        }
+        futures_lite::future::yield_now().await;
+        assert_eq!(*out_data.lock().unwrap(), vec![1, 2, 3, 4, 5]);
+    };
+    futures_util::pin_mut!(drive, probe);
+    let _ = futures_util::future::select(drive, probe).await;
 }
 
+dual_runtime_test_!(pipeline_flows_driven_by_devices_);
+
 /// 主动生产端在输入耗尽后停止泵入；再次消费时不再有数据。
-#[test]
-fn pipe_from_input_stops_when_exhausted() {
+/// - 手段：输入仅 3 字节、容量 8；构建后读空。
+/// - 判断：累计读出 `[1,2,3]`；缓冲为 0；输入被读走 3 字节。
+async fn pipe_from_input_stops_when_exhausted_() {
     let input = TestInput::new(vec![1, 2, 3]);
     let pos = input.pos.clone();
 
@@ -303,8 +336,7 @@ fn pipe_from_input_stops_when_exhausted() {
         .unwrap()
         .pipe_from_input(input)
         .consumer_passive();
-    let mut rx =
-        futures_lite::future::block_on(ready.build_async().into_future()).unwrap();
+    let mut rx = ready.build_async().await.unwrap();
 
     let mut total = Vec::new();
     loop {
@@ -322,6 +354,8 @@ fn pipe_from_input_stops_when_exhausted() {
     assert_eq!(rx.data_size(), 0);
     assert_eq!(pos.load(Ordering::Relaxed), 3);
 }
+
+dual_runtime_test_!(pipe_from_input_stops_when_exhausted_);
 
 /// 主动端的半部错误类型（编译期检查 Unavailable 变体存在且可达）。
 #[allow(dead_code)]
@@ -369,8 +403,10 @@ impl abs_buff::io::TrInput<u8> for GatedInput {
 /// 对端（生产端）为主动时，`try_read` **自动**驱动一轮输入泵：缓冲为空、
 /// 设备数据「迟到」（构造后才可用）时，单次 `try_read` 即拉到数据——
 /// 调用者无需任何手动 drive（无后台任务模型下「操作即事件」）。
-#[test]
-fn try_read_auto_drives_active_producer() {
+/// - 手段：门控输入设备（构造期门未开）；开门后立即 `try_read`。
+/// - 判断：开门前缓冲为 0、泵调用 1 次；开门后单次 `try_read` 拿到 `[7,8,9]`；
+///   供完后再次 `try_read` 返回 `Drained`。
+async fn try_read_auto_drives_active_producer_() {
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize},
@@ -389,8 +425,7 @@ fn try_read_auto_drives_active_producer() {
         .unwrap()
         .pipe_from_input(input)
         .consumer_passive();
-    let mut rx =
-        futures_lite::future::block_on(ready.build_async().into_future()).unwrap();
+    let mut rx = ready.build_async().await.unwrap();
 
     // 构造期 start() 泵了一轮，但门未开 → 缓冲为空。
     assert_eq!(rx.data_size(), 0);
@@ -418,10 +453,13 @@ fn try_read_auto_drives_active_producer() {
     );
 }
 
+dual_runtime_test_!(try_read_auto_drives_active_producer_);
+
 /// 写端关闭（`ProducerClose` 事件）：`close_tx` 先驱动输出泵排空残留再触发
 /// 事件——写端关闭后不再有新数据，残留必须送达输出设备。
-#[test]
-fn close_tx_drains_remaining_output() {
+/// - 手段：写 5 字节、再写 2 字节，最后 `close`。
+/// - 判断：每次提交后输出设备立即拿到数据；`close` 后输出保持完整 7 字节。
+async fn close_tx_drains_remaining_output_() {
     let output = TestOutput::new();
     let out_data = output.data.clone();
 
@@ -429,8 +467,7 @@ fn close_tx_drains_remaining_output() {
         .unwrap()
         .producer_passive()
         .pipe_into_output(output);
-    let mut tx =
-        futures_lite::future::block_on(ready.build_async().into_future()).unwrap();
+    let mut tx = ready.build_async().await.unwrap();
 
     // 写 5 字节（一次借出可写区，全部写入并提交）——advance_write 已排空。
     let demand = Demand::at_least(5);
@@ -458,12 +495,17 @@ fn close_tx_drains_remaining_output() {
     assert_eq!(*out_data.lock().unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
 }
 
+dual_runtime_test_!(close_tx_drains_remaining_output_);
+
 /// 主动生产 × 被动消费的**异步读**：构造（`init_async` 初始搬运）已把缓冲填满，
 /// 因此第一次 `read_async` **无需任何泵驱动**即成功——等待逻辑保持纯粹（只
 /// 关心本端需求）；随后每次读取提交（`advance_read`）驱动输入泵补位，后续
 /// `read_async` 同样立即成功。
-#[test]
-fn read_async_with_active_producer_has_data() {
+/// - 手段：容量 8、输入 20 字节；用 `select(读等待, 让出一次)` 左优先断言读等待
+///   在首轮即就绪（若 park 则会走到让出侧而失败——有界失败，不永久挂起）。
+/// - 判断：第一次读借出 8 字节 `0..8`；提交后缓冲立即补满（`data_size == 8`、
+///   输入被读走 16）。
+async fn read_async_with_active_producer_has_data_() {
     let input = TestInput::new((0..20).collect());
     let pos = input.pos.clone();
 
@@ -471,21 +513,22 @@ fn read_async_with_active_producer_has_data() {
         .unwrap()
         .pipe_from_input(input)
         .consumer_passive();
-    let mut rx =
-        futures_lite::future::block_on(ready.build_async().into_future()).unwrap();
+    let mut rx = ready.build_async().await.unwrap();
 
     // 构造即已填满：第一次 read_async 必有数据（无需等待 / 泵驱动）。
-    // 内层作用域：future 持有 &mut rx，读取完成后立即 drop 释放借用。
+    // 内层作用域：等待 future 持有 `&mut rx`，读完后立即释放借用。
     {
         let demand = Demand::at_least(8);
-        let fut = rx.read_async(&demand);
-        let mut fut = pin!(fut.into_future());
-        let (waker, _flag) = TestWaker::make_waker_tuple();
-        let res = poll_once(fut.as_mut(), &waker);
-        let mut rs = match res {
-            std::task::Poll::Ready(r) => r.pick_left().expect("构造已填满：第一次读应有数据"),
-            std::task::Poll::Pending => panic!("构造已填满：read_async 不应 park"),
+        let read = rx.read_async(&demand).into_future();
+        let probe = async { futures_lite::future::yield_now().await };
+        futures_util::pin_mut!(read, probe);
+        let res = match futures_util::future::select(read, probe).await {
+            futures_util::future::Either::Left((res, _)) => res,
+            futures_util::future::Either::Right(_) => {
+                panic!("构造已填满：read_async 不应 park")
+            }
         };
+        let mut rs = res.pick_left().expect("构造已填满：第一次读应有数据");
         assert_eq!(rs.least_count(), 8);
         assert_eq!(take_segm(&mut rs, 8), (0..8).collect::<Vec<_>>());
         drop(rs); // 提交 → advance_read → 驱动输入泵补位
@@ -495,6 +538,8 @@ fn read_async_with_active_producer_has_data() {
     assert_eq!(rx.data_size(), 8, "advance_read 应驱动输入泵补满空位");
     assert_eq!(pos.load(Ordering::Relaxed), 16, "输入设备已被读走 16 字节");
 }
+
+dual_runtime_test_!(read_async_with_active_producer_has_data_);
 
 // ---------------------------------------------------------------------------
 // 双头测试设备：同时实现 TrInput 与 TrOutput，观察真实数据流动
@@ -539,7 +584,8 @@ impl DualHeadDevice {
 }
 
 /// 双头设备作为 `TrInput` 的读 future：`out_buf` 有数据即拷贝并推进读取位置；
-/// 为空则注册 waker 并挂起（阻塞式设备语义）。
+/// 为空则注册 waker 并挂起（阻塞式设备语义——设备侧的 `poll` 实现，不是测试
+/// 在手动驱动被测 future）。
 struct DualHeadRead<'f> {
     dev: &'f mut DualHeadDevice,
     target: &'f mut [core::mem::MaybeUninit<u8>],
@@ -627,27 +673,17 @@ impl TrOutput<u8> for DualHeadDevice {
     }
 }
 
-/// # 被测约定
 /// 双主动流水线（`pipe_async`）**由两端设备驱动**：数据真实地在
 /// 「源设备 → 双头设备 → 终端设备」之间流动，且双头设备（同时实现
 /// `TrInput` 与 `TrOutput`）内部可观察到流经的数据（`seen_in` / `seen_out`）。
-/// 上游 pipe 把数据写入双头设备的 `TrOutput` 侧，双头设备**转发**到
-/// `out_buf` 并唤醒读者；下游 pipe 从双头设备的 `TrInput` 侧读取并转交终端。
-///
-/// # 构造
-/// `source`（`TestInput`，20 字节）经 `pipe1` 接到双头设备的 `TrOutput` 侧；
-/// 双头设备的 `TrInput` 侧经 `pipe2` 接到 `sink`（`TestOutput`）。两个 pipe
-/// 的 future 用 [`poll_once`] 手动驱动（阻塞式双头设备：无数据时挂起并注册
-/// waker，模拟真实连接）。
-///
-/// # 判定
-/// (1) 先 poll `pipe2`：双头设备尚无数据 → **挂起**（非空转，验证 await 设备
-/// 而非 `block_on` 自旋）；(2) poll `pipe1` 一次：源数据全部流入双头设备
-/// （`seen_in == 0..20`）；(3) 再 poll `pipe2`：数据经双头设备转交终端
-/// （`sink.data == 0..20`、`seen_out == 0..20`）——三处断言共同证明数据真的
-/// 流经双头设备，而非停留在任一管道内部。
-#[test]
-fn dual_head_device_observes_cross_pipe_flow() {
+/// - 手段：`source`（`TestInput`，20 字节）经 `pipe1` 接到双头设备的 `TrOutput`
+///   侧；双头设备的 `TrInput` 侧经 `pipe2` 接到 `sink`（`TestOutput`）。两个
+///   永不结束的 pipe future 在同一运行时任务里用 `join!` 并发，并与「探测」
+///   future 用 `select` 并发——探测让出直到终端设备收满 20 字节为止。
+/// - 判断：(1) `seen_in == 0..20`——源数据全部流入双头设备；(2) `sink.data ==
+///   0..20` 且 `seen_out == 0..20`——数据经双头设备转交终端。三处断言共同证明
+///   数据真的流经双头设备，而非停留在任一管道内部。
+async fn dual_head_device_observes_cross_pipe_flow_() {
     let source = TestInput::new((0..20).collect());
     let sink = TestOutput::new();
     let out_data = sink.data.clone(); // sink 将 move 进 pipe2，观察侧保留 Arc
@@ -658,40 +694,38 @@ fn dual_head_device_observes_cross_pipe_flow() {
         .unwrap()
         .pipe_from_input(source)
         .pipe_into_output(dual.clone());
-    let mut pipe1 =
-        futures_lite::future::block_on(ready1.build_async().into_future()).unwrap();
+    let mut pipe1 = ready1.build_async().await.unwrap();
     // pipe2：dual（TrInput）→ sink（TrOutput）——数据从双头设备流出。
     let mut ready2 = DefaultBuilder::with_capacity(8)
         .unwrap()
         .pipe_from_input(dual.clone())
         .pipe_into_output(sink);
-    let mut pipe2 =
-        futures_lite::future::block_on(ready2.build_async().into_future()).unwrap();
+    let mut pipe2 = ready2.build_async().await.unwrap();
 
-    let (waker, _flag) = TestWaker::make_waker_tuple();
-    let f1 = pipe1.pipe_async().into_future();
-    let mut p1 = pin!(f1);
-    let f2 = pipe2.pipe_async().into_future();
-    let mut p2 = pin!(f2);
+    // 两个管道并发推进：pipe2 先挂起在双头设备上（阻塞式设备），pipe1 随后把
+    // 源数据搬进双头设备并唤醒 pipe2 的读者。
+    let drive = async {
+        futures_util::join!(
+            pipe2.pipe_async().into_future(),
+            pipe1.pipe_async().into_future()
+        );
+    };
+    let stop = async {
+        for _ in 0..64 {
+            futures_lite::future::yield_now().await;
+            if out_data.lock().unwrap().len() == 20 {
+                return;
+            }
+        }
+    };
+    futures_util::pin_mut!(drive, stop);
+    let _ = futures_util::future::select(drive, stop).await;
 
-    // (1) 先 poll pipe2：双头设备尚无数据 → 输入侧挂起（阻塞式设备语义，
-    //     注册 waker；这正是真实连接的行为——无数据即 Pending，而非空转）。
-    assert!(
-        poll_once(p2.as_mut(), &waker).is_pending(),
-        "pipe2 输入（双头设备）暂无数据时应挂起"
-    );
-
-    // (2) poll pipe1：源数据全部流入双头设备（source 非阻塞，单次 poll 流完；
-    //     双头设备 TrOutput 记录 seen_in、转发 out_buf 并唤醒 pipe2 的读者）。
-    let _ = poll_once(p1.as_mut(), &waker);
     assert_eq!(
         *dual.seen_in.lock().unwrap(),
         (0..20).collect::<Vec<_>>(),
         "pipe1 的数据应全部流入双头设备（seen_in 可观察）"
     );
-
-    // (3) 再次 poll pipe2：双头设备把收到的数据转交终端设备。
-    let _ = poll_once(p2.as_mut(), &waker);
     assert_eq!(
         *out_data.lock().unwrap(),
         (0..20).collect::<Vec<_>>(),
@@ -704,22 +738,25 @@ fn dual_head_device_observes_cross_pipe_flow() {
     );
 }
 
+dual_runtime_test_!(dual_head_device_observes_cross_pipe_flow_);
+
 // ---------------------------------------------------------------------------
 // Dev 端唤醒槽位 + STNDBY armed 协议（executor 驱动的泵 park 机制）
 // ---------------------------------------------------------------------------
 
-/// # 被测约定
 /// 主动端（`DevProducer` / `DevConsumer`）携带与被动端同构的唤醒槽位
 /// （`wakeslot_`）。executor 驱动的泵在「无事可做」（缓冲满 / 空、设备阻塞）
 /// 时把 waker 注册进主动端自身的槽位并 armed（`TX_STNDBY` / `RX_STNDBY`，
 /// 经核心 `arm_producer` / `arm_consumer`）；对端提交路径的 fire 侧**只唤醒
 /// 不搬运**——armed 才 `check`，`check` 感兴趣即 `signal` 唤醒泵。
 ///
-/// # 判定
-/// (1) 端级：`DevConsumer::check(Available(…))` 感兴趣 → 直接 `signal` 自身
-/// 槽位（唤醒已注册的泵）；(2) 核心级端到端：armed 后经核心写入 → 段 drop →
-/// `advance_write` → `fire_consumer` → `check` → `signal`；(3) 门控：未 armed
-/// 时 fire 不唤醒（无等待者 / 泵未 park）。
+/// 本用例测的是 `check` / `signal` 的**同步协议**（不涉及任何 future 驱动），
+/// 因此保持 `#[test]`：用 [`TestWaker`] 充当唤醒的**接收端**（`AtomicBool`
+/// 置位），不轮询任何 future。
+/// - 手段：把已注册 waker 的 `Waiter` 注册进槽位，再分别触发端级 `check`、
+///   核心级 `advance_write`、以及未 armed 的门控路径。
+/// - 判断：(1) `check` 感兴趣并置位标志；(2) armed 后写入提交经
+///   `fire_consumer → check → signal` 置位；(3) 未 armed 时 fire 不置位。
 #[test]
 fn dev_wakeslot_and_stndby_protocol() {
     // (1) 端级：check 感兴趣 → signal 自身唤醒槽位。
