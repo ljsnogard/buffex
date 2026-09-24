@@ -19,6 +19,11 @@ mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.1
 [dev-dependencies]
 abs_buff-testkit = { git = "https://gitee.com/lino_snsalias/abs_buff-testkit.git" }
 
+# 性能基准：`divan` 与 asyncband 官方 benchmark 同款；`asyncband` 只作为对标基线
+# （其 mpsc bounded 同时充当 SPSC 的单生产者基线，因为 asyncband 没有 SPSC 实现）。
+asyncband = { version = "0.7.2", features = ["mpsc"] }
+divan = "0.1.21"
+
 # 跨异步运行时的抽象层与两个具体后端（**不引 bridge**：bridge 用 Cargo feature
 # 强制「只能有一个后端」，会让「同一次 cargo test 里跑两种后端」直接编译失败）。
 abs_art = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", package = "abs_art" }
@@ -36,3 +41,11 @@ futures-lite = { version = "2" }
 compio = { version = "0.19.*", features = ["fs", "macros", "time"] }
 futures-executor = "0.3"
 futures-util = "0.3"
+
+# 性能基准入口：divan 自带 main（`harness = false`），`test = false` 避免
+# `cargo test` 顺手把基准跑一遍。
+[[bench]]
+name = "channels"
+path = "benches/channels/main.rs"
+harness = false
+test = false
