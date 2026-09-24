@@ -2,6 +2,9 @@
 //!
 //! * [`sync_`]——被动 × 被动：读写往返、`Demand` 语义、跨末端环绕、异步等待；
 //! * [`pump_`]——主动模式：输入泵、输出泵、全主动流水线；
+//! * [`socket_pump_`]——真实 tokio socket 接入：被动生产 × 主动消费的数据滞留
+//!   （`#[ignore]`）、全被动环 + 调用方泵（可用）、主动生产 × 被动消费的泵停滞
+//!   （`#[ignore]`）；
 //! * [`hook_`]——关闭 / EOF 事件与被动唤醒；
 //! * [`builder_`]——构建器顺序灵活性：两端任意换序、`pipe_between`、
 //!   默认双端被动；
@@ -15,6 +18,7 @@ mod hook_;
 mod park_tests_;
 mod pos_tests_;
 mod pump_;
+mod socket_pump_;
 mod sync_;
 
 use core::{mem::MaybeUninit, pin::Pin};
