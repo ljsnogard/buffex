@@ -7,7 +7,5 @@
 //!   后由 `Drop` 提交；要更多就再从父段切一段。
 
 
-
-mod conc_segm_;
 mod mpsc_;
 mod spsc_;
