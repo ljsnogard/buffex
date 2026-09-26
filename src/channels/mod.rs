@@ -132,6 +132,10 @@
 //! （`CooperativeAcqSession` 只是 `&CooperativeRwLock` 的外壳），会话因此可以放在
 //! `MpscSender` 自身里——它指向的锁位于那块固定不动的堆分配中，不需要额外装箱。
 
+// 多写者并发填写的下一步：类型与协议已就位并有用例覆盖，但尚未接到
+// `MpscSender` 的写路径上，因此在非 test 构建里暂时是「未被使用」。
+#[allow(dead_code)]
+mod conc_segm_;
 mod error_;
 mod mpsc_;
 mod segm_;

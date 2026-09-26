@@ -16,6 +16,8 @@ abs_buff = { git = "https://gitee.com/lino_snsalias/abs_buff.git", branch = "dev
 atomic_sync = { git = "https://gitee.com/lino_snsalias/atomic_sync.git", branch = "dev/0.3.0" }
 mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.1.3" }
 
+futures-lite = "2.6.1"
+
 [dev-dependencies]
 abs_buff-testkit = { git = "https://gitee.com/lino_snsalias/abs_buff-testkit.git" }
 
