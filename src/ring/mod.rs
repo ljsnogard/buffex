@@ -2,6 +2,7 @@ mod error_;
 mod hook_;
 mod ring_core_;
 
+pub mod passive;
 pub mod reclaim;
 
 pub use error_::{ConsumerError, ProducerError};
