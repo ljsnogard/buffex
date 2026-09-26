@@ -1,38 +1,33 @@
 use core::{
     cell::UnsafeCell,
-    future::{Future, IntoFuture},
     marker::{PhantomData, PhantomPinned},
     mem::MaybeUninit,
-    pin::pin,
-    ptr::{self, NonNull},
     slice,
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
-    task::{Context, Poll, Waker},
+    sync::atomic::AtomicUsize,
 };
 
 use abs_buff::{
     Demand,
-    buffer::{TrAsBufferMut, TrBuffSegmMut, TrBuffSegmRef},
-    error::TrTaggedError,
+    buffer::TrAsBufferMut,
+    error::{IoErrTag, TrTaggedError, TrErrTag},
     gen_may_cancel_future,
-    io::{TrInput, TrOutput},
-    x_deps::{abs_cancel, anylr, gen_mcf2},
+    x_deps::{abs_cancel, anylr},
 };
 use abs_cancel::{TrCancellationToken, TrMayCancel};
-use anylr::SomeOf;
+use anylr::{SomeOf, TrSomeOf};
 use atomex::AtomicFlags;
-use atomic_sync::x_deps::{abs_sync, atomex};
+use atomic_sync::x_deps::atomex;
 
 use super::{
     error_::{ConsumerError, ProducerError},
-    io_wake_::{TrConsumerNotify, TrProducerNotify, TrPark},
+    hook_::{TrConsumerHook, TrProducerHook, TrPark},
     reclaim::{Reclaim, ReclSliceMut, ReclSliceRef, SegmSlicesMut, SegmSlicesRef},
 };
 
 pub struct Ring<P, C, B, T = u8>
 where
-    P: TrProducerNotify<T>,
-    C: TrConsumerNotify<T>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
     B: TrAsBufferMut<T>,
 {
     /// `rp`（低 `POS_BITS` 位）| `wp`（次 `POS_BITS` 位）| 全部标志（高位：
@@ -50,29 +45,37 @@ where
 
 impl<P, C, B, T> Ring<P, C, B, T>
 where
-    P: TrProducerNotify<T>,
-    C: TrConsumerNotify<T>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
     B: TrAsBufferMut<T>,
 {
-    pub const fn new_unchecked(
+    pub fn new_unchecked(
         buffer: B,
-        producer_wake: P,
-        consumer_wake: C,
+        producer: P,
+        consumer: C,
     ) -> Self {
-        Ring {
+        let cap = buffer.as_slice_uninit().len();
+        debug_assert!(cap >= MIN_CAPACITY);
+        debug_assert!(cap <= MAX_CAPACITY);
+        let mut ring = Ring {
             atm_flag_: AtomicFlags::new(AtomicUsize::new(0usize)),
             buf_cell_: UnsafeCell::new(buffer),
-            producer_: producer_wake,
-            consumer_: consumer_wake,
+            producer_: producer,
+            consumer_: consumer,
             _unuse_t_: PhantomData,
             _pinning_: PhantomPinned,
-        }
+        };
+        let pos = IoPos::unpack(ring.atm_flag_.value(), cap);
+        // SAFETY: the factory uniquely owned the buffer.
+        let buf = unsafe { ring.buf_cell_.as_mut_unchecked() };
+        ring.producer_.init_once(buf, &pos);
+        ring
     }
 
     pub fn try_new(
         buffer: B,
-        producer_wake: P,
-        consumer_wake: C,
+        producer: P,
+        consumer: C,
     ) -> Result<Self, usize> {
         let buff = buffer.as_slice_uninit();
         if buff.len() < MIN_CAPACITY || buff.len() > MAX_CAPACITY {
@@ -80,8 +83,8 @@ where
         } else {
             Result::Ok(Self::new_unchecked(
                 buffer,
-                producer_wake,
-                consumer_wake,
+                producer,
+                consumer,
             ))
         }
     }
@@ -152,8 +155,8 @@ where
 
 impl<P, C, B, T> Ring<P, C, B, T>
 where
-    P: TrProducerNotify<T>,
-    C: TrConsumerNotify<T> + TrPark,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B> + TrPark<Err = ConsumerError<usize>>,
     B: TrAsBufferMut<T>,
 {
     pub fn read_async<'f>(
@@ -166,8 +169,8 @@ where
 
 impl<P, C, B, T> Ring<P, C, B, T>
 where
-    P: TrProducerNotify<T> + TrPark,
-    C: TrConsumerNotify<T>,
+    P: TrProducerHook<T, Buff = B> + TrPark<Err = ProducerError<usize>>,
+    C: TrConsumerHook<T, Buff = B>,
     B: TrAsBufferMut<T>,
 {
     pub fn write_async<'f>(
@@ -184,8 +187,8 @@ where
 
 impl<P, C, B, T> Ring<P, C, B, T>
 where
-    P: TrProducerNotify<T>,
-    C: TrConsumerNotify<T>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
     B: TrAsBufferMut<T>,
 {
     /// 借出可读区，返回 `(start, take)`。
@@ -220,7 +223,6 @@ where
         }
         let take = core::cmp::min(max_len, ready);
         debug_assert!(take > 0);
-        self.producer_.notify(pos);
         Ok((pos.rp, take))
     }
 
@@ -246,7 +248,6 @@ where
         }
         let take = core::cmp::min(max_len, free);
         debug_assert!(take > 0 && take >= min_len);
-        self.consumer_.notify(pos);
         Ok((pos.wp, take))
     }
 
@@ -261,7 +262,10 @@ where
             let pos = IoPos::unpack(s, cap);
             pos.advance_wp(amount).pack(s)
         });
-        IoPos::unpack(s, cap).free_size()
+        let pos = IoPos::unpack(s, cap);
+        let buf = unsafe { self.buf_cell_.as_ref_unchecked() };
+        self.consumer_.handle_event(buf, &pos);
+        pos.free_size()
     }
 
     /// 读提交：按已消费量推进读位置，触发生产端事件。
@@ -271,7 +275,10 @@ where
             let pos = IoPos::unpack(s, cap);
             pos.advance_rp(amount).pack(s)
         });
-        IoPos::unpack(s, cap).data_size()
+        let pos = IoPos::unpack(s, cap);
+        let buf = unsafe { self.buf_cell_.as_mut_unchecked() };
+        self.producer_.handle_event(buf, &pos);
+        pos.data_size()
     }
 
     fn update_pos_<F>(&self, f: F) -> usize
@@ -348,14 +355,39 @@ where
 // Ring TrBuffRead TrBuffWrite
 // -- ---- ---- ---- ---- ---- ---- ---- ----
 
+impl<P, C, B, T> abs_buff::buffer::TrConsumerState for Ring<P, C, B, T>
+where
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: TrAsBufferMut<T>,
+{
+    fn consumer_state(&self) -> Option<(usize, bool)> {
+        let size = self.data_size();
+        let sign = self.is_producer_closed();
+        Option::Some((size, sign))
+    }
+}
+
+impl<P, C, B, T> abs_buff::buffer::TrProducerState for Ring<P, C, B, T>
+where
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: TrAsBufferMut<T>,
+{
+    fn producer_state(&self) -> Option<(usize, bool)> {
+        let size = self.free_size();
+        let sign = self.is_consumer_closed();
+        Option::Some((size, sign))
+    }
+}
+
 impl<P, C, B, T> abs_buff::TrBuffTryRead<T> for Ring<P, C, B, T>
 where
-    P: TrProducerNotify<T>,
-    C: TrConsumerNotify<T>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
     B: TrAsBufferMut<T>,
 {
     type SegmRef<'f> = ReclSliceRef<'f, T, Reclaim<'f, Self>> where Self: 'f;
-
     type Err = ConsumerError<usize>;
 
     #[inline]
@@ -369,8 +401,8 @@ where
 
 impl<P, C, B, T> abs_buff::TrBuffRead<T> for Ring<P, C, B, T>
 where
-    P: TrProducerNotify<T>,
-    C: TrConsumerNotify<T> + TrPark,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B> + TrPark<Err = Self::Err>,
     B: TrAsBufferMut<T>,
 {
     type ReadAsync<'f> = RingReadAsync<'f, 'f, P, C, B, T> where Self: 'f;
@@ -384,21 +416,56 @@ where
     }
 }
 
+impl<P, C, B, T> abs_buff::TrBuffTryWrite<T> for Ring<P, C, B, T>
+where
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: TrAsBufferMut<T>,
+{
+    type SegmMut<'f> = ReclSliceMut<'f, T, Reclaim<'f, Self>> where Self: 'f;
+    type Err = ProducerError<usize>;
+
+    #[inline]
+    fn try_write<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> SomeOf<Self::SegmMut<'f>, Self::Err> {
+        Ring::try_write(self, demand)
+    }
+}
+
+impl<P, C, B, T> abs_buff::TrBuffWrite<T> for Ring<P, C, B, T>
+where
+    P: TrProducerHook<T, Buff = B> + TrPark<Err = Self::Err>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: TrAsBufferMut<T>,
+{
+    type WriteAsync<'f> = RingWriteAsync<'f, 'f, P, C, B, T> where Self: 'f;
+
+    #[inline]
+    fn write_async<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> Self::WriteAsync<'f> {
+        Ring::write_async(self, demand)
+    }
+}
+
 // -- ---- ---- ---- ---- ---- ---- ---- ----
 // Ring: Send Sync
 // -- ---- ---- ---- ---- ---- ---- ---- ----
 
 unsafe impl<P, C, B, T> Send for Ring<P, C, B, T>
 where
-    P: Send + TrProducerNotify<T>,
-    C: Send + TrConsumerNotify<T>,
+    P: Send + TrProducerHook<T, Buff = B>,
+    C: Send + TrConsumerHook<T, Buff = B>,
     B: TrAsBufferMut<T>,
 {}
 
 unsafe impl<P, C, B, T> Sync for Ring<P, C, B, T>
 where
-    P: Sync + TrProducerNotify<T>,
-    C: Sync + TrConsumerNotify<T>,
+    P: Sync + TrProducerHook<T, Buff = B>,
+    C: Sync + TrConsumerHook<T, Buff = B>,
     B: TrAsBufferMut<T>,
 {}
 
@@ -568,12 +635,32 @@ async fn ring_read_async<'f, P, C, B, T, K>(
     ConsumerError<usize>,
 >
 where
-    P: TrProducerNotify<T>,
-    C: TrConsumerNotify<T> + TrPark,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B> + TrPark<Err = ConsumerError<usize>>,
     B: TrAsBufferMut<T>,
     K: TrCancellationToken,
 {
-    SomeOf::new_right(ConsumerError::Argument)
+    loop {
+        if true {
+            let x = ring.try_read(demand);
+            if x.contains_left() {
+                return x
+            }
+            if x.contains_right_and(err_should_term_op) {
+                return x;
+            }
+        }
+        if cancel.is_cancelled() {
+            return SomeOf::new_right(ConsumerError::Cancelled);
+        }
+        let opt_err = ring.consumer_
+            .park_async()
+            .may_cancel_with(cancel.child_token())
+            .await;
+        if opt_err.as_ref().is_some_and(err_should_term_op) {
+            return SomeOf::new_right(opt_err.unwrap())
+        }
+    }
 }
 
 #[gen_may_cancel_future(RingWrite, pub)]
@@ -586,10 +673,38 @@ async fn ring_write_async<'f, P, C, B, T, K>(
     ProducerError<usize>,
 >
 where
-    P: TrProducerNotify<T> + TrPark,
-    C: TrConsumerNotify<T>,
+    P: TrProducerHook<T, Buff = B> + TrPark<Err = ProducerError<usize>>,
+    C: TrConsumerHook<T, Buff = B>,
     B: TrAsBufferMut<T>,
     K: TrCancellationToken,
 {
-    SomeOf::new_right(ProducerError::Argument)
+    loop {
+        if true {
+            let x = ring.try_write(demand);
+            if x.contains_left() {
+                return x
+            }
+            if x.contains_right_and(err_should_term_op) {
+                return x;
+            }
+        }
+        if cancel.is_cancelled() {
+            return SomeOf::new_right(ProducerError::Cancelled);
+        }
+        let opt_err = ring.producer_
+            .park_async()
+            .may_cancel_with(cancel.child_token())
+            .await;
+        if opt_err.as_ref().is_some_and(err_should_term_op) {
+            return SomeOf::new_right(opt_err.unwrap())
+        }
+    }
+}
+
+fn err_should_term_op<E, T>(err: &E) -> bool
+where
+    E: TrTaggedError<T>,
+    T: TrErrTag + Into<IoErrTag>,
+{
+    err.err_tag().into().should_terminate()
 }

@@ -17,8 +17,8 @@ pub enum ProducerError<S> {
     Closing,
     /// 调用者主动取消
     Cancelled,
-    /// 参数非法（例如 `Demand` 区间非法）。
-    Argument,
+    /// 请求不可能满足
+    Unsatisfiable,
 }
 
 impl<S: fmt::Debug> fmt::Display for ProducerError<S> {
@@ -27,7 +27,7 @@ impl<S: fmt::Debug> fmt::Display for ProducerError<S> {
             ProducerError::Stuffed(p) => write!(f, "ProducerError::Stuffed(at: {p:?})"),
             ProducerError::Closing => write!(f, "ProducerError::Closing"),
             ProducerError::Cancelled => write!(f, "ProducerError::Cancelled"),
-            ProducerError::Argument => write!(f, "ProducerError::Argument"),
+            ProducerError::Unsatisfiable => write!(f, "ProducerError::Unsatisfiable"),
         }
     }
 }
@@ -39,7 +39,7 @@ impl<S: fmt::Debug> TrTaggedError<WriteErrTag> for ProducerError<S> {
         match self {
             ProducerError::Closing | ProducerError::Cancelled
                 => WriteErrTag::Closing,
-            ProducerError::Argument => WriteErrTag::Unknown,
+            ProducerError::Unsatisfiable => WriteErrTag::Unknown,
             ProducerError::Stuffed(_) => WriteErrTag::Stuffed,
         }
     }
@@ -54,8 +54,8 @@ pub enum ConsumerError<S> {
     Closing,
     /// 调用者主动取消
     Cancelled,
-    /// 参数非法。
-    Argument,
+    /// 请求不可能满足
+    Unsatisfiable,
 }
 
 impl<S: fmt::Debug> fmt::Display for ConsumerError<S> {
@@ -64,7 +64,7 @@ impl<S: fmt::Debug> fmt::Display for ConsumerError<S> {
             ConsumerError::Drained(p) => write!(f, "ConsumerError::Drained(at: {p:?})"),
             ConsumerError::Closing => write!(f, "ConsumerError::Closing"),
             ConsumerError::Cancelled => write!(f, "ConsumerError::Cancelled"),
-            ConsumerError::Argument => write!(f, "ConsumerError::Argument"),
+            ConsumerError::Unsatisfiable => write!(f, "ConsumerError::Unsatisfiable"),
         }
     }
 }
@@ -76,7 +76,7 @@ impl<S: fmt::Debug> TrTaggedError<ReadErrTag> for ConsumerError<S> {
         match self {
             ConsumerError::Closing | ConsumerError::Cancelled
                 => ReadErrTag::Closing,
-            ConsumerError::Argument => ReadErrTag::Unknown,
+            ConsumerError::Unsatisfiable => ReadErrTag::Unknown,
             ConsumerError::Drained(_) => ReadErrTag::Drained,
         }
     }
