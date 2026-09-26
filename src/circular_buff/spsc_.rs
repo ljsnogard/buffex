@@ -22,7 +22,7 @@ use core::{
 
 use abs_buff::{
     Demand, TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite,
-    buffer::TrBufferState,
+    buffer::{TrConsumerState, TrProducerState},
     gen_may_cancel_future,
     io::{TrInput, TrOutput},
     x_deps::{abs_cancel, anylr},
@@ -84,7 +84,7 @@ where
     // P: TrProducer<Data = T>,
     C: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: TrMalloc + Clone,
 {
     core_ref_: CoreRef<BufProducer<T>, C, B, T, A>,
@@ -99,7 +99,7 @@ where
     P: Send + Sync + TrProducer<Data = T>,
     // C: TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: TrMalloc + Clone,
 {
     core_ref_: CoreRef<P, BufConsumer<T>, B, T, A>,
@@ -114,7 +114,7 @@ where
     // P: Send + Sync + TrProducer<Data = T>,
     C: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: Send + Sync + TrMalloc + Clone,
 {
     pub(super) fn new(core_ref: CoreRef<BufProducer<T>, C, B, T, A>) -> Self {
@@ -175,7 +175,7 @@ where
     // P: Send + Sync + TrProducer<Data = T>,
     C: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: Send + Sync + TrMalloc + Clone,
 {
     pub fn write_async<'f>(
@@ -197,46 +197,12 @@ where
     }
 }
 
-impl<C, B, T, A> TrBufferState for Producer<C, B, T, A>
-where
-    // P: Send + Sync + TrProducer<Data = T>,
-    C: Send + Sync + TrConsumer<Data = T>,
-    B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
-    A: Send + Sync + TrMalloc + Clone,
-{
-    #[inline]
-    fn capacity(&self) -> usize {
-        Producer::capacity(self)
-    }
-
-    #[inline]
-    fn data_size(&self) -> usize {
-        Producer::data_size(self)
-    }
-
-    #[inline]
-    fn free_size(&self) -> usize {
-        Producer::free_size(self)
-    }
-
-    #[inline]
-    fn is_consumer_closed(&self) -> bool {
-        Producer::is_consumer_closed(self)
-    }
-
-    #[inline]
-    fn is_producer_closed(&self) -> bool {
-        Producer::is_producer_closed(self)
-    }
-}
-
 impl<C, B, T, A> Drop for Producer<C, B, T, A>
 where
     // P: TrProducer<Data = T>,
     C: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: TrMalloc + Clone,
 {
     fn drop(&mut self) {
@@ -257,7 +223,7 @@ async fn producer_write_async_<'f, K, B, T, A, C>(
     // P: Send + Sync + TrProducer<Data = T>,
     K: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: Send + Sync + TrMalloc + Clone,
     C: TrCancellationToken,
 {
@@ -276,7 +242,7 @@ async fn producer_close_async_<'f, K, B, T, A, C>(
 where
     K: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: Send + Sync + TrMalloc + Clone,
     C: TrCancellationToken,
 {
@@ -335,7 +301,7 @@ where
     P: Send + Sync + TrProducer<Data = T>,
     // C: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: Send + Sync + TrMalloc + Clone,
 {
     pub fn read_async<'f>(
@@ -357,46 +323,12 @@ where
     }
 }
 
-impl<P, B, T, A> TrBufferState for Consumer<P, B, T, A>
-where
-    P: Send + Sync + TrProducer<Data = T>,
-    // C: Send + Sync + TrConsumer<Data = T>,
-    B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
-    A: Send + Sync + TrMalloc + Clone,
-{
-    #[inline]
-    fn capacity(&self) -> usize {
-        Consumer::capacity(self)
-    }
-
-    #[inline]
-    fn data_size(&self) -> usize {
-        Consumer::data_size(self)
-    }
-
-    #[inline]
-    fn free_size(&self) -> usize {
-        Consumer::free_size(self)
-    }
-
-    #[inline]
-    fn is_consumer_closed(&self) -> bool {
-        Consumer::is_consumer_closed(self)
-    }
-
-    #[inline]
-    fn is_producer_closed(&self) -> bool {
-        Consumer::is_producer_closed(self)
-    }
-}
-
 impl<P, B, T, A> Drop for Consumer<P, B, T, A>
 where
     P: Send + Sync + TrProducer<Data = T>,
     // C: TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: TrMalloc + Clone,
 {
     fn drop(&mut self) {
@@ -416,7 +348,7 @@ where
     P: Send + Sync + TrProducer<Data = T>,
     // K: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: Send + Sync + TrMalloc + Clone,
     C: TrCancellationToken,
 {
@@ -533,7 +465,7 @@ where
     I: Send + Sync + TrInput<T>,
     O: Send + Sync + TrOutput<T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: Send + Sync + TrMalloc + Clone,
 {
     pub(super) fn new(core_ref: PipeCore<I, O, B, T, A>) -> Self {
@@ -570,37 +502,33 @@ where
     }
 }
 
-impl<I, O, B, T, A> TrBufferState for Pipeline<I, O, B, T, A>
+impl<I, O, B, T, A> TrConsumerState for Pipeline<I, O, B, T, A>
 where
     I: Send + Sync + TrInput<T>,
     O: Send + Sync + TrOutput<T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: Send + Sync + TrMalloc + Clone,
 {
-    #[inline]
-    fn capacity(&self) -> usize {
-        Pipeline::capacity(self)
+    fn consumer_state(&self) -> Option<(usize, bool)> {
+        let size = self.core_ref_.data_size();
+        let closing = self.core_ref_.is_rx_closed();
+        Option::Some((size, closing))
     }
+}
 
-    #[inline]
-    fn data_size(&self) -> usize {
-        Pipeline::data_size(self)
-    }
-
-    #[inline]
-    fn free_size(&self) -> usize {
-        Pipeline::data_size(self)
-    }
-
-    #[inline]
-    fn is_consumer_closed(&self) -> bool {
-        Pipeline::is_consumer_closed(self)
-    }
-
-    #[inline]
-    fn is_producer_closed(&self) -> bool {
-        Pipeline::is_producer_closed(self)
+impl<I, O, B, T, A> TrProducerState for Pipeline<I, O, B, T, A>
+where
+    I: Send + Sync + TrInput<T>,
+    O: Send + Sync + TrOutput<T>,
+    B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
+    T: 'static,
+    A: Send + Sync + TrMalloc + Clone,
+{
+    fn producer_state(&self) -> Option<(usize, bool)> {
+        let size = self.core_ref_.free_size();
+        let closing = self.core_ref_.is_tx_closed();
+        Option::Some((size, closing))
     }
 }
 
@@ -614,7 +542,7 @@ where
     I: Send + Sync + TrInput<T>,
     O: Send + Sync + TrOutput<T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: Send + Sync + TrMalloc + Clone,
     C: TrCancellationToken,
 {
@@ -657,7 +585,7 @@ where
 // abs_buff 读写 trait
 // ---------------------------------------------------------------------------
 
-impl<C, B, T, A> TrBuffWrite<T> for Producer<C, B, T, A>
+impl<C, B, T, A> TrProducerState for Producer<C, B, T, A>
 where
     // P: Send + Sync + TrProducer<Data = T>,
     C: Send + Sync + TrConsumer<Data = T>,
@@ -665,9 +593,22 @@ where
     T: Send + Sync + 'static,
     A: Send + Sync + TrMalloc + Clone,
 {
-    type WriteAsync<'f> = ProducerWriteAsync<'f, 'f, C, B, T, A>
-    where Self: 'f;
+    #[inline]
+    fn producer_state(&self) -> Option<(usize, bool)> {
+        let size = self.core_ref_.free_size();
+        let closing = self.core_ref_.is_rx_closed();
+        Option::Some((size, closing))
+    }
+}
 
+impl<C, B, T, A> TrBuffTryWrite<T> for Producer<C, B, T, A>
+where
+    // P: Send + Sync + TrProducer<Data = T>,
+    C: Send + Sync + TrConsumer<Data = T>,
+    B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
+    T: 'static,
+    A: Send + Sync + TrMalloc + Clone,
+{
     type SegmMut<'f> = ReclSliceMut<'f, T,
         WriterReclaim<'f, CircCore<BufProducer<T>, C, B, T>>>
     where Self: 'f;
@@ -675,9 +616,24 @@ where
     type Err = ProducerError<usize>;
 
     #[inline]
-    fn is_stuffed_closing(&self) -> bool {
-        self.core_ref_.is_tx_closed() || !self.core_ref_.producer_ready(1)
+    fn try_write<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> SomeOf<Self::SegmMut<'f>, Self::Err> {
+        Producer::try_write(self, demand)
     }
+}
+
+impl<C, B, T, A> TrBuffWrite<T> for Producer<C, B, T, A>
+where
+    // P: Send + Sync + TrProducer<Data = T>,
+    C: Send + Sync + TrConsumer<Data = T>,
+    B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
+    T: 'static,
+    A: Send + Sync + TrMalloc + Clone,
+{
+    type WriteAsync<'f> = ProducerWriteAsync<'f, 'f, C, B, T, A>
+    where Self: 'f;
 
     #[inline]
     fn write_async<'f>(
@@ -688,20 +644,42 @@ where
     }
 }
 
-impl<C, B, T, A> TrBuffTryWrite<T> for Producer<C, B, T, A>
+impl<P, B, T, A> TrConsumerState for Consumer<P, B, T, A>
 where
-    // P: Send + Sync + TrProducer<Data = T>,
-    C: Send + Sync + TrConsumer<Data = T>,
+    P: Send + Sync + TrProducer<Data = T>,
+    // C: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     A: Send + Sync + TrMalloc + Clone,
 {
     #[inline]
-    fn try_write<'f>(
+    fn consumer_state(&self) -> Option<(usize, bool)> {
+        let size = self.core_ref_.data_size();
+        let closing = self.core_ref_.is_tx_closed();
+        Option::Some((size, closing))
+    }
+}
+
+impl<P, B, T, A> TrBuffTryRead<T> for Consumer<P, B, T, A>
+where
+    P: Send + Sync + TrProducer<Data = T>,
+    // C: Send + Sync + TrConsumer<Data = T>,
+    B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
+    T: 'static,
+    A: Send + Sync + TrMalloc + Clone,
+{
+    type SegmRef<'f> = ReclSliceRef<'f, T,
+        ReaderReclaim<'f, CircCore<P, BufConsumer<T>, B, T>>>
+    where Self: 'f;
+
+    type Err = ConsumerError<usize>;
+
+    #[inline]
+    fn try_read<'f>(
         &'f mut self,
         demand: &'f Demand<usize>,
-    ) -> SomeOf<Self::SegmMut<'f>, Self::Err> {
-        Producer::try_write(self, demand)
+    ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
+        Consumer::try_read(self, demand)
     }
 }
 
@@ -715,43 +693,8 @@ where
 {
     type ReadAsync<'f> = ConsumerReadAsync<'f, 'f, P, B, T, A> where Self: 'f;
 
-    type SegmRef<'f> = ReclSliceRef<'f, T,
-        ReaderReclaim<'f, CircCore<P, BufConsumer<T>, B, T>>>
-    where Self: 'f;
-
-    type Err = ConsumerError<usize>;
-
     #[inline]
-    fn is_drained_closing(&self) -> bool {
-        // 「Drained」= 不再会有新数据：读端已关闭，或（写端已关闭且缓冲已
-        // 空）。写端关闭但仍有缓冲数据时不算 drained——EOF 语义要求先把残留
-        // 数据读走（与 `ring_buffer` 的 `RingRx::is_drained_closing` 一致）。
-        self.core_ref_.is_rx_closed()
-            || (self.core_ref_.is_tx_closed() && self.core_ref_.data_size() == 0)
-    }
-
-    #[inline]
-    fn read_async<'f>(
-        &'f mut self,
-        demand: &'f Demand<usize>,
-    ) -> Self::ReadAsync<'f> {
+    fn read_async<'f>(&'f mut self, demand: &'f Demand<usize>) -> Self::ReadAsync<'f> {
         Consumer::read_async(self, demand)
-    }
-}
-
-impl<P, B, T, A> TrBuffTryRead<T> for Consumer<P, B, T, A>
-where
-    P: Send + Sync + TrProducer<Data = T>,
-    // C: Send + Sync + TrConsumer<Data = T>,
-    B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
-    A: Send + Sync + TrMalloc + Clone,
-{
-    #[inline]
-    fn try_read<'f>(
-        &'f mut self,
-        demand: &'f Demand<usize>,
-    ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
-        Consumer::try_read(self, demand)
     }
 }

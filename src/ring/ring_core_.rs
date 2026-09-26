@@ -1,0 +1,595 @@
+use core::{
+    cell::UnsafeCell,
+    future::{Future, IntoFuture},
+    marker::{PhantomData, PhantomPinned},
+    mem::MaybeUninit,
+    pin::pin,
+    ptr::{self, NonNull},
+    slice,
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    task::{Context, Poll, Waker},
+};
+
+use abs_buff::{
+    Demand,
+    buffer::{TrAsBufferMut, TrBuffSegmMut, TrBuffSegmRef},
+    error::TrTaggedError,
+    gen_may_cancel_future,
+    io::{TrInput, TrOutput},
+    x_deps::{abs_cancel, anylr, gen_mcf2},
+};
+use abs_cancel::{TrCancellationToken, TrMayCancel};
+use anylr::SomeOf;
+use atomex::AtomicFlags;
+use atomic_sync::x_deps::{abs_sync, atomex};
+
+use super::{
+    error_::{ConsumerError, ProducerError},
+    io_wake_::{TrConsumerNotify, TrProducerNotify, TrPark},
+    reclaim::{Reclaim, ReclSliceMut, ReclSliceRef, SegmSlicesMut, SegmSlicesRef},
+};
+
+pub struct Ring<P, C, B, T = u8>
+where
+    P: TrProducerNotify<T>,
+    C: TrConsumerNotify<T>,
+    B: TrAsBufferMut<T>,
+{
+    /// `rp`（低 `POS_BITS` 位）| `wp`（次 `POS_BITS` 位）| 全部标志（高位：
+    /// 关闭 ×2、待机 ×2、泵互斥 ×1、待办泵 ×2）。
+    atm_flag_: AtomicFlags<usize>,
+    buf_cell_: UnsafeCell<B>,
+
+    /// 环形缓冲（拥有）：统一 `[MaybeUninit<T>]` 视图。基址经裸指针访问，
+    /// `Owned` 只负责所有权与生命周期。
+    producer_: P,
+    consumer_: C,
+    _unuse_t_: PhantomData<fn() -> T>,
+    _pinning_: PhantomPinned,
+}
+
+impl<P, C, B, T> Ring<P, C, B, T>
+where
+    P: TrProducerNotify<T>,
+    C: TrConsumerNotify<T>,
+    B: TrAsBufferMut<T>,
+{
+    pub const fn new_unchecked(
+        buffer: B,
+        producer_wake: P,
+        consumer_wake: C,
+    ) -> Self {
+        Ring {
+            atm_flag_: AtomicFlags::new(AtomicUsize::new(0usize)),
+            buf_cell_: UnsafeCell::new(buffer),
+            producer_: producer_wake,
+            consumer_: consumer_wake,
+            _unuse_t_: PhantomData,
+            _pinning_: PhantomPinned,
+        }
+    }
+
+    pub fn try_new(
+        buffer: B,
+        producer_wake: P,
+        consumer_wake: C,
+    ) -> Result<Self, usize> {
+        let buff = buffer.as_slice_uninit();
+        if buff.len() < MIN_CAPACITY || buff.len() > MAX_CAPACITY {
+            Result::Err(buff.len())
+        } else {
+            Result::Ok(Self::new_unchecked(
+                buffer,
+                producer_wake,
+                consumer_wake,
+            ))
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 状态查询
+    // ------------------------------------------------------------------
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        // Safety: borrow
+        unsafe {
+            self.buf_cell_
+                .as_ref_unchecked()
+                .as_slice_uninit()
+                .len()
+        }
+    }
+
+    /// 当前可读数据量。
+    #[inline]
+    pub fn data_size(&self) -> usize {
+        let state = self.atm_flag_.value();
+        let pos = IoPos::unpack(state, self.capacity());
+        pos.data_size()
+    }
+
+    /// 当前可写空间量。
+    #[inline]
+    pub fn free_size(&self) -> usize {
+        let state = self.atm_flag_.value();
+        let pos = IoPos::unpack(state, self.capacity());
+        pos.free_size()
+    }
+
+    #[inline]
+    pub fn is_producer_closed(&self) -> bool {
+        has_flag(self.atm_flag_.value(), PRODUCER_CLOSED)
+    }
+
+    #[inline]
+    pub fn is_consumer_closed(&self) -> bool {
+        has_flag(self.atm_flag_.value(), CONSUMER_CLOSED)
+    }
+
+    // ------------------------------------------------------------------
+    // 同步读写
+    // ------------------------------------------------------------------
+
+    pub fn try_read<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> SomeOf<ReclSliceRef<'f, T, Reclaim<'f, Self>>, ConsumerError<usize>> {
+        self.try_read_internal_(demand)
+            .map(|(start, take)| self.create_read_segm_(start, take))
+            .into()
+    }
+
+    pub fn try_write<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> SomeOf<ReclSliceMut<'f, T, Reclaim<'f, Self>>, ProducerError<usize>> {
+        self.try_write_internal_(demand)
+            .map(|(start, take)| self.create_write_segm_(start, take))
+            .into()
+    }
+}
+
+impl<P, C, B, T> Ring<P, C, B, T>
+where
+    P: TrProducerNotify<T>,
+    C: TrConsumerNotify<T> + TrPark,
+    B: TrAsBufferMut<T>,
+{
+    pub fn read_async<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> RingReadAsync<'f, 'f, P, C, B, T> {
+        RingReadAsync::new(self, demand)
+    }
+}
+
+impl<P, C, B, T> Ring<P, C, B, T>
+where
+    P: TrProducerNotify<T> + TrPark,
+    C: TrConsumerNotify<T>,
+    B: TrAsBufferMut<T>,
+{
+    pub fn write_async<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> RingWriteAsync<'f, 'f, P, C, B, T> {
+        RingWriteAsync::new(self, demand)
+    }
+}
+
+// -- ---- ---- ---- ---- ---- ---- ---- ----
+// Ring internals
+// -- ---- ---- ---- ---- ---- ---- ---- ----
+
+impl<P, C, B, T> Ring<P, C, B, T>
+where
+    P: TrProducerNotify<T>,
+    C: TrConsumerNotify<T>,
+    B: TrAsBufferMut<T>,
+{
+    /// 借出可读区，返回 `(start, take)`。
+    ///
+    /// 尊重 `Demand` 的 `[min, max]` 区间：可读数据不足下限且未关闭时**不返回**
+    /// （返回 `Drained`）；**EOF 例外**——写端已关闭（不再会有更多数据）时，
+    /// 返回现有部分（可能不足下限）；读端已关闭或缓冲区已空时返回 `Closing` /
+    /// `Drained`。
+    fn try_read_internal_(
+        &self,
+        demand: &Demand<usize>,
+    ) -> Result<(usize, usize), ConsumerError<usize>> {
+        let min_len = demand.min().copied().unwrap_or(0);
+        let max_len = demand.max().copied().unwrap_or(usize::MAX);
+        let state = self.atm_flag_.value();
+        let cap = self.capacity();
+        let pos = IoPos::unpack(state, cap);
+        let ready = pos.data_size();
+        if ready == 0 {
+            if has_flag(state, PRODUCER_CLOSED)
+                || has_flag(state, CONSUMER_CLOSED)
+            {
+                return Err(ConsumerError::Closing); // EOF：写端已关且读空
+            }
+            return Err(ConsumerError::Drained(pos.rp));
+        }
+        if ready < min_len
+            && !has_flag(state, PRODUCER_CLOSED)
+            && !has_flag(state, CONSUMER_CLOSED)
+        {
+            return Err(ConsumerError::Drained(pos.rp)); // 不足下限且未关闭：等待更多
+        }
+        let take = core::cmp::min(max_len, ready);
+        debug_assert!(take > 0);
+        self.producer_.notify(pos);
+        Ok((pos.rp, take))
+    }
+
+    /// 借出可写区，返回 `(start, take)`。
+    ///
+    /// 尊重 `Demand` 的 `[min, max]` 区间：**可写空间不足下限时不返回**（返回
+    /// `Stuffed`），满足时最多借出 `max`。区域可能跨末端环绕（由段类型表达）。
+    pub(super) fn try_write_internal_(
+        &self,
+        demand: &Demand<usize>,
+    ) -> Result<(usize, usize), ProducerError<usize>> {
+        let min_len = demand.min().copied().unwrap_or(0);
+        let max_len = demand.max().copied().unwrap_or(usize::MAX);
+        let state = self.atm_flag_.value();
+        let cap = self.capacity();
+        let pos = IoPos::unpack(state, cap);
+        let free = pos.free_size();
+        if free == 0 || free < min_len {
+            if has_flag(state, PRODUCER_CLOSED) {
+                return Err(ProducerError::Closing);
+            }
+            return Err(ProducerError::Stuffed(pos.wp));
+        }
+        let take = core::cmp::min(max_len, free);
+        debug_assert!(take > 0 && take >= min_len);
+        self.consumer_.notify(pos);
+        Ok((pos.wp, take))
+    }
+
+    // ------------------------------------------------------------------
+    // 状态迁移（提交路径：推进位置 / 关闭，随后触发对端事件）
+    // ------------------------------------------------------------------
+
+    /// 写提交：按已消费量推进写位置，触发消费端事件。
+    pub(super) fn advance_write(&self, amount: usize) -> usize {
+        let cap = self.capacity();
+        let s = self.update_pos_(|s| {
+            let pos = IoPos::unpack(s, cap);
+            pos.advance_wp(amount).pack(s)
+        });
+        IoPos::unpack(s, cap).free_size()
+    }
+
+    /// 读提交：按已消费量推进读位置，触发生产端事件。
+    pub(super) fn advance_read(&self, amount: usize) -> usize {
+        let cap = self.capacity();
+        let s = self.update_pos_(|s| {
+            let pos = IoPos::unpack(s, cap);
+            pos.advance_rp(amount).pack(s)
+        });
+        IoPos::unpack(s, cap).data_size()
+    }
+
+    fn update_pos_<F>(&self, f: F) -> usize
+    where
+        F: Fn(usize) -> usize,
+    {
+        let expect = |_| true;
+        let desire = f;
+        self.atm_flag_
+            .try_spin_compare_exchange_weak(expect, desire)
+            .into_inner()
+    }
+
+    // ------------------------------------------------------------------
+    // 段构建（提交目标：本核心，经 TrCircBuffCore）
+    // ------------------------------------------------------------------
+
+    /// 构建写段：覆盖 `[start, start+take)`，跨末端时拆成两段物理空间。
+    ///
+    /// 段 drop 时经 [`WriterReclaim`] 提交回本核心（推进写位置并触发消费端
+    /// 事件）。
+    fn create_write_segm_<'s>(
+        &'s self,
+        start: usize,
+        take: usize,
+    ) -> ReclSliceMut<'s, T, Reclaim<'s, Self>> {
+        // SAFETY: `start`/`take` 来自 `try_write_at`，区域在缓冲内；可写区与
+        // 其他活段 / 泵操作不重叠是调用者义务（SPSC）。
+        let whole: &'s mut [MaybeUninit<T>] = unsafe {
+            let buff = &mut *self.buf_cell_.get();
+            buff.as_mut_slice_uninit()
+        };
+        let first = core::cmp::min(take, self.capacity() - start);
+        let pieces = if first < take {
+            let (head, tail) = whole.split_at_mut(start);
+            let b = &mut head[..take - first];
+            SegmSlicesMut::Two(tail, b)
+        } else {
+            SegmSlicesMut::One(&mut whole[start..start + take])
+        };
+        let reclaim = Reclaim::new(self, Self::advance_write);
+        ReclSliceMut::new(pieces, reclaim)
+    }
+
+    /// 构建读段：覆盖 `[start, start+take)`，跨末端时拆成两段物理空间。
+    ///
+    /// 段 drop 时经 [`ReaderReclaim`] 提交回本核心（推进读位置并触发生产端
+    /// 事件）。
+    fn create_read_segm_<'s>(
+        &'s self,
+        start: usize,
+        take: usize,
+    ) -> ReclSliceRef<'s, T, Reclaim<'s, Self>> {
+        // SAFETY: 同 [`CircCore::write_segm`]。
+        let base = unsafe {
+            let buff = self.buf_cell_.as_ref_unchecked();
+            buff.as_slice_uninit().as_ptr().cast::<T>()
+        };
+        let first = core::cmp::min(take, self.capacity() - start);
+        let pieces = if first < take {
+            let a = unsafe { slice::from_raw_parts(base.add(start), first) };
+            let b = unsafe { slice::from_raw_parts(base, take - first) };
+            SegmSlicesRef::Two(a, b)
+        } else {
+            let a = unsafe { slice::from_raw_parts(base.add(start), take) };
+            SegmSlicesRef::One(a)
+        };
+        let reclaim = Reclaim::new(self, Self::advance_read);
+        ReclSliceRef::new(pieces, reclaim)
+    }
+}
+
+// -- ---- ---- ---- ---- ---- ---- ---- ----
+// Ring TrBuffRead TrBuffWrite
+// -- ---- ---- ---- ---- ---- ---- ---- ----
+
+impl<P, C, B, T> abs_buff::TrBuffTryRead<T> for Ring<P, C, B, T>
+where
+    P: TrProducerNotify<T>,
+    C: TrConsumerNotify<T>,
+    B: TrAsBufferMut<T>,
+{
+    type SegmRef<'f> = ReclSliceRef<'f, T, Reclaim<'f, Self>> where Self: 'f;
+
+    type Err = ConsumerError<usize>;
+
+    #[inline]
+    fn try_read<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
+        Ring::try_read(self, demand)
+    }
+}
+
+impl<P, C, B, T> abs_buff::TrBuffRead<T> for Ring<P, C, B, T>
+where
+    P: TrProducerNotify<T>,
+    C: TrConsumerNotify<T> + TrPark,
+    B: TrAsBufferMut<T>,
+{
+    type ReadAsync<'f> = RingReadAsync<'f, 'f, P, C, B, T> where Self: 'f;
+
+    #[inline]
+    fn read_async<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> Self::ReadAsync<'f> {
+        Ring::read_async(self, demand)
+    }
+}
+
+// -- ---- ---- ---- ---- ---- ---- ---- ----
+// Ring: Send Sync
+// -- ---- ---- ---- ---- ---- ---- ---- ----
+
+unsafe impl<P, C, B, T> Send for Ring<P, C, B, T>
+where
+    P: Send + TrProducerNotify<T>,
+    C: Send + TrConsumerNotify<T>,
+    B: TrAsBufferMut<T>,
+{}
+
+unsafe impl<P, C, B, T> Sync for Ring<P, C, B, T>
+where
+    P: Sync + TrProducerNotify<T>,
+    C: Sync + TrConsumerNotify<T>,
+    B: TrAsBufferMut<T>,
+{}
+
+// ---------------------------------------------------------------------------
+// 状态字布局
+// ---------------------------------------------------------------------------
+
+/// 保留高8位作为状态字（关闭 ×2 + 待机 ×2 + REVERSION）。
+const RSV_BITS: u32 = 8;
+
+/// 生产者（写端）已关闭。
+const PRODUCER_CLOSED: usize = 1usize << (usize::BITS - 1);
+/// 消费者（读端）已关闭。
+const CONSUMER_CLOSED: usize = 1usize << (usize::BITS - 2);
+/// 生产端等待唤醒。被动模式下 demand 有值
+const PRODUCER_STNDBY: usize = 1usize << (usize::BITS - 3);
+/// 消费端等待唤醒。
+const CONSUMER_STNDBY: usize = 1usize << (usize::BITS - 4);
+
+/// 写入端已跨段标志，即此时 wp <= rp 是合法状态
+pub(super) const REVERSION: usize = 1usize << (usize::BITS - 5);
+
+/// 状态字全部标志的掩码（位置更新（`update_state`）保留这些位）。
+#[allow(unused)]
+pub(super) const FLAG_MASK: usize = PRODUCER_CLOSED
+    | CONSUMER_CLOSED
+    | PRODUCER_STNDBY
+    | CONSUMER_STNDBY
+    | REVERSION;
+/// 每个位置占用的位数（两个位置共享低位，两个标志占高位）。
+pub(super) const POS_BITS: u32 = (usize::BITS - RSV_BITS) / 2;
+/// 位置掩码。
+pub(super) const POS_MASK: usize = (1usize << POS_BITS) - 1;
+
+pub(super) const MIN_CAPACITY: usize = 2;
+/// 环形缓冲的最大容量（与 `ring_buffer` 的 `MAX_CAPACITY` 同量级）。
+pub(super) const MAX_CAPACITY: usize = POS_MASK;
+
+/// 环形位置状态：读者位置 `rp` / 写者位置 `wp`（均为 `[0, capacity_)` 内的
+/// 物理索引）+ 跨末端标志 `rv`（即状态字中的 [`REVERSION`] 位）。
+///
+/// # 位置约定（REVERSION 方案，不再使用「空一槽」）
+///
+/// 读写位置打包进状态字低位（`rp` 占低 `POS_BITS` 位、`wp` 占次 `POS_BITS`
+/// 位），容量**全部可用**——不再刻意保留一个空槽。满 / 空由 `rv` 区分：
+///
+/// * `rv == false`（写者未跨过物理末端）：原始 `wp >= rp`，数据量 = `wp - rp`；
+///   其中 `wp == rp` 表示**空**（data = 0）；
+/// * `rv == true`（写者已跨过物理末端，原始 `wp <= rp`）：数据量 =
+///   `wp + capacity - rp`；其中 `wp == rp` 表示**满**（整环都是数据，
+///   data = capacity）。
+///
+/// `rv` 只随位置推进而置位 / 清除（其余标志位原样保留）：
+///
+/// * [`IoPos::advance_wp`]：写者越过物理末端（`wp + amount >= capacity`）时
+///   置位，且置位后一直保持——写者始终「在读者之后（含追上成满环）」；
+/// * [`IoPos::advance_rp`]：读者越过物理末端（`rp + amount >= capacity`）时
+///   清除——读者跨过末端后，写者的原始位置重新位于读者之前，恢复未跨状态。
+#[derive(Clone, Copy, Debug)]
+pub struct IoPos {
+    /// 与 REVERSION flag 含义一致：写者是否已越过缓冲区物理末端（此时原始
+    /// `wp <= rp`；`wp == rp` 表示环满）。
+    pub rv: bool,
+    /// 读者位置（物理索引，`[0, capacity_)`）。
+    pub rp: usize,
+    /// 写者位置（物理索引，`[0, capacity_)`）。
+    pub wp: usize,
+    /// circular buff 的容量。
+    capacity_: usize,
+}
+
+impl IoPos {
+    /// 本类型在状态字中「拥有」的位：两个位置字段（`rp` 低 `POS_BITS` 位、
+    /// `wp` 次 `POS_BITS` 位）与 REVERSION 位。`pack` 只覆盖这些位，其余
+    /// 标志位由传入的基座状态字原样保留。
+    pub const MASK: usize = REVERSION | POS_MASK | (POS_MASK << POS_BITS);
+
+    /// 从 `atm_stat_` 的状态字解出位置与保留标志。
+    pub fn unpack(state: usize, cap: usize) -> Self {
+        let rp = state & POS_MASK;
+        let wp = (state >> POS_BITS) & POS_MASK;
+        let rv = has_flag(state, REVERSION);
+        IoPos { rv, rp, wp, capacity_: cap }
+    }
+
+    /// 当前可读数据量（遵循上述约定：空环 = 0、满环 = 容量）。
+    #[inline]
+    pub fn data_size(&self) -> usize {
+        if self.rv && self.wp == self.rp {
+            // 写者跨过末端后恰好追上读者：整环都是数据（满）。
+            self.capacity_
+        } else {
+            // 未跨（wp > rp）或已跨未满（wp < rp）：`(wp - rp) mod capacity`。
+            (self.wp + self.capacity_ - self.rp) % self.capacity_
+        }
+    }
+
+    /// 当前可写空间量：`capacity - data_size`（满环 = 0、空环 = 容量）。
+    #[inline]
+    pub fn free_size(&self) -> usize {
+        self.capacity_ - self.data_size()
+    }
+
+    /// 以传入的基座状态字 `state` 打包回完整状态字：`state` 中本类型不拥有的
+    /// 位（[`IoPos::MASK`] 之外——关闭、待机、待办泵等标志）**原样保留**；
+    /// 本类型拥有的位（`rp` / `wp` 位置字段与 REVERSION 位）用自身的新值
+    /// **覆盖**（先清除基座中的旧值再写入，而非按位或——否则旧位置会残留并
+    /// 与新位置混合）。
+    pub fn pack(&self, state: usize) -> usize {
+        let s = (state & !Self::MASK) | self.rp | (self.wp << POS_BITS);
+        if self.rv { s | REVERSION } else { s & !REVERSION }
+    }
+
+    /// 推进写者位置：`wp += amount`（物理上环绕）；**写者越过缓冲区物理末端
+    /// （`wp + amount >= capacity`）时设置 REVERSION flag**，且一旦置位保持
+    /// 到读者追上来为止。返回推进后的**新位置状态**（不含任何标志位）；需要
+    /// 写回 `atm_stat_` 时以原状态字为基座调用 [`IoPos::pack`]。
+    ///
+    /// 前置：`amount <= free_size`（不允许写过头；恰好写满时进入
+    /// `wp == rp && rv` 的满态）。
+    pub fn advance_wp(&self, amount: usize) -> Self {
+        debug_assert!(amount <= self.free_size());
+        let new_wp = self.wp + amount;
+        let crossed = new_wp >= self.capacity_;
+        Self {
+            // 越过末端置位；已置位则保持（写者仍在读者之后，直到读者追上）。
+            rv: self.rv || crossed,
+            rp: self.rp,
+            wp: new_wp % self.capacity_,
+            capacity_: self.capacity_,
+        }
+    }
+
+    /// 推进读者位置：`rp += amount`（物理上环绕）；**读者越过缓冲区物理末端
+    /// （`rp + amount >= capacity`）时清除 REVERSION flag**——读者跨过末端后，
+    /// 写者的原始位置重新位于读者之前，恢复未跨状态。返回推进后的**新位置状态**
+    /// （不含任何标志位）；需要写回 `atm_stat_` 时以原状态字为基座调用
+    /// [`IoPos::pack`]。
+    ///
+    /// 前置：`amount <= data_size`（不允许读过头；恰好读空时回到
+    /// `wp == rp && !rv` 的空态）。
+    pub fn advance_rp(&self, amount: usize) -> Self {
+        debug_assert!(amount <= self.data_size());
+        let new_rp = self.rp + amount;
+        let crossed = self.rp + amount >= self.capacity_;
+        Self {
+            rv: self.rv && !crossed,
+            rp: new_rp % self.capacity_,
+            wp: self.wp,
+            capacity_: self.capacity_,
+        }
+    }
+}
+
+#[inline]
+fn has_flag(state: usize, flag: usize) -> bool {
+    state & flag != 0
+}
+
+#[gen_may_cancel_future(RingRead, pub)]
+async fn ring_read_async<'f, P, C, B, T, K>(
+    ring: &'f mut Ring<P, C, B, T>,
+    demand: &'f Demand<usize>,
+    cancel: K,
+) -> SomeOf<
+    ReclSliceRef<'f, T, Reclaim<'f, Ring<P, C, B, T>>>,
+    ConsumerError<usize>,
+>
+where
+    P: TrProducerNotify<T>,
+    C: TrConsumerNotify<T> + TrPark,
+    B: TrAsBufferMut<T>,
+    K: TrCancellationToken,
+{
+    SomeOf::new_right(ConsumerError::Argument)
+}
+
+#[gen_may_cancel_future(RingWrite, pub)]
+async fn ring_write_async<'f, P, C, B, T, K>(
+    ring: &'f mut Ring<P, C, B, T>,
+    demand: &'f Demand<usize>,
+    cancel: K,
+) -> SomeOf<
+    ReclSliceMut<'f, T, Reclaim<'f, Ring<P, C, B, T>>>,
+    ProducerError<usize>,
+>
+where
+    P: TrProducerNotify<T> + TrPark,
+    C: TrConsumerNotify<T>,
+    B: TrAsBufferMut<T>,
+    K: TrCancellationToken,
+{
+    SomeOf::new_right(ProducerError::Argument)
+}

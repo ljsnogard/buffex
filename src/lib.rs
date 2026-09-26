@@ -3,6 +3,7 @@
 #![feature(async_fn_traits)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(unboxed_closures)]
+#![feature(unsafe_cell_access)]
 
 #![no_std]
 #![cfg_attr(test, feature(try_trait_v2))]
@@ -19,6 +20,7 @@ extern crate alloc;
 
 pub mod channels;
 pub mod circular_buff;
+pub mod ring;
 
 #[cfg(test)]
 mod test_support_;

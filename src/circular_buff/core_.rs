@@ -338,7 +338,7 @@ where
     // P: Send + Sync + TrProducer<Data = T>,
     C: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
 {
     pub fn try_write_<'f>(
         &'f self,
@@ -382,7 +382,7 @@ impl<P, B, T> CircCore<P, BufConsumer<T>, B, T>
 where
     P: Send + Sync + TrProducer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync,
+    T: 'static,
 {
     pub fn try_read_<'f>(
         &'f self,
@@ -431,7 +431,7 @@ where
     P: Send + Sync + TrProducer<Data = T>,
     C: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync,
+    T: 'static,
 {
     /// 构造核心：分配缓冲、状态归零、装入两端。
     ///
@@ -1028,7 +1028,7 @@ where
     I: Send + Sync + TrInput<T>,
     O: Send + Sync + TrOutput<T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync,
+    T: 'static,
 {
     // ------------------------------------------------------------------
     // 双主动流水线泵（`Pipeline::pipe_async`）：await 设备，阻塞即挂起
@@ -1110,7 +1110,7 @@ where
     P: Send + Sync + TrProducer<Data = T>,
     C: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
 {
     type Data = T;
 
@@ -1165,7 +1165,7 @@ where
     P: Send + TrProducer<Data = T>,
     C: Send + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send,
+    T: 'static,
 {}
 
 unsafe impl<P, C, B, T> Sync for CircCore<P, C, B, T>
@@ -1173,7 +1173,7 @@ where
     P: Send + Sync + TrProducer<Data = T>,
     C: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync,
+    T: 'static,
 {}
 
 // ---------------------------------------------------------------------------
@@ -1330,7 +1330,7 @@ async fn core_passive_read_async_<'f, P, B, T, C>(
 where
     P: Send + Sync + TrProducer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     C: TrCancellationToken,
 {
     loop {
@@ -1417,7 +1417,7 @@ async fn core_passive_write_async_<'f, K, B, T, C>(
 where
     K: Send + Sync + TrConsumer<Data = T>,
     B: Send + Sync + BorrowMut<[MaybeUninit<T>]>,
-    T: Send + Sync + 'static,
+    T: 'static,
     C: TrCancellationToken,
 {
     loop {
