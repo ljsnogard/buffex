@@ -1,11 +1,16 @@
 use core::{
-    borrow::BorrowMut, cell::UnsafeCell, marker::{PhantomData, PhantomPinned}, mem::MaybeUninit, slice, sync::atomic::AtomicUsize,
+    borrow::{Borrow, BorrowMut},
+    cell::UnsafeCell,
+    marker::{PhantomData, PhantomPinned},
+    mem::MaybeUninit,
+    slice,
+    sync::atomic::AtomicUsize,
 };
 
 use abs_buff::{
     Demand,
     buffer::{TrConsumerState, TrProducerState},
-    error::{IoErrTag, TrTaggedError, TrErrTag},
+    error::{IoErrTag, TrErrTag, TrTaggedError},
     gen_may_cancel_future,
     x_deps::{abs_cancel, anylr},
 };
@@ -19,6 +24,7 @@ use super::{
     hook_::{TrConsumerHook, TrProducerHook, TrPark},
     reclaim::{Reclaim, ReclSliceMut, ReclSliceRef, SegmSlicesMut, SegmSlicesRef},
 };
+
 
 #[derive(Debug)]
 #[repr(C)]
@@ -35,8 +41,8 @@ where
 
     /// 环形缓冲（拥有）：统一 `[MaybeUninit<T>]` 视图。基址经裸指针访问，
     /// `Owned` 只负责所有权与生命周期。
-    producer_: P,
-    consumer_: C,
+    producer_: UnsafeCell<P>,
+    consumer_: UnsafeCell<C>,
     _unuse_t_: PhantomData<fn() -> T>,
     _pinning_: PhantomPinned,
 }
@@ -47,44 +53,62 @@ where
     C: TrConsumerHook<T, Buff = B>,
     B: BorrowMut<[MaybeUninit<T>]>,
 {
+    pub fn check_buffer_size(buff: &B) -> Result<usize, usize> {
+        let capacity = buff.borrow().len();
+        if !(MIN_CAPACITY..=MAX_CAPACITY).contains(&capacity) {
+            Result::Err(capacity)
+        } else {
+            Result::Ok(capacity)
+        }
+    }
+
     pub fn new_unchecked(
         buffer: B,
         producer: P,
         consumer: C,
     ) -> Self {
+        debug_assert!(Self::check_buffer_size(&buffer).is_ok());
         let capacity = buffer.borrow().len();
-        debug_assert!(capacity >= MIN_CAPACITY);
-        debug_assert!(capacity <= MAX_CAPACITY);
-        let mut ring = Ring {
+        let ring = Ring {
             buf_stat_: RingState::new(capacity),
             buf_cell_: UnsafeCell::new(buffer),
-            producer_: producer,
-            consumer_: consumer,
+            producer_: UnsafeCell::new(producer),
+            consumer_: UnsafeCell::new(consumer),
             _unuse_t_: PhantomData,
             _pinning_: PhantomPinned,
         };
-        // SAFETY: the factory uniquely owned the buffer.
-        let buf = unsafe { ring.buf_cell_.as_mut_unchecked() };
-        ring.producer_.init_once(buf, &ring.buf_stat_);
-        ring.consumer_.init_once(buf, &ring.buf_stat_);
+        // SAFETY: the factory uniquely owns everything.
+        unsafe {
+            let buf = ring.buf_cell_.as_mut_unchecked();
+            let producer = ring.producer_.as_mut_unchecked();
+            let consumer = ring.consumer_.as_mut_unchecked();
+            producer.init_once(buf, &ring.buf_stat_);
+            consumer.init_once(buf, &ring.buf_stat_);
+        }
         ring
     }
 
-    pub fn try_new(
-        buffer: B,
-        producer: P,
-        consumer: C,
-    ) -> Result<Self, usize> {
-        let capacity = buffer.borrow().len();
-        if !(MIN_CAPACITY..=MAX_CAPACITY).contains(&capacity) {
-            Result::Err(capacity)
-        } else {
-            Result::Ok(Self::new_unchecked(
-                buffer,
-                producer,
-                consumer,
-            ))
+    pub fn try_new(buffer: B, producer: P, consumer: C) -> Result<Self, usize> {
+        let chk = Self::check_buffer_size(&buffer);
+        if let Result::Err(cap) = chk {
+            return Result::Err(cap);
         }
+        Result::Ok(Self::new_unchecked(
+            buffer,
+            producer,
+            consumer,
+        ))
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn split<'f>(ring: &'f mut Self) -> (
+        RingWriter<&'f Self, P, C, B, T>,
+        RingReader<&'f Self, P, C, B, T>,
+    ) {
+        let ring: &'f Self = ring;
+        let w = RingWriter::new_(ring);
+        let r = RingReader::new_(ring);
+        (w, r)
     }
 
     // ------------------------------------------------------------------
@@ -120,25 +144,23 @@ where
     }
 
     // ------------------------------------------------------------------
-    // 同步读写
+    // 同步快速读写
     // ------------------------------------------------------------------
 
+    #[inline]
     pub fn try_read<'f>(
         &'f mut self,
         demand: &'f Demand<usize>,
-    ) -> SomeOf<ReclSliceRef<'f, T, Reclaim<'f, Self>>, ConsumerError<usize>> {
-        self.try_read_internal_(demand)
-            .map(|(start, take)| self.create_read_segm_(start, take))
-            .into()
+    ) -> SomeOf<RingSegmRef<'f, P, C, B, T>, ConsumerError<usize>> {
+        self.try_read_(demand)
     }
 
+    #[inline]
     pub fn try_write<'f>(
         &'f mut self,
         demand: &'f Demand<usize>,
-    ) -> SomeOf<ReclSliceMut<'f, T, Reclaim<'f, Self>>, ProducerError<usize>> {
-        self.try_write_internal_(demand)
-            .map(|(start, take)| self.create_write_segm_(start, take))
-            .into()
+    ) -> SomeOf<RingSegmMut<'f, P, C, B, T>, ProducerError<usize>> {
+        self.try_write_(demand)
     }
 }
 
@@ -180,6 +202,28 @@ where
     C: TrConsumerHook<T, Buff = B>,
     B: BorrowMut<[MaybeUninit<T>]>,
 {
+    // ------------------------------------------------------------------
+    // 同步读写完整封装，仅允许内部调用
+    // ------------------------------------------------------------------
+
+    fn try_read_<'f>(
+        &'f self,
+        demand: &'f Demand<usize>,
+    ) -> SomeOf<ReclSliceRef<'f, T, Reclaim<'f, Self>>, ConsumerError<usize>> {
+        self.try_read_internal_(demand)
+            .map(|(start, take)| self.create_read_segm_(start, take))
+            .into()
+    }
+
+    fn try_write_<'f>(
+        &'f self,
+        demand: &'f Demand<usize>,
+    ) -> SomeOf<ReclSliceMut<'f, T, Reclaim<'f, Self>>, ProducerError<usize>> {
+        self.try_write_internal_(demand)
+            .map(|(start, take)| self.create_write_segm_(start, take))
+            .into()
+    }
+
     /// 借出可读区，返回 `(start, take)`。
     ///
     /// 尊重 `Demand` 的 `[min, max]` 区间：可读数据不足下限且未关闭时**不返回**
@@ -218,7 +262,7 @@ where
     ///
     /// 尊重 `Demand` 的 `[min, max]` 区间：**可写空间不足下限时不返回**（返回
     /// `Stuffed`），满足时最多借出 `max`。区域可能跨末端环绕（由段类型表达）。
-    pub(super) fn try_write_internal_(
+    fn try_write_internal_(
         &self,
         demand: &Demand<usize>,
     ) -> Result<(usize, usize), ProducerError<usize>> {
@@ -244,7 +288,7 @@ where
     // ------------------------------------------------------------------
 
     /// 写提交：按已消费量推进写位置，触发消费端事件。
-    pub(super) fn advance_write(&self, amount: usize) -> usize {
+    fn advance_write(&self, amount: usize) -> usize {
         let cap = self.capacity();
         let s = self.update_pos_(|s| {
             let pos = IoPos::unpack(s, cap);
@@ -252,12 +296,13 @@ where
         });
         let pos = IoPos::unpack(s, cap);
         let buf = unsafe { self.buf_cell_.as_ref_unchecked() };
-        self.consumer_.handle_event(buf, &self.buf_stat_);
+        let consumer = unsafe { self.consumer_.as_ref_unchecked() };
+        consumer.handle_event(buf, &self.buf_stat_);
         pos.free_size()
     }
 
     /// 读提交：按已消费量推进读位置，触发生产端事件。
-    pub(super) fn advance_read(&self, amount: usize) -> usize {
+    fn advance_read(&self, amount: usize) -> usize {
         let cap = self.capacity();
         let s = self.update_pos_(|s| {
             let pos = IoPos::unpack(s, cap);
@@ -265,7 +310,8 @@ where
         });
         let pos = IoPos::unpack(s, cap);
         let buf = unsafe { self.buf_cell_.as_mut_unchecked() };
-        self.producer_.handle_event(buf, &self.buf_stat_);
+        let producer = unsafe { self.producer_.as_ref_unchecked() };
+        producer.handle_event(buf, &self.buf_stat_);
         pos.data_size()
     }
 
@@ -370,41 +416,6 @@ where
     }
 }
 
-impl<P, C, B, T> abs_buff::TrBuffTryRead<T> for Ring<P, C, B, T>
-where
-    P: TrProducerHook<T, Buff = B>,
-    C: TrConsumerHook<T, Buff = B>,
-    B: BorrowMut<[MaybeUninit<T>]>,
-{
-    type SegmRef<'f> = ReclSliceRef<'f, T, Reclaim<'f, Self>> where Self: 'f;
-    type Err = ConsumerError<usize>;
-
-    #[inline]
-    fn try_read<'f>(
-        &'f mut self,
-        demand: &'f Demand<usize>,
-    ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
-        Ring::try_read(self, demand)
-    }
-}
-
-impl<P, C, B, T> abs_buff::TrBuffRead<T> for Ring<P, C, B, T>
-where
-    P: TrProducerHook<T, Buff = B>,
-    C: TrConsumerHook<T, Buff = B> + TrPark<Err = Self::Err>,
-    B: BorrowMut<[MaybeUninit<T>]>,
-{
-    type ReadAsync<'f> = RingReadAsync<'f, 'f, P, C, B, T> where Self: 'f;
-
-    #[inline]
-    fn read_async<'f>(
-        &'f mut self,
-        demand: &'f Demand<usize>,
-    ) -> Self::ReadAsync<'f> {
-        Ring::read_async(self, demand)
-    }
-}
-
 impl<P, C, B, T> abs_buff::TrBuffTryWrite<T> for Ring<P, C, B, T>
 where
     P: TrProducerHook<T, Buff = B>,
@@ -419,7 +430,7 @@ where
         &'f mut self,
         demand: &'f Demand<usize>,
     ) -> SomeOf<Self::SegmMut<'f>, Self::Err> {
-        Ring::try_write(self, demand)
+        Ring::try_write_(self, demand)
     }
 }
 
@@ -616,7 +627,7 @@ fn has_flag(state: usize, flag: usize) -> bool {
 
 #[gen_may_cancel_future(RingRead, pub)]
 async fn ring_read_async<'f, P, C, B, T, K>(
-    ring: &'f mut Ring<P, C, B, T>,
+    ring: &'f Ring<P, C, B, T>,
     demand: &'f Demand<usize>,
     cancel: K,
 ) -> SomeOf<
@@ -631,7 +642,7 @@ where
 {
     loop {
         if true {
-            let x = ring.try_read(demand);
+            let x = ring.try_read_(demand);
             if x.contains_left() {
                 return x
             }
@@ -643,7 +654,8 @@ where
         if cancel.is_cancelled() {
             return SomeOf::new_right(ConsumerError::Cancelled);
         }
-        let opt_err = ring.consumer_
+        let consumer = unsafe { ring.consumer_.as_mut_unchecked() };
+        let opt_err = consumer
             .park_async(demand)
             .may_cancel_with(cancel.child_token())
             .await;
@@ -655,7 +667,7 @@ where
 
 #[gen_may_cancel_future(RingWrite, pub)]
 async fn ring_write_async<'f, P, C, B, T, K>(
-    ring: &'f mut Ring<P, C, B, T>,
+    ring: &'f Ring<P, C, B, T>,
     demand: &'f Demand<usize>,
     cancel: K,
 ) -> SomeOf<
@@ -670,7 +682,7 @@ where
 {
     loop {
         if true {
-            let x = ring.try_write(demand);
+            let x = ring.try_write_(demand);
             if x.contains_left() {
                 return x
             }
@@ -681,7 +693,8 @@ where
         if cancel.is_cancelled() {
             return SomeOf::new_right(ProducerError::Cancelled);
         }
-        let opt_err = ring.producer_
+        let producer = unsafe { ring.producer_.as_mut_unchecked() };
+        let opt_err = producer
             .park_async(demand)
             .may_cancel_with(cancel.child_token())
             .await;
@@ -750,4 +763,235 @@ where
     T: TrErrTag + Into<IoErrTag>,
 {
     err.err_tag().into().should_terminate()
+}
+
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// RingReader
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+pub type RingSegmRef<'f, P, C, B, T> =
+    ReclSliceRef<'f, T, Reclaim<'f, Ring<P, C, B, T>>>;
+
+pub struct RingReader<S, P, C, B, T>
+where
+    S: Borrow<Ring<P, C, B, T>>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    ring_ref_: S,
+    _using_r_: PhantomData<Ring<P, C, B, T>>,
+}
+
+impl<S, P, C, B, T> RingReader<S, P, C, B, T>
+where
+    S: Borrow<Ring<P, C, B, T>>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    const fn new_(ring: S) -> Self {
+        RingReader { ring_ref_: ring, _using_r_: PhantomData }
+    }
+
+    #[inline]
+    pub fn try_read<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> SomeOf<RingSegmRef<'f, P, C, B, T>, ConsumerError<usize>> {
+        self.ring_ref_.borrow().try_read_(demand)
+    }
+
+    #[inline]
+    pub fn ring_state(&self) -> &RingState {
+        &self.ring_ref_.borrow().buf_stat_
+    }
+
+    #[inline]
+    pub fn consumer_state(&self) -> Option<(usize, bool)> {
+        self.ring_ref_.borrow().consumer_state()
+    }
+}
+
+impl<S, P, C, B, T> RingReader<S, P, C, B, T>
+where
+    S: Borrow<Ring<P, C, B, T>>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B> + TrPark<Err = ConsumerError<usize>>,
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    #[inline]
+    pub fn read_async<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> RingReadAsync<'f, 'f, P, C, B, T> {
+        let ring = self.ring_ref_.borrow();
+        RingReadAsync::new(ring, demand)
+    }
+}
+
+impl<S, P, C, B, T> TrConsumerState for RingReader<S, P, C, B, T>
+where
+    S: Borrow<Ring<P, C, B, T>>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    #[inline]
+    fn consumer_state(&self) -> Option<(usize, bool)> {
+        RingReader::consumer_state(self)
+    }
+}
+
+impl<S, P, C, B, T> abs_buff::TrBuffTryRead<T> for RingReader<S, P, C, B, T>
+where
+    S: Borrow<Ring<P, C, B, T>>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    type SegmRef<'f> = RingSegmRef<'f, P, C, B, T> where Self: 'f;
+    type Err = ConsumerError<usize>;
+
+    #[inline]
+    fn try_read<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
+        RingReader::try_read(self, demand)
+    }
+}
+
+impl<S, P, C, B, T> abs_buff::TrBuffRead<T> for RingReader<S, P, C, B, T>
+where
+    S: Borrow<Ring<P, C, B, T>>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B> + TrPark<Err = Self::Err>,
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    type ReadAsync<'f> = RingReadAsync<'f, 'f, P, C, B, T> where Self: 'f;
+
+    #[inline]
+    fn read_async<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> Self::ReadAsync<'f> {
+        RingReader::read_async(self, demand)
+    }
+}
+
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// RingWriter
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+pub type RingSegmMut<'f, P, C, B, T> =
+    ReclSliceMut<'f, T, Reclaim<'f, Ring<P, C, B, T>>>;
+
+pub struct RingWriter<S, P, C, B, T>
+where
+    S: Borrow<Ring<P, C, B, T>>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    ring_ref_: S,
+    _using_r_: PhantomData<Ring<P, C, B, T>>,
+}
+
+impl<S, P, C, B, T> RingWriter<S, P, C, B, T>
+where
+    S: Borrow<Ring<P, C, B, T>>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    const fn new_(ring: S) -> Self {
+        RingWriter { ring_ref_: ring, _using_r_: PhantomData }
+    }
+
+    #[inline]
+    pub fn try_write<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> SomeOf<RingSegmMut<'f, P, C, B, T>, ProducerError<usize>> {
+        self.ring_ref_.borrow().try_write_(demand)
+    }
+
+    #[inline]
+    pub fn ring_state(&self) -> &RingState {
+        &self.ring_ref_.borrow().buf_stat_
+    }
+
+    #[inline]
+    pub fn producer_state(&self) -> Option<(usize, bool)> {
+        let ring = &self.ring_ref_.borrow();
+        Ring::producer_state(ring)
+    }
+}
+
+impl<S, P, C, B, T> RingWriter<S, P, C, B, T>
+where
+    S: Borrow<Ring<P, C, B, T>>,
+    P: TrProducerHook<T, Buff = B> + TrPark<Err = ProducerError<usize>>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    #[inline]
+    pub fn write_async<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> RingWriteAsync<'f, 'f, P, C, B, T> {
+        let ring = self.ring_ref_.borrow();
+        RingWriteAsync::new(ring, demand)
+    }
+}
+
+impl<S, P, C, B, T> TrProducerState for RingWriter<S, P, C, B, T>
+where
+    S: Borrow<Ring<P, C, B, T>>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    #[inline]
+    fn producer_state(&self) -> Option<(usize, bool)> {
+        RingWriter::producer_state(self)
+    }
+}
+
+impl<S, P, C, B, T> abs_buff::TrBuffTryWrite<T> for RingWriter<S, P, C, B, T>
+where
+    S: Borrow<Ring<P, C, B, T>>,
+    P: TrProducerHook<T, Buff = B>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    type SegmMut<'f> = RingSegmMut<'f, P, C, B, T> where Self: 'f;
+    type Err = ProducerError<usize>;
+
+    #[inline]
+    fn try_write<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> SomeOf<Self::SegmMut<'f>, Self::Err> {
+        RingWriter::try_write(self, demand)
+    }
+}
+
+impl<S, P, C, B, T> abs_buff::TrBuffWrite<T> for RingWriter<S, P, C, B, T>
+where
+    S: Borrow<Ring<P, C, B, T>>,
+    P: TrProducerHook<T, Buff = B> + TrPark<Err = Self::Err>,
+    C: TrConsumerHook<T, Buff = B>,
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    type WriteAsync<'f> = RingWriteAsync<'f, 'f, P, C, B, T> where Self: 'f;
+
+    #[inline]
+    fn write_async<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> Self::WriteAsync<'f> {
+        RingWriter::write_async(self, demand)
+    }
 }

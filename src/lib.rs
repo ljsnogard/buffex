@@ -2,6 +2,7 @@
 #![allow(unused_features)]
 #![feature(async_fn_traits)]
 #![feature(impl_trait_in_assoc_type)]
+#![feature(impl_restriction)]
 #![feature(unboxed_closures)]
 #![feature(unsafe_cell_access)]
 

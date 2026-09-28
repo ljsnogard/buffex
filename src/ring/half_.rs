@@ -9,11 +9,7 @@ use core::{
     task::{Context, Poll, Waker},
 };
 
-use abs_buff::{
-    Demand,
-    // buffer::{TrAsBuffer, TrAsBufferMut},
-    x_deps::abs_cancel,
-};
+use abs_buff::{Demand, x_deps::abs_cancel};
 use abs_cancel::{NonCancellableToken, TrMayCancel, TrCancellationToken};
 use atomex::AtomexPtrOwned;
 use atomic_sync::x_deps::atomex;
