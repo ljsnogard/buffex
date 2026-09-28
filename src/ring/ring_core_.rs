@@ -8,7 +8,7 @@ use core::{
 
 use abs_buff::{
     Demand,
-    buffer::TrAsBufferMut,
+    buffer::{TrAsBufferMut, TrConsumerState, TrProducerState},
     error::{IoErrTag, TrTaggedError, TrErrTag},
     gen_may_cancel_future,
     x_deps::{abs_cancel, anylr},
@@ -24,6 +24,8 @@ use super::{
     reclaim::{Reclaim, ReclSliceMut, ReclSliceRef, SegmSlicesMut, SegmSlicesRef},
 };
 
+#[derive(Debug)]
+#[repr(C)]
 pub struct Ring<P, C, B, T = u8>
 where
     P: TrProducerHook<T, Buff = B>,
@@ -32,7 +34,7 @@ where
 {
     /// `rp`（低 `POS_BITS` 位）| `wp`（次 `POS_BITS` 位）| 全部标志（高位：
     /// 关闭 ×2、待机 ×2、泵互斥 ×1、待办泵 ×2）。
-    atm_flag_: AtomicFlags<usize>,
+    buf_stat_: RingState,
     buf_cell_: UnsafeCell<B>,
 
     /// 环形缓冲（拥有）：统一 `[MaybeUninit<T>]` 视图。基址经裸指针访问，
@@ -54,21 +56,21 @@ where
         producer: P,
         consumer: C,
     ) -> Self {
-        let cap = buffer.as_slice_uninit().len();
-        debug_assert!(cap >= MIN_CAPACITY);
-        debug_assert!(cap <= MAX_CAPACITY);
+        let capacity = buffer.as_slice_uninit().len();
+        debug_assert!(capacity >= MIN_CAPACITY);
+        debug_assert!(capacity <= MAX_CAPACITY);
         let mut ring = Ring {
-            atm_flag_: AtomicFlags::new(AtomicUsize::new(0usize)),
+            buf_stat_: RingState::new(capacity),
             buf_cell_: UnsafeCell::new(buffer),
             producer_: producer,
             consumer_: consumer,
             _unuse_t_: PhantomData,
             _pinning_: PhantomPinned,
         };
-        let pos = IoPos::unpack(ring.atm_flag_.value(), cap);
         // SAFETY: the factory uniquely owned the buffer.
         let buf = unsafe { ring.buf_cell_.as_mut_unchecked() };
-        ring.producer_.init_once(buf, &pos);
+        ring.producer_.init_once(buf, &ring.buf_stat_);
+        ring.consumer_.init_once(buf, &ring.buf_stat_);
         ring
     }
 
@@ -93,41 +95,32 @@ where
     // 状态查询
     // ------------------------------------------------------------------
 
+    /// The unchanged capacity
     #[inline]
-    pub fn capacity(&self) -> usize {
-        // Safety: borrow
-        unsafe {
-            self.buf_cell_
-                .as_ref_unchecked()
-                .as_slice_uninit()
-                .len()
-        }
+    pub const fn capacity(&self) -> usize {
+        self.buf_stat_.capacity()
     }
 
     /// 当前可读数据量。
     #[inline]
     pub fn data_size(&self) -> usize {
-        let state = self.atm_flag_.value();
-        let pos = IoPos::unpack(state, self.capacity());
-        pos.data_size()
+        self.buf_stat_.data_size()
     }
 
     /// 当前可写空间量。
     #[inline]
     pub fn free_size(&self) -> usize {
-        let state = self.atm_flag_.value();
-        let pos = IoPos::unpack(state, self.capacity());
-        pos.free_size()
+        self.buf_stat_.free_size()
     }
 
     #[inline]
     pub fn is_producer_closed(&self) -> bool {
-        has_flag(self.atm_flag_.value(), PRODUCER_CLOSED)
+        self.buf_stat_.is_producer_closed()
     }
 
     #[inline]
     pub fn is_consumer_closed(&self) -> bool {
-        has_flag(self.atm_flag_.value(), CONSUMER_CLOSED)
+        self.buf_stat_.is_consumer_closed()
     }
 
     // ------------------------------------------------------------------
@@ -203,9 +196,8 @@ where
     ) -> Result<(usize, usize), ConsumerError<usize>> {
         let min_len = demand.min().copied().unwrap_or(0);
         let max_len = demand.max().copied().unwrap_or(usize::MAX);
-        let state = self.atm_flag_.value();
-        let cap = self.capacity();
-        let pos = IoPos::unpack(state, cap);
+        let state = self.buf_stat_.value();
+        let pos = IoPos::unpack(state, self.capacity());
         let ready = pos.data_size();
         if ready == 0 {
             if has_flag(state, PRODUCER_CLOSED)
@@ -236,7 +228,7 @@ where
     ) -> Result<(usize, usize), ProducerError<usize>> {
         let min_len = demand.min().copied().unwrap_or(0);
         let max_len = demand.max().copied().unwrap_or(usize::MAX);
-        let state = self.atm_flag_.value();
+        let state = self.buf_stat_.value();
         let cap = self.capacity();
         let pos = IoPos::unpack(state, cap);
         let free = pos.free_size();
@@ -264,7 +256,7 @@ where
         });
         let pos = IoPos::unpack(s, cap);
         let buf = unsafe { self.buf_cell_.as_ref_unchecked() };
-        self.consumer_.handle_event(buf, &pos);
+        self.consumer_.handle_event(buf, &self.buf_stat_);
         pos.free_size()
     }
 
@@ -277,7 +269,7 @@ where
         });
         let pos = IoPos::unpack(s, cap);
         let buf = unsafe { self.buf_cell_.as_mut_unchecked() };
-        self.producer_.handle_event(buf, &pos);
+        self.producer_.handle_event(buf, &self.buf_stat_);
         pos.data_size()
     }
 
@@ -287,7 +279,8 @@ where
     {
         let expect = |_| true;
         let desire = f;
-        self.atm_flag_
+        self.buf_stat_
+            .atm_flag_
             .try_spin_compare_exchange_weak(expect, desire)
             .into_inner()
     }
@@ -355,7 +348,7 @@ where
 // Ring TrBuffRead TrBuffWrite
 // -- ---- ---- ---- ---- ---- ---- ---- ----
 
-impl<P, C, B, T> abs_buff::buffer::TrConsumerState for Ring<P, C, B, T>
+impl<P, C, B, T> TrConsumerState for Ring<P, C, B, T>
 where
     P: TrProducerHook<T, Buff = B>,
     C: TrConsumerHook<T, Buff = B>,
@@ -368,7 +361,7 @@ where
     }
 }
 
-impl<P, C, B, T> abs_buff::buffer::TrProducerState for Ring<P, C, B, T>
+impl<P, C, B, T> TrProducerState for Ring<P, C, B, T>
 where
     P: TrProducerHook<T, Buff = B>,
     C: TrConsumerHook<T, Buff = B>,
@@ -646,18 +639,19 @@ where
             if x.contains_left() {
                 return x
             }
-            if x.contains_right_and(err_should_term_op) {
+            if x.contains_right_and(err_should_term_op_) {
                 return x;
             }
+            // x 在此处结束对 ring 的借用
         }
         if cancel.is_cancelled() {
             return SomeOf::new_right(ConsumerError::Cancelled);
         }
         let opt_err = ring.consumer_
-            .park_async()
+            .park_async(demand)
             .may_cancel_with(cancel.child_token())
             .await;
-        if opt_err.as_ref().is_some_and(err_should_term_op) {
+        if opt_err.as_ref().is_some_and(err_should_term_op_) {
             return SomeOf::new_right(opt_err.unwrap())
         }
     }
@@ -684,7 +678,7 @@ where
             if x.contains_left() {
                 return x
             }
-            if x.contains_right_and(err_should_term_op) {
+            if x.contains_right_and(err_should_term_op_) {
                 return x;
             }
         }
@@ -692,16 +686,69 @@ where
             return SomeOf::new_right(ProducerError::Cancelled);
         }
         let opt_err = ring.producer_
-            .park_async()
+            .park_async(demand)
             .may_cancel_with(cancel.child_token())
             .await;
-        if opt_err.as_ref().is_some_and(err_should_term_op) {
+        if opt_err.as_ref().is_some_and(err_should_term_op_) {
             return SomeOf::new_right(opt_err.unwrap())
         }
     }
 }
 
-fn err_should_term_op<E, T>(err: &E) -> bool
+#[derive(Debug)]
+pub struct RingState {
+    atm_flag_: AtomicFlags<usize>,
+    capacity_: usize,
+}
+
+impl RingState {
+    const fn new(capacity: usize) -> Self {
+        RingState {
+            atm_flag_: AtomicFlags::new(AtomicUsize::new(0usize)),
+            capacity_: capacity,
+        }
+    }
+
+    #[inline]
+    pub const fn capacity(&self) -> usize {
+        self.capacity_
+    }
+
+    #[inline]
+    pub fn value(&self) -> usize {
+        self.atm_flag_.value()
+    }
+
+    #[inline]
+    pub fn io_pos(&self) -> IoPos {
+        IoPos::unpack(self.atm_flag_.value(), self.capacity())
+    }
+
+    #[inline]
+    pub fn data_size(&self) -> usize {
+        self.io_pos().data_size()
+    }
+
+    /// 当前可写空间量。
+    #[inline]
+    pub fn free_size(&self) -> usize {
+        self.io_pos().free_size()
+    }
+
+    #[inline]
+    pub fn is_consumer_closed(&self) -> bool {
+        let state = self.atm_flag_.value();
+        has_flag(state, CONSUMER_CLOSED)
+    }
+
+    #[inline]
+    pub fn is_producer_closed(&self) -> bool {
+        let state = self.atm_flag_.value();
+        has_flag(state, PRODUCER_CLOSED)
+    }
+}
+
+fn err_should_term_op_<E, T>(err: &E) -> bool
 where
     E: TrTaggedError<T>,
     T: TrErrTag + Into<IoErrTag>,

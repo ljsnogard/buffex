@@ -2,6 +2,8 @@ use core::{
     future::{Future, IntoFuture},
     marker::PhantomData,
     pin::Pin,
+    ptr::{self, NonNull},
+    sync::atomic::AtomicPtr,
     task::{Context, Poll, Waker},
 };
 
@@ -11,52 +13,79 @@ use abs_buff::{
     x_deps::abs_cancel,
 };
 use abs_cancel::{NonCancellableToken, TrMayCancel, TrCancellationToken};
+use atomex::AtomexPtrOwned;
+use atomic_sync::x_deps::atomex;
 
 use super::{
     error_::{ConsumerError, ProducerError},
     hook_::{TrConsumerHook, TrProducerHook, TrPark},
+    ring_core_::RingState,
 };
 
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // passive::ConsumerHook
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-pub struct ConsumerHook<B, T>
+#[derive(Debug)]
+pub struct Consumer<B, T>
 where
     B: TrAsBuffer<T>,
 {
-    wake_slot_: Option<Waker>,
-    opt_demand_: Option<Demand<usize>>,
-    _using_b_: PhantomData<fn() -> B>,
-    _using_t_: PhantomData<fn() -> T>,
+    ring_half_: RingHalf_,
+    _unused_b_: PhantomData<fn() -> B>,
+    _unused_t_: PhantomData<fn() -> T>,
 }
 
-impl<B, T> TrConsumerHook<T> for ConsumerHook<B, T>
+impl<B, T> Consumer<B, T>
+where
+    B: TrAsBuffer<T>,
+{
+    pub(super) const fn new() -> Self {
+        Consumer {
+            ring_half_: RingHalf_::new_(),
+            _unused_b_: PhantomData,
+            _unused_t_: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn pending_demand_(&self) -> Option<&Demand<usize>> {
+        self.ring_half_.pending_demand_()
+    }
+
+    #[inline]
+    fn reset_demand_(&self) -> bool {
+        self.ring_half_.reset_demand_()
+    }
+}
+
+impl<B, T> TrConsumerHook<T> for Consumer<B, T>
 where
     B: TrAsBuffer<T>,
 {
     type Buff = B;
 
-    fn init_once(&mut self, buf: &Self::Buff, pos: &super::IoPos) {
-        let _ = (buf, pos);
+    fn init_once(&mut self, buf: &Self::Buff, state: &RingState) {
+        let _ = (buf, state);
     }
 
-    fn handle_event(&self, _: &Self::Buff, pos: &super::IoPos) {
-        let Option::Some(demand) = &self.opt_demand_ else {
+    fn handle_event(&self, _: &Self::Buff, state: &RingState) {
+        let Option::Some(demand) = self.ring_half_.pending_demand_() else {
             return;
         };
         let min_demand = demand.min().copied().unwrap_or(1usize);
+        let pos = state.io_pos();
         if pos.data_size() < min_demand {
             return;
         }
-        let Option::Some(waker_ref) = &self.wake_slot_ else {
+        let Option::Some(waker_ref) = &self.ring_half_.wake_slot_ else {
             return;
         };
         waker_ref.wake_by_ref();
     }
 }
 
-impl<B, T> TrPark for ConsumerHook<B, T>
+impl<B, T> TrPark for Consumer<B, T>
 where
     B: TrAsBuffer<T>,
 {
@@ -64,8 +93,11 @@ where
     type Err = ConsumerError<usize>;
 
     #[inline]
-    fn park_async(&mut self) -> Self::ParkAsync<'_> {
-        ConsumerParkAsync::new(self)
+    fn park_async<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> Self::ParkAsync<'f> {
+        ConsumerParkAsync::new_(self, demand)
     }
 }
 
@@ -73,19 +105,20 @@ where
 // passive::ConsumerParkAsync
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-pub struct ConsumerParkAsync<'a, B, T>
+pub struct ConsumerParkAsync<'a, B, T>(&'a mut Consumer<B, T>)
 where
-    B: TrAsBuffer<T>,
-{
-    hook_: &'a mut ConsumerHook<B, T>,
-}
+    B: TrAsBuffer<T>;
 
 impl<'a, B, T> ConsumerParkAsync<'a, B, T>
 where
     B: TrAsBuffer<T>,
 {
-    const fn new(hook: &'a mut ConsumerHook<B, T>) -> Self {
-        ConsumerParkAsync { hook_: hook }
+    fn new_(
+        consumer: &'a mut Consumer<B, T>,
+        demand: &'a Demand<usize>,
+    ) -> Self {
+        consumer.ring_half_.init_demand_(demand);
+        ConsumerParkAsync(consumer)
     }
 }
 
@@ -97,9 +130,9 @@ where
     type Output = Option<ConsumerError<usize>>;
 
     fn into_future(self) -> Self::IntoFuture {
-        let hook = self.hook_;
+        let consumer = self.0;
         let cancel = NonCancellableToken::new();
-        ConsumerParkFuture::new(hook, cancel)
+        ConsumerParkFuture::new(consumer, cancel)
     }
 }
 
@@ -115,15 +148,12 @@ where
 
     type MayCancelOutput = Option<ConsumerError<usize>>;
 
-    fn may_cancel_with<C>(
-        self,
-        cancel: C,
-    ) -> Self::MayCancelFuture<'a, C>
+    fn may_cancel_with<C>(self, cancel: C) -> Self::MayCancelFuture<'a, C>
     where
-        C: 'a + TrCancellationToken
+        C: 'a + TrCancellationToken,
     {
-        let hook = self.hook_;
-        ConsumerParkFuture::new(hook, cancel)
+        let consumer = self.0;
+        ConsumerParkFuture::new(consumer, cancel)
     }
 }
 
@@ -138,7 +168,7 @@ where
     B: TrAsBuffer<T>,
     K: TrCancellationToken,
 {
-    hook_: &'a mut ConsumerHook<B, T>,
+    consumer_: &'a mut Consumer<B, T>,
     cancel_tok_: Option<K>,
     cancel_sig_: Option<<K::ChildToken as TrCancellationToken>::Cancellation>,
 }
@@ -148,9 +178,12 @@ where
     B: TrAsBuffer<T>,
     K: TrCancellationToken,
 {
-    const fn new(hook: &'a mut ConsumerHook<B, T>, cancel: K) -> Self {
+    const fn new(
+        consumer: &'a mut Consumer<B, T>,
+        cancel: K,
+    ) -> Self {
         ConsumerParkFuture {
-            hook_: hook,
+            consumer_: consumer,
             cancel_tok_: Option::Some(cancel),
             cancel_sig_: Option::None,
         }
@@ -165,36 +198,8 @@ where
     type Output = Option<ConsumerError<usize>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        // consumer hook 没有 waker 时，表明这是第一次 poll。
-        if this.hook_.wake_slot_.is_none() {
-            this.hook_.wake_slot_ = Some(cx.waker().clone());
-            // 第一次 poll 时取得 cancellation signal。
-            if this.cancel_sig_.is_none() {
-                let child_tok = this.cancel_tok_
-                    .as_ref()
-                    .map(|tk| tk.child_token())
-                    .expect("cancel token already taken");
-
-                this.cancel_sig_ = Some(child_tok.cancellation());
-            }
-            // cancellation signal 与 consumer hook 共用当前 waker。
-            let Option::Some(cancel_sig) = this.cancel_sig_.as_mut() else {
-                unreachable!()
-            };
-            let f = unsafe { Pin::new_unchecked(cancel_sig) };
-            if f.poll(cx).is_ready() {
-                Poll::Ready(Some(ConsumerError::Cancelled))
-            } else {
-                Poll::Pending
-            }
-        } else {
-            if this.cancel_tok_.as_ref().is_some_and(|tk| tk.is_cancelled()) {
-                Poll::Ready(Option::Some(ConsumerError::Cancelled))
-            } else {
-                Poll::Ready(Option::None)
-            }
-        }
+        let make_cancelled = || ConsumerError::Cancelled;
+        poll_park_future_(self, make_cancelled, cx)
     }
 }
 
@@ -202,42 +207,65 @@ where
 // passive::ProducerHook
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-pub struct ProducerHook<B, T>
+pub struct Producer<B, T>
 where
     B: TrAsBufferMut<T>,
 {
-    wake_slot_: Option<Waker>,
-    opt_demand_: Option<Demand<usize>>,
-    _using_b_: PhantomData<fn() -> B>,
-    _using_t_: PhantomData<fn() -> T>,
+    ring_half_: RingHalf_,
+    _unused_b_: PhantomData<fn() -> B>,
+    _unused_t_: PhantomData<fn() -> T>,
 }
 
-impl<B, T> TrProducerHook<T> for ConsumerHook<B, T>
+impl<B, T> Producer<B, T>
+where
+    B: TrAsBufferMut<T>,
+{
+    pub(super) const fn new() -> Self {
+        Producer {
+            ring_half_: RingHalf_::new_(),
+            _unused_b_: PhantomData,
+            _unused_t_: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn pending_demand_(&self) -> Option<&Demand<usize>> {
+        self.ring_half_.pending_demand_()
+    }
+
+    #[inline]
+    fn reset_demand_(&self) -> bool {
+        self.ring_half_.reset_demand_()
+    }
+}
+
+impl<B, T> TrProducerHook<T> for Producer<B, T>
 where
     B: TrAsBufferMut<T>,
 {
     type Buff = B;
 
-    fn init_once(&mut self, buf: &Self::Buff, pos: &super::IoPos) {
-        let _ = (buf, pos);
+    fn init_once(&mut self, buf: &Self::Buff, state: &RingState) {
+        let _ = (buf, state);
     }
 
-    fn handle_event(&self, _: &Self::Buff, pos: &super::IoPos) {
-        let Option::Some(demand) = &self.opt_demand_ else {
+    fn handle_event(&self, _: &Self::Buff, state: &RingState) {
+        let Option::Some(demand) = self.pending_demand_() else {
             return;
         };
         let min_demand = demand.min().copied().unwrap_or(1usize);
+        let pos = state.io_pos();
         if pos.data_size() < min_demand {
             return;
         }
-        let Option::Some(waker_ref) = &self.wake_slot_ else {
+        let Option::Some(waker_ref) = &self.ring_half_.wake_slot_ else {
             return;
         };
         waker_ref.wake_by_ref();
     }
 }
 
-impl<B, T> TrPark for ProducerHook<B, T>
+impl<B, T> TrPark for Producer<B, T>
 where
     B: TrAsBufferMut<T>,
 {
@@ -245,8 +273,11 @@ where
     type Err = ProducerError<usize>;
 
     #[inline]
-    fn park_async(&mut self) -> Self::ParkAsync<'_> {
-        ProducerParkAsync::new(self)
+    fn park_async<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> Self::ParkAsync<'f> {
+        ProducerParkAsync::new_(self, demand)
     }
 }
 
@@ -254,19 +285,20 @@ where
 // passive::ProducerParkAsync
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-pub struct ProducerParkAsync<'a, B, T>
+pub struct ProducerParkAsync<'a, B, T>(&'a mut Producer<B, T>)
 where
-    B: TrAsBufferMut<T>,
-{
-    hook_: &'a mut ProducerHook<B, T>,
-}
+    B: TrAsBufferMut<T>;
 
 impl<'a, B, T> ProducerParkAsync<'a, B, T>
 where
     B: TrAsBufferMut<T>,
 {
-    const fn new(hook: &'a mut ProducerHook<B, T>) -> Self {
-        ProducerParkAsync { hook_: hook }
+    fn new_(
+        producer: &'a mut Producer<B, T>,
+        demand: &'a Demand<usize>,
+    ) -> Self {
+        producer.ring_half_.init_demand_(demand);
+        ProducerParkAsync(producer)
     }
 }
 
@@ -278,9 +310,9 @@ where
     type Output = Option<ProducerError<usize>>;
 
     fn into_future(self) -> Self::IntoFuture {
-        let hook = self.hook_;
+        let producer = self.0;
         let cancel = NonCancellableToken::new();
-        ProducerParkFuture::new(hook, cancel)
+        ProducerParkFuture::new(producer, cancel)
     }
 }
 
@@ -303,8 +335,8 @@ where
     where
         C: 'a + TrCancellationToken
     {
-        let hook = self.hook_;
-        ProducerParkFuture::new(hook, cancel)
+        let producer = self.0;
+        ProducerParkFuture::new(producer, cancel)
     }
 }
 
@@ -319,7 +351,7 @@ where
     B: TrAsBufferMut<T>,
     K: TrCancellationToken,
 {
-    hook_: &'a mut ProducerHook<B, T>,
+    producer_: &'a mut Producer<B, T>,
     cancel_tok_: Option<K>,
     cancel_sig_: Option<<K::ChildToken as TrCancellationToken>::Cancellation>,
 }
@@ -329,9 +361,9 @@ where
     B: TrAsBufferMut<T>,
     K: TrCancellationToken,
 {
-    const fn new(hook: &'a mut ProducerHook<B, T>, cancel: K) -> Self {
+    const fn new(producer: &'a mut Producer<B, T>, cancel: K) -> Self {
         ProducerParkFuture {
-            hook_: hook,
+            producer_: producer,
             cancel_tok_: Option::Some(cancel),
             cancel_sig_: Option::None,
         }
@@ -346,35 +378,178 @@ where
     type Output = Option<ProducerError<usize>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        // consumer hook 没有 waker 时，表明这是第一次 poll。
-        if this.hook_.wake_slot_.is_none() {
-            this.hook_.wake_slot_ = Some(cx.waker().clone());
-            // 第一次 poll 时取得 cancellation signal。
-            if this.cancel_sig_.is_none() {
-                let child_tok = this.cancel_tok_
-                    .as_ref()
-                    .map(|tk| tk.child_token())
-                    .expect("cancel token already taken");
+        let make_cancelled = || ProducerError::Cancelled;
+        poll_park_future_(self, make_cancelled, cx)
+    }
+}
 
-                this.cancel_sig_ = Some(child_tok.cancellation());
-            }
-            // cancellation signal 与 consumer hook 共用当前 waker。
-            let Option::Some(cancel_sig) = this.cancel_sig_.as_mut() else {
-                unreachable!()
-            };
-            let f = unsafe { Pin::new_unchecked(cancel_sig) };
-            if f.poll(cx).is_ready() {
-                Poll::Ready(Some(ProducerError::Cancelled))
-            } else {
-                Poll::Pending
-            }
-        } else {
-            if this.cancel_tok_.as_ref().is_some_and(|tk| tk.is_cancelled()) {
-                Poll::Ready(Option::Some(ProducerError::Cancelled))
-            } else {
-                Poll::Ready(Option::None)
-            }
+trait TrAsRingHalf_ {
+    fn as_half_mut_(&mut self) -> &mut RingHalf_;
+}
+
+impl<B, T> TrAsRingHalf_ for Consumer<B, T>
+where
+    B: TrAsBuffer<T>,
+{
+    fn as_half_mut_(&mut self) -> &mut RingHalf_ {
+        &mut self.ring_half_
+    }
+}
+
+impl<B, T> TrAsRingHalf_ for Producer<B, T>
+where
+    B: TrAsBufferMut<T>,
+{
+    fn as_half_mut_(&mut self) -> &mut RingHalf_ {
+        &mut self.ring_half_
+    }
+}
+
+#[derive(Debug)]
+struct RingHalf_ {
+    wake_slot_: Option<Waker>,
+    opt_demand_: AtomexPtrOwned<Demand<usize>>,
+}
+
+impl RingHalf_ {
+    const fn new_() -> Self {
+        RingHalf_ {
+            wake_slot_: Option::None,
+            opt_demand_: AtomexPtrOwned::new(AtomicPtr::new(ptr::null_mut())),
         }
     }
+
+    #[inline]
+    fn init_demand_(&self, demand: &Demand<usize>) -> bool {
+        self.opt_demand_.try_spin_init(NonNull::from(demand)).is_ok()
+    }
+
+    #[inline]
+    fn pending_demand_(&self) -> Option<&Demand<usize>> {
+        let ptr = self.opt_demand_.load()?;
+        Option::Some(unsafe { ptr.as_ref() })
+    }
+
+    #[inline]
+    fn reset_demand_(&self) -> bool {
+        self.opt_demand_.try_reset().is_ok()
+    }
+}
+
+
+trait TrFutBorrowRingHalf_: Future {
+    type Half: TrAsRingHalf_;
+    type CancelTok: TrCancellationToken;
+
+    fn half_mut(&mut self) -> &mut Self::Half;
+
+    fn cancel_sig(
+        &mut self,
+    ) -> &mut Option<
+        <<Self::CancelTok as TrCancellationToken>::ChildToken
+            as TrCancellationToken>::Cancellation
+    >;
+
+    fn cancel_tok(
+        &mut self
+    ) -> &mut Option<Self::CancelTok>;
+}
+
+impl<'a, B, T, K> TrFutBorrowRingHalf_ for ConsumerParkFuture<'a, B, T, K>
+where
+    B: TrAsBuffer<T>,
+    K: TrCancellationToken,
+{
+    type Half = Consumer<B, T>;
+    type CancelTok = K;
+
+    fn half_mut(&mut self) -> &mut Self::Half {
+        self.consumer_
+    }
+
+    fn cancel_sig(
+        &mut self,
+    ) -> &mut Option<
+        <<Self::CancelTok as TrCancellationToken>::ChildToken
+            as TrCancellationToken>::Cancellation
+    > {
+        &mut self.cancel_sig_
+    }
+
+    fn cancel_tok(
+        &mut self
+    ) -> &mut Option<Self::CancelTok> {
+        &mut self.cancel_tok_
+    }
+}
+
+impl<'a, B, T, K> TrFutBorrowRingHalf_ for ProducerParkFuture<'a, B, T, K>
+where
+    B: TrAsBufferMut<T>,
+    K: TrCancellationToken,
+{
+    type Half = Producer<B, T>;
+    type CancelTok = K;
+
+    fn half_mut(&mut self) -> &mut Self::Half {
+        self.producer_
+    }
+
+    fn cancel_sig(
+        &mut self,
+    ) -> &mut Option<
+        <<Self::CancelTok as TrCancellationToken>::ChildToken
+            as TrCancellationToken>::Cancellation
+    > {
+        &mut self.cancel_sig_
+    }
+
+    fn cancel_tok(
+        &mut self
+    ) -> &mut Option<Self::CancelTok> {
+        &mut self.cancel_tok_
+    }
+}
+
+fn poll_park_future_<F, E>(
+    future: Pin<&mut F>,
+    make_cancelled: impl FnOnce() -> E,
+    cx: &mut Context<'_>,
+) -> Poll<Option<E>>
+where
+    F: TrFutBorrowRingHalf_,
+{
+    let this = unsafe { future.get_unchecked_mut() };
+    // 没有 waker 时，表明这是第一次 poll。
+    let x = if this.half_mut().as_half_mut_().wake_slot_.is_none() {
+        let slot = &mut this.half_mut().as_half_mut_().wake_slot_;
+        *slot = Some(cx.waker().clone());
+        // 第一次 poll 时取得 cancellation signal。
+        if this.cancel_sig().is_none() {
+            let child_tok = this.cancel_tok()
+                .as_ref()
+                .map(|tk| tk.child_token())
+                .expect("cancel token already taken");
+
+            *this.cancel_sig() = Some(child_tok.cancellation());
+        }
+        // cancellation signal 与 consumer hook 共用当前 waker。
+        let Option::Some(cancel_sig) = this.cancel_sig().as_mut() else {
+            unreachable!()
+        };
+        let f = unsafe { Pin::new_unchecked(cancel_sig) };
+        if f.poll(cx).is_ready() {
+            Poll::Ready(Option::Some(make_cancelled()))
+        } else {
+            Poll::Pending
+        }
+    } else {
+        if this.cancel_tok().as_ref().is_some_and(|tk| tk.is_cancelled()) {
+            Poll::Ready(Option::Some(make_cancelled()))
+        } else {
+            Poll::Ready(Option::None)
+        }
+    };
+    this.half_mut().as_half_mut_().reset_demand_();
+    x
 }

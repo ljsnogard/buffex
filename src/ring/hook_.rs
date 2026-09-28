@@ -1,25 +1,26 @@
 use abs_buff::{
+    Demand,
     buffer::{TrAsBuffer, TrAsBufferMut},
     x_deps::abs_cancel,
 };
 use abs_cancel::TrMayCancel;
 
-use super::ring_core_::IoPos;
+use super::ring_core_::RingState;
 
 pub trait TrConsumerHook<T> {
     type Buff: TrAsBuffer<T>;
 
-    fn init_once(&mut self, buf: &Self::Buff, pos: &IoPos);
+    fn init_once(&mut self, buff: &Self::Buff, state: &RingState);
 
-    fn handle_event(&self, buf: &Self::Buff, pos: &IoPos);
+    fn handle_event(&self, buff: &Self::Buff, state: &RingState);
 }
 
 pub trait TrProducerHook<T> {
     type Buff: TrAsBufferMut<T>;
 
-    fn init_once(&mut self, buf: &Self::Buff, pos: &IoPos);
+    fn init_once(&mut self, buf: &Self::Buff, state: &RingState);
 
-    fn handle_event(&self, buf: &Self::Buff, pos: &IoPos);
+    fn handle_event(&self, buff: &Self::Buff, state: &RingState);
 }
 
 pub trait TrPark {
@@ -29,5 +30,8 @@ pub trait TrPark {
 
     type Err;
 
-    fn park_async(&mut self) -> Self::ParkAsync<'_>;
+    fn park_async<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> Self::ParkAsync<'f>;
 }
