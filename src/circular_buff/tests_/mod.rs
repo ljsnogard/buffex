@@ -66,7 +66,7 @@ pub(super) type DefaultBuilder =
 // * `ReadySegm` 是 abs_buff 的正式公开类型（立即就绪的 `SomeOf` future）；
 // * `TestErr` / `TestInput` / `TestOutput` 来自 abs_buff 的共享测试模块，
 //   由 dev-dependencies 里的 `segm-tests` feature 打开。
-pub(super) use abs_buff::ReadySegm;
+// pub(super) use abs_buff::ReadySegm;
 // pub(super) use abs_buff_testkit::{TestErr, TestInput, TestOutput};
 
 // ---------------------------------------------------------------------------

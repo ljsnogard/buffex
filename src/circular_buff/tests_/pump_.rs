@@ -35,17 +35,19 @@ use abs_buff::{
 
 use mm_ptr::Owned;
 
-use super::{
-    super::{
-        ConsumerError, ProducerError,
+use crate::{
+    circular_buff::{
+        self,
+        ConsumerError, ProducerError, BufProducer, CoreAlloc, DevConsumer,
         abs_comp_::{ConsumerHookEvent, TrConsumer},
         core_::{CircCore, Waiter},
-        BufProducer, CoreAlloc, DevConsumer,
     },
-    DefaultBuilder, ReadySegm, TestErr, TestInput, TestOutput, TestWaker, fill_segm,
-    take_segm,
+    test_support_::dual_runtime_test_
 };
-use crate::test_support_::dual_runtime_test_;
+use super::{
+    DefaultBuilder, ReadySegm, TestErr, TestInput, TestOutput, TestWaker,
+    fill_segm, take_segm,
+};
 
 /// 主动生产 × 被动消费：构造（`init_async`）即把 `TrInput` 现有数据灌满缓冲；
 /// 消费端每读取一次，读取提交（`advance_read`）驱动主动生产者**重复拉取**补满

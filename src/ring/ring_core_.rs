@@ -76,7 +76,7 @@ where
         consumer: C,
     ) -> Result<Self, usize> {
         let capacity = buffer.borrow().len();
-        if capacity < MIN_CAPACITY || capacity > MAX_CAPACITY {
+        if !(MIN_CAPACITY..=MAX_CAPACITY).contains(&capacity) {
             Result::Err(capacity)
         } else {
             Result::Ok(Self::new_unchecked(

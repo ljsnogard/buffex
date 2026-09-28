@@ -42,7 +42,7 @@ impl<B, T> Consumer<B, T>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
 {
-    pub(super) const fn new() -> Self {
+    pub const fn new() -> Self {
         Consumer {
             ring_half_: RingHalf_::new_(),
             _unused_b_: PhantomData,
@@ -54,10 +54,14 @@ where
     fn pending_demand_(&self) -> Option<&Demand<usize>> {
         self.ring_half_.pending_demand_()
     }
+}
 
-    #[inline]
-    fn reset_demand_(&self) -> bool {
-        self.ring_half_.reset_demand_()
+impl<B, T> Default for Consumer<B, T>
+where
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    fn default() -> Self {
+        Consumer::new()
     }
 }
 
@@ -72,7 +76,7 @@ where
     }
 
     fn handle_event(&self, _: &Self::Buff, state: &RingState) {
-        let Option::Some(demand) = self.ring_half_.pending_demand_() else {
+        let Option::Some(demand) = self.pending_demand_() else {
             return;
         };
         let min_demand = demand.min().copied().unwrap_or(1usize);
@@ -222,7 +226,7 @@ impl<B, T> Producer<B, T>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
 {
-    pub(super) const fn new() -> Self {
+    pub const fn new() -> Self {
         Producer {
             ring_half_: RingHalf_::new_(),
             _unused_b_: PhantomData,
@@ -234,10 +238,14 @@ where
     fn pending_demand_(&self) -> Option<&Demand<usize>> {
         self.ring_half_.pending_demand_()
     }
+}
 
-    #[inline]
-    fn reset_demand_(&self) -> bool {
-        self.ring_half_.reset_demand_()
+impl<B, T> Default for Producer<B, T>
+where
+    B: BorrowMut<[MaybeUninit<T>]>,
+{
+    fn default() -> Self {
+        Producer::new()
     }
 }
 
@@ -437,7 +445,6 @@ impl RingHalf_ {
         self.opt_demand_.try_reset().is_ok()
     }
 }
-
 
 trait TrFutBorrowRingHalf_: Future {
     type Half: TrAsRingHalf_;
