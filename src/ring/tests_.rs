@@ -13,22 +13,32 @@
 //! 与「空环」的区分）、`Demand` 的下限 / 上限语义、跨末端的两段式段、多轮 FIFO 顺序，
 //! 以及异步入口在条件不满足时确实 park、在取消令牌已就绪时立即返回 `Cancelled`。
 //!
-//! # 已知边界：`Ring` 内部无法并发持有两端
+//! 自 `Ring::split` 起，读写两端可以拆成 [`RingWriter`] / [`RingReader`] 分别持有，
+//! 因而能像 `circular_buff` 那样写「一端 park、另一端提交后唤醒」的 `join!` 并发用例
+//! （见「分拆后的并发读写」一节）。
 //!
-//! `circular_buff` 的读写两半可以分别持有（`tx` / `rx`），因此能写「一端 park、
-//! 另一端提交后唤醒」的并发用例。`ring::Ring` 把生产端 hook 与消费端 hook 装在
-//! **同一个对象**里，`try_read` / `read_async` 与 `try_write` / `write_async` 都要
-//! 借 `&mut Ring`，同一个任务里无法同时持有两端，所以这里只钉住「park 确实发生」
-//! 这一可观测事实；「唤醒已 park 的一端」要等 `Ring` 具备拆分能力后才能诚实测出。
-//! 另外 `Ring` 目前没有对外的 `close`，故不含 EOF 用例。
+//! # 已知缺陷：park 不能被复用、等待空间的写者会被提前唤醒
+//!
+//! `half_` 里的 `RingHalf_` 的 `wake_slot_` **只设不清**，且 `opt_demand_` 在 park
+//! future 中途 drop 时**不 reset**；再叠加 `Producer::handle_event` 用 `data_size()`
+//! （而非 `free_size()`）判定空间是否足够，会让「同一个半部第二次 park」「等待更多空间
+//! 的写者被提前唤醒」时，`ring_*_async` 的循环在**一次 poll 内同步空转**（不让出也不
+//! 返回，表现为任务挂死）。本节末尾的 `known_bug_*` 用例以「查询预算令牌」把空转截断
+//! 成**有界失败**，既是缺陷复现，也是修复后的验收标准（**当前实现下它们会失败**）。
+//!
+//! `Ring` 目前没有对外的 `close`，故不含 EOF 用例。
 
 use core::{
-    future::IntoFuture,
+    future::{self, IntoFuture},
     mem::MaybeUninit,
 };
 
 use std::{
     boxed::Box,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     vec,
     vec::Vec,
 };
@@ -36,7 +46,7 @@ use std::{
 use abs_buff::{
     Demand,
     buffer::{TrBuffSegmMut, TrReclaim},
-    x_deps::abs_cancel::{CancelledToken, TrMayCancel},
+    x_deps::abs_cancel::{CancelledToken, TrMayCancel, TrCancellationToken},
 };
 
 use crate::{
@@ -48,13 +58,25 @@ use crate::{
 // 测试辅助
 // ---------------------------------------------------------------------------
 
-/// 测试用 `Ring` 具体类型：元素 `u8`、缓冲 `Box<[MaybeUninit<u8>]>`、两端均为被动 hook。
-type TestRing = Ring<
-    Producer<Box<[MaybeUninit<u8>]>, u8>,
-    Consumer<Box<[MaybeUninit<u8>]>, u8>,
-    Box<[MaybeUninit<u8>]>,
-    u8,
->;
+/// 测试用缓冲类型：`Box<[MaybeUninit<u8>]>`（元素 `u8`）。
+type TestBuff = Box<[MaybeUninit<u8>]>;
+
+/// 测试用生产端 hook 类型（被动）。
+type TestProducer = Producer<TestBuff, u8>;
+
+/// 测试用消费端 hook 类型（被动）。
+type TestConsumer = Consumer<TestBuff, u8>;
+
+/// 测试用 `Ring` 具体类型。
+type TestRing = Ring<TestProducer, TestConsumer, TestBuff, u8>;
+
+/// `Ring::split` 出的写端（借用 `Ring`）。
+type TestWriter<'f> =
+    RingWriter<&'f TestRing, TestProducer, TestConsumer, TestBuff, u8>;
+
+/// `Ring::split` 出的读端（借用 `Ring`）。
+type TestReader<'f> =
+    RingReader<&'f TestRing, TestProducer, TestConsumer, TestBuff, u8>;
 
 /// 构造一个指定容量的测试环（容量须落在 `Ring` 允许的 `[2, MAX_CAPACITY]` 内）。
 fn new_ring_(capacity: usize) -> TestRing {
@@ -97,6 +119,76 @@ where
         .into_iter()
         .map(|m| unsafe { m.assume_init() })
         .collect()
+}
+
+/// 通过写端借出写段并写入 `data`，drop 提交后返回实际写入的元素数。
+async fn tx_write_(tx: &mut TestWriter<'_>, demand: &Demand<usize>, data: &[u8]) -> usize {
+    let some = tx.write_async(demand).await;
+    let mut segm = some.pick_left().expect("应能借出写段");
+    let moved = segm.move_items_from_as_buff(data);
+    drop(segm); // 提交：推进写位置并触发消费端事件
+    moved
+}
+
+/// 通过读端借出读段并取出 `len` 个元素，drop 提交后返回取出的字节序列。
+async fn rx_read_(rx: &mut TestReader<'_>, demand: &Demand<usize>, len: usize) -> Vec<u8> {
+    let some = rx.read_async(demand).await;
+    let mut segm = some.pick_left().expect("应能借出读段");
+    let got = take_segm_bytes_(&mut segm, len).await;
+    drop(segm); // 提交：推进读位置并触发生产端事件
+    got
+}
+
+/// 测试用取消令牌：`is_cancelled()` 被查询满 `budget_` 次之后才「取消」。
+///
+/// # 用途
+///
+/// `wake_slot_` 只设不清的缺陷会让 park future 第二次被 poll 时立即就绪，读 / 写循环
+/// 因此在**一次 poll 内同步空转**、不让出也不返回——直接跑会挂死。把预算调到很小的值，
+/// 空转就会在有限次查询后以 `Cancelled` 结束，于是缺陷表现为**有界失败**而不是挂死。
+///
+/// `cancellation()` 返回永不就绪的 future：正常实现里首次 park 必须继续挂起，不能被这个
+/// 令牌「提前放行」，否则用例在修复后也无法通过。
+#[derive(Clone)]
+struct BudgetToken {
+    checks_: Arc<AtomicUsize>,
+    budget_: usize,
+}
+
+impl BudgetToken {
+    /// 构造一个预算为 `budget` 次的令牌（父令牌与子令牌共享同一计数）。
+    fn new(budget: usize) -> Self {
+        BudgetToken {
+            checks_: Arc::new(AtomicUsize::new(0)),
+            budget_: budget,
+        }
+    }
+
+    /// 已发生的取消状态查询次数（含父令牌与子令牌）。
+    fn checks(&self) -> usize {
+        self.checks_.load(Ordering::Acquire)
+    }
+}
+
+impl TrCancellationToken for BudgetToken {
+    type Cancellation = future::Pending<()>;
+    type ChildToken = BudgetToken;
+
+    fn is_cancelled(&self) -> bool {
+        self.checks_.fetch_add(1, Ordering::AcqRel) + 1 >= self.budget_
+    }
+
+    fn can_be_cancelled(&self) -> bool {
+        true
+    }
+
+    fn child_token(&self) -> Self::ChildToken {
+        self.clone()
+    }
+
+    fn cancellation(self) -> Self::Cancellation {
+        future::pending()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -506,3 +598,249 @@ async fn async_ops_honour_cancellation_() {
 }
 
 dual_runtime_test_!(async_ops_honour_cancellation_);
+
+// ---------------------------------------------------------------------------
+// 分拆后的并发读写（调用者日常用法）
+// ---------------------------------------------------------------------------
+
+/// 分拆出的写端 / 读端可分别持有，同步读写往返与两端状态查询都正常。
+/// - 测试目标：`Ring::split` 之后 `RingWriter::try_write` / `RingReader::try_read`
+///   的日常往返，以及两端的 `producer_state` / `consumer_state` 视图。
+/// - 测试手段：容量 8 上用写端写 3 个元素并查状态；再用读端读回 3 个并查状态。
+/// - 判定标准：写后读端看到 `data == 3`、写端看到 `free == 5`；读回序列为
+///   `[1, 2, 3]`；读空后读端看到 `data == 0`。
+async fn split_tx_rx_roundtrip_() {
+    let mut ring = new_ring_(8);
+    let (mut tx, mut rx) = Ring::split(&mut ring);
+
+    {
+        let demand = Demand::at_least(3);
+        let mut segm = tx.try_write(&demand).pick_left().expect("应能借出写段");
+        assert_eq!(segm.move_items_from_as_buff(&[1u8, 2, 3]), 3);
+    }
+    assert_eq!(rx.consumer_state(), Some((3, false)), "读端应看到 3 个可读元素");
+    assert_eq!(tx.producer_state(), Some((5, false)), "写端应看到 5 格可写空间");
+
+    {
+        let demand = Demand::at_least(3);
+        let mut segm = rx.try_read(&demand).pick_left().expect("应能借出读段");
+        assert_eq!(take_segm_bytes_(&mut segm, 3).await, vec![1, 2, 3]);
+    }
+    assert_eq!(rx.consumer_state(), Some((0, false)), "读空后读端应看到 0");
+}
+
+dual_runtime_test_!(split_tx_rx_roundtrip_);
+
+/// 读端先 park，写端提交后在同一任务里把它唤醒。
+/// - 测试目标：分拆后「一端 park、另一端提交」的读侧唤醒路径（`read_async`）。
+/// - 测试手段：`join!` 并发「读端等 3 个元素」与「写端立即提交 `[7, 8, 9]`」。把 park
+///   的读端放在 `join!` 第一位，保证它先挂起；写端不额外 `yield`，避免给读等待制造
+///   一次「条件尚未满足」的轮询（当前实现会因此空转，见 `known_bug_*`）。
+/// - 判定标准：读等待被唤醒并取回 `[7, 8, 9]`。
+async fn read_async_wakes_on_write_() {
+    let mut ring = new_ring_(8);
+    let (mut tx, mut rx) = Ring::split(&mut ring);
+
+    let read = async {
+        let demand = Demand::at_least(3);
+        assert_eq!(rx_read_(&mut rx, &demand, 3).await, vec![7, 8, 9]);
+    };
+    let write = async {
+        let demand = Demand::at_least(3);
+        let mut segm = tx.try_write(&demand).pick_left().expect("应能借出写段");
+        assert_eq!(segm.move_items_from_as_buff(&[7u8, 8, 9]), 3);
+    };
+    futures_util::join!(read, write);
+}
+
+dual_runtime_test_!(read_async_wakes_on_write_);
+
+/// 写端先 park（满环），读端取走后把它唤醒。
+/// - 测试目标：分拆后「一端 park、另一端提交」的写侧唤醒路径（`write_async`）。
+/// - 测试手段：容量 4 写满；`join!` 并发「写端等 1 格空间」与「读端取走 1 个元素」，
+///   把 park 的写端放在第一位、读端不 `yield`。
+/// - 判定标准：写等待被唤醒、拿到恰好 1 格空间并写回 1 个元素。
+async fn write_async_wakes_on_read_() {
+    let mut ring = new_ring_(4);
+    let (mut tx, mut rx) = Ring::split(&mut ring);
+    {
+        let demand = Demand::at_least(4);
+        let mut segm = tx.try_write(&demand).pick_left().expect("应能借出写段");
+        assert_eq!(segm.move_items_from_as_buff(&[1u8, 2, 3, 4]), 4);
+    }
+
+    let write = async {
+        let demand = Demand::at_least(1);
+        let some = tx.write_async(&demand).await;
+        let mut segm = some.pick_left().expect("读走 1 格后写等待应被唤醒");
+        assert_eq!(segm.least_count(), 1, "读走 1 格后应恰好可写 1 格");
+        assert_eq!(segm.move_items_from_as_buff(&[9u8]), 1);
+    };
+    let read = async {
+        let demand = Demand::less_than(1);
+        assert_eq!(rx_read_(&mut rx, &demand, 1).await, vec![1]);
+    };
+    futures_util::join!(write, read);
+}
+
+dual_runtime_test_!(write_async_wakes_on_read_);
+
+/// 取消一个挂起的读等待后，已经就绪的数据仍可正常取走。
+/// - 测试目标：读等待被取消（future drop）不会破坏环的读写状态。
+/// - 测试手段：空环上发起 `read_async`，用 `select` + 让出一次证明它挂起后取消；
+///   写端写入 3 个元素；读端以**同步** `try_read` 取回。
+/// - 判定标准：取回的序列为 `[1, 2, 3]`；写后读端状态显示 3 个可读元素。
+///
+/// 说明：这里刻意**不**再次 park（第二次 park 的前景见 `known_bug_*`）；`demand` 也刻意
+/// 活到函数结束，避免缺陷二（drop 时不 `reset_demand_`）留下的悬垂指针。
+async fn cancel_pending_read_then_read_ready_() {
+    let mut ring = new_ring_(8);
+    let (mut tx, mut rx) = Ring::split(&mut ring);
+
+    let demand = Demand::at_least(3);
+    {
+        let read = rx.read_async(&demand).into_future();
+        let probe = async { futures_lite::future::yield_now().await };
+        futures_util::pin_mut!(probe, read);
+        assert!(
+            matches!(
+                futures_util::future::select(probe, read).await,
+                futures_util::future::Either::Left(_)
+            ),
+            "空环上读等待应先 park（探测先完成）"
+        );
+    } // read drop = 取消
+
+    assert_eq!(tx_write_(&mut tx, &Demand::at_least(3), &[1, 2, 3]).await, 3);
+    assert_eq!(rx.consumer_state(), Some((3, false)));
+
+    let demand = Demand::at_least(3);
+    let mut segm = rx.try_read(&demand).pick_left().expect("应能借出读段");
+    assert_eq!(take_segm_bytes_(&mut segm, 3).await, vec![1, 2, 3]);
+}
+
+dual_runtime_test_!(cancel_pending_read_then_read_ready_);
+
+// ---------------------------------------------------------------------------
+// 已知缺陷复现（当前实现下**故意失败**）
+// ---------------------------------------------------------------------------
+//
+// 以下用例以**调用者日常用法**复现三个互相放大的缺陷：
+//
+// 1. `wake_slot_` 只设不清：park future 首次 poll 注册 waker 后，第二次 poll 直接返回
+//    `Ready(None)`（不挂起）；`ring_*_async` 的循环于是「重试 → 再 park → 立即就绪」
+//    同步空转，不让出也不返回。
+// 2. `opt_demand_` 在 park future 中途 drop（取消）时不 `reset`：旧 demand 残留，对端
+//    `handle_event` 可能按过时下限判定唤醒，并留下悬垂指针。
+// 3. `Producer::handle_event` 用 `data_size()` 而非 `free_size()` 判定空间：等待更多
+//    空间的写者会被提前唤醒（满环读走 1 格、写者要 3 格时就会发生）。
+//
+// 直接跑会挂死，故用 [`BudgetToken`] 把空转截断成**有界失败**：缺陷在有限次查询后以
+// `Cancelled` 暴露；修复后（第一次 park 的取消要清理唤醒槽位与 demand、park 只在真正被
+// 唤醒时重试、写端按 `free_size` 判定）这两个用例应当通过。
+
+/// 已知缺陷复现（读侧）：同一个读端第二次 park 会同步空转。
+/// - 测试目标：期望「挂起的读等待被取消后，可以再次挂起并正常被写端唤醒」。
+/// - 测试手段：空环上读等待 park 一次后取消；随后在 `join!` 中让读端**再次**等待 1 个
+///   元素、写端提交 1 个元素；用查询预算令牌把可能出现的空转截断。
+/// - 判定标准（期望行为）：第二次读等待被写端唤醒，取回 `[1]`。
+///   当前实现：`wake_slot_` 仍指向已取消的等待者，第二次 park 立即 `Ready(None)`，读循环
+///   在**一次 poll 内**反复查询取消状态直到预算耗尽，最终以 `Cancelled` 失败。
+async fn known_bug_reader_second_wait_busy_loops_() {
+    let mut ring = new_ring_(8);
+    let (mut tx, mut rx) = Ring::split(&mut ring);
+
+    // 第一次等待：park 后取消（drop）。demand 活到函数结束，规避缺陷二的悬垂指针 UB。
+    let first_demand = Demand::at_least(1);
+    {
+        let read = rx.read_async(&first_demand).into_future();
+        let probe = async { futures_lite::future::yield_now().await };
+        futures_util::pin_mut!(probe, read);
+        assert!(
+            matches!(
+                futures_util::future::select(probe, read).await,
+                futures_util::future::Either::Left(_)
+            ),
+            "空环上首次读等待应先 park"
+        );
+    }
+
+    let token = BudgetToken::new(64);
+    let read = async {
+        let demand = Demand::at_least(1);
+        let some = rx
+            .read_async(&demand)
+            .may_cancel_with(token.clone())
+            .await;
+        let mut segm = some.pick_left().unwrap_or_else(|| {
+            panic!(
+                "第二次读等待未挂起：在一次 poll 内查询取消状态 {} 次后中止。\
+                 根因是 wake_slot_ 只设不清（park future 第二次 poll 立即 Ready(None)），\
+                 叠加 opt_demand_ 在 park 中途 drop 时不 reset。",
+                token.checks()
+            )
+        });
+        assert_eq!(take_segm_bytes_(&mut segm, 1).await, vec![1]);
+    };
+    let write = async {
+        assert_eq!(tx_write_(&mut tx, &Demand::at_least(1), &[1]).await, 1);
+    };
+    futures_util::join!(read, write);
+}
+
+dual_runtime_test_!(known_bug_reader_second_wait_busy_loops_);
+
+/// 已知缺陷复现（写侧）：等待「更多空间」的写者被提前唤醒后会同步空转。
+/// - 测试目标：期望「写者需要 3 格空间时，只有真正腾出 3 格才被唤醒」。
+/// - 测试手段：容量 4 写满；写端等待 3 格空间；读端先取走 1 格（只腾出 1 格，不应唤醒
+///   写者），让出一次后再取走 2 格（此时才腾出 3 格）；用查询预算令牌把可能出现的空转
+///   截断。
+/// - 判定标准（期望行为）：写者最终拿到 3 格空间并写回 3 个元素。
+///   当前实现：读走 1 格后 `Producer::handle_event` 按 `data_size() >= 3` 误判为「空间
+///   足够」而提前唤醒写者；写者重试仍失败，park 又因 `wake_slot_` 未清立即就绪，循环同步
+///   空转，直到预算耗尽以 `Cancelled` 失败。
+///
+/// 同一判定错误还有**反向**表现：若读端一次读走 3 格（`data_size` 降为 1），
+/// `data_size() < 3` 会让 `handle_event` 直接返回——真正腾出的 3 格空间反而**不唤醒**写者，
+/// 写者永久挂起。该表现是「漏唤醒」，park 之后不再查询取消状态，预算令牌无法截断，故本
+/// 用例只钉住「提前唤醒 → 空转」这一半（漏唤醒可由同一处 `free_size()` 修复一并解决）。
+async fn known_bug_writer_busy_loops_on_spurious_wake_() {
+    let mut ring = new_ring_(4);
+    let (mut tx, mut rx) = Ring::split(&mut ring);
+    {
+        let demand = Demand::at_least(4);
+        let mut segm = tx.try_write(&demand).pick_left().expect("应能借出写段");
+        assert_eq!(segm.move_items_from_as_buff(&[1u8, 2, 3, 4]), 4);
+    }
+
+    let token = BudgetToken::new(64);
+    let write = async {
+        let demand = Demand::at_least(3);
+        let some = tx
+            .write_async(&demand)
+            .may_cancel_with(token.clone())
+            .await;
+        let mut segm = some.pick_left().unwrap_or_else(|| {
+            panic!(
+                "等待 3 格空间的写者被提前唤醒：在一次 poll 内查询取消状态 {} 次后中止。\
+                 根因是 Producer::handle_event 用 data_size 而非 free_size 判定空间，\
+                 叠加 wake_slot_ 只设不清。",
+                token.checks()
+            )
+        });
+        assert_eq!(segm.move_items_from_as_buff(&[9u8, 9, 9]), 3);
+    };
+    let read = async {
+        // 只取走 1 格：不是写者需要的 3 格。
+        let demand = Demand::less_than(1);
+        assert_eq!(rx_read_(&mut rx, &demand, 1).await, vec![1]);
+        // 让出一次：给被提前唤醒的写者一次重新轮询的机会（缺陷在此暴露）。
+        futures_lite::future::yield_now().await;
+        // 再取走 2 格：此时才真正腾出 3 格。
+        let demand = Demand::less_than(2);
+        assert_eq!(rx_read_(&mut rx, &demand, 2).await, vec![2, 3]);
+    };
+    futures_util::join!(write, read);
+}
+
+dual_runtime_test_!(known_bug_writer_busy_loops_on_spurious_wake_);
