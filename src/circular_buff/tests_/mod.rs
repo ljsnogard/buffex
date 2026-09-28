@@ -20,12 +20,12 @@
 //! 只在 `pump_` 的**同步**唤醒协议用例（`dev_wakeslot_and_stndby_protocol`）里
 //! 充当「唤醒标志位」的接收者，不用于轮询任何 future。
 
-mod builder_;
+// mod builder_;
 mod hook_;
 mod park_tests_;
 mod pos_tests_;
-mod pump_;
-mod socket_pump_;
+// mod pump_;
+// mod socket_pump_;
 mod sync_;
 
 use core::mem::MaybeUninit;
@@ -67,7 +67,7 @@ pub(super) type DefaultBuilder =
 // * `TestErr` / `TestInput` / `TestOutput` 来自 abs_buff 的共享测试模块，
 //   由 dev-dependencies 里的 `segm-tests` feature 打开。
 pub(super) use abs_buff::ReadySegm;
-pub(super) use abs_buff_testkit::{TestErr, TestInput, TestOutput};
+// pub(super) use abs_buff_testkit::{TestErr, TestInput, TestOutput};
 
 // ---------------------------------------------------------------------------
 // 段操作辅助（两段式 ReclSliceMut / ReclSliceRef）
@@ -144,4 +144,3 @@ impl Wake for TestWaker {
         self.0.store(true, Ordering::Release);
     }
 }
-

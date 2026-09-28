@@ -1,14 +1,10 @@
 use core::{
-    cell::UnsafeCell,
-    marker::{PhantomData, PhantomPinned},
-    mem::MaybeUninit,
-    slice,
-    sync::atomic::AtomicUsize,
+    borrow::BorrowMut, cell::UnsafeCell, marker::{PhantomData, PhantomPinned}, mem::MaybeUninit, slice, sync::atomic::AtomicUsize,
 };
 
 use abs_buff::{
     Demand,
-    buffer::{TrAsBufferMut, TrConsumerState, TrProducerState},
+    buffer::{TrConsumerState, TrProducerState},
     error::{IoErrTag, TrTaggedError, TrErrTag},
     gen_may_cancel_future,
     x_deps::{abs_cancel, anylr},
@@ -30,7 +26,7 @@ pub struct Ring<P, C, B, T = u8>
 where
     P: TrProducerHook<T, Buff = B>,
     C: TrConsumerHook<T, Buff = B>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     /// `rp`（低 `POS_BITS` 位）| `wp`（次 `POS_BITS` 位）| 全部标志（高位：
     /// 关闭 ×2、待机 ×2、泵互斥 ×1、待办泵 ×2）。
@@ -49,14 +45,14 @@ impl<P, C, B, T> Ring<P, C, B, T>
 where
     P: TrProducerHook<T, Buff = B>,
     C: TrConsumerHook<T, Buff = B>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     pub fn new_unchecked(
         buffer: B,
         producer: P,
         consumer: C,
     ) -> Self {
-        let capacity = buffer.as_slice_uninit().len();
+        let capacity = buffer.borrow().len();
         debug_assert!(capacity >= MIN_CAPACITY);
         debug_assert!(capacity <= MAX_CAPACITY);
         let mut ring = Ring {
@@ -79,9 +75,9 @@ where
         producer: P,
         consumer: C,
     ) -> Result<Self, usize> {
-        let buff = buffer.as_slice_uninit();
-        if buff.len() < MIN_CAPACITY || buff.len() > MAX_CAPACITY {
-            Result::Err(buff.len())
+        let capacity = buffer.borrow().len();
+        if capacity < MIN_CAPACITY || capacity > MAX_CAPACITY {
+            Result::Err(capacity)
         } else {
             Result::Ok(Self::new_unchecked(
                 buffer,
@@ -150,7 +146,7 @@ impl<P, C, B, T> Ring<P, C, B, T>
 where
     P: TrProducerHook<T, Buff = B>,
     C: TrConsumerHook<T, Buff = B> + TrPark<Err = ConsumerError<usize>>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     pub fn read_async<'f>(
         &'f mut self,
@@ -164,7 +160,7 @@ impl<P, C, B, T> Ring<P, C, B, T>
 where
     P: TrProducerHook<T, Buff = B> + TrPark<Err = ProducerError<usize>>,
     C: TrConsumerHook<T, Buff = B>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     pub fn write_async<'f>(
         &'f mut self,
@@ -182,7 +178,7 @@ impl<P, C, B, T> Ring<P, C, B, T>
 where
     P: TrProducerHook<T, Buff = B>,
     C: TrConsumerHook<T, Buff = B>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     /// 借出可读区，返回 `(start, take)`。
     ///
@@ -302,7 +298,7 @@ where
         // 其他活段 / 泵操作不重叠是调用者义务（SPSC）。
         let whole: &'s mut [MaybeUninit<T>] = unsafe {
             let buff = &mut *self.buf_cell_.get();
-            buff.as_mut_slice_uninit()
+            buff.borrow_mut()
         };
         let first = core::cmp::min(take, self.capacity() - start);
         let pieces = if first < take {
@@ -328,7 +324,7 @@ where
         // SAFETY: 同 [`CircCore::write_segm`]。
         let base = unsafe {
             let buff = self.buf_cell_.as_ref_unchecked();
-            buff.as_slice_uninit().as_ptr().cast::<T>()
+            buff.borrow().as_ptr().cast::<T>()
         };
         let first = core::cmp::min(take, self.capacity() - start);
         let pieces = if first < take {
@@ -352,7 +348,7 @@ impl<P, C, B, T> TrConsumerState for Ring<P, C, B, T>
 where
     P: TrProducerHook<T, Buff = B>,
     C: TrConsumerHook<T, Buff = B>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     fn consumer_state(&self) -> Option<(usize, bool)> {
         let size = self.data_size();
@@ -365,7 +361,7 @@ impl<P, C, B, T> TrProducerState for Ring<P, C, B, T>
 where
     P: TrProducerHook<T, Buff = B>,
     C: TrConsumerHook<T, Buff = B>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     fn producer_state(&self) -> Option<(usize, bool)> {
         let size = self.free_size();
@@ -378,7 +374,7 @@ impl<P, C, B, T> abs_buff::TrBuffTryRead<T> for Ring<P, C, B, T>
 where
     P: TrProducerHook<T, Buff = B>,
     C: TrConsumerHook<T, Buff = B>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     type SegmRef<'f> = ReclSliceRef<'f, T, Reclaim<'f, Self>> where Self: 'f;
     type Err = ConsumerError<usize>;
@@ -396,7 +392,7 @@ impl<P, C, B, T> abs_buff::TrBuffRead<T> for Ring<P, C, B, T>
 where
     P: TrProducerHook<T, Buff = B>,
     C: TrConsumerHook<T, Buff = B> + TrPark<Err = Self::Err>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     type ReadAsync<'f> = RingReadAsync<'f, 'f, P, C, B, T> where Self: 'f;
 
@@ -413,7 +409,7 @@ impl<P, C, B, T> abs_buff::TrBuffTryWrite<T> for Ring<P, C, B, T>
 where
     P: TrProducerHook<T, Buff = B>,
     C: TrConsumerHook<T, Buff = B>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     type SegmMut<'f> = ReclSliceMut<'f, T, Reclaim<'f, Self>> where Self: 'f;
     type Err = ProducerError<usize>;
@@ -431,7 +427,7 @@ impl<P, C, B, T> abs_buff::TrBuffWrite<T> for Ring<P, C, B, T>
 where
     P: TrProducerHook<T, Buff = B> + TrPark<Err = Self::Err>,
     C: TrConsumerHook<T, Buff = B>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     type WriteAsync<'f> = RingWriteAsync<'f, 'f, P, C, B, T> where Self: 'f;
 
@@ -452,14 +448,14 @@ unsafe impl<P, C, B, T> Send for Ring<P, C, B, T>
 where
     P: Send + TrProducerHook<T, Buff = B>,
     C: Send + TrConsumerHook<T, Buff = B>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {}
 
 unsafe impl<P, C, B, T> Sync for Ring<P, C, B, T>
 where
     P: Sync + TrProducerHook<T, Buff = B>,
     C: Sync + TrConsumerHook<T, Buff = B>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {}
 
 // ---------------------------------------------------------------------------
@@ -630,7 +626,7 @@ async fn ring_read_async<'f, P, C, B, T, K>(
 where
     P: TrProducerHook<T, Buff = B>,
     C: TrConsumerHook<T, Buff = B> + TrPark<Err = ConsumerError<usize>>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
     K: TrCancellationToken,
 {
     loop {
@@ -669,7 +665,7 @@ async fn ring_write_async<'f, P, C, B, T, K>(
 where
     P: TrProducerHook<T, Buff = B> + TrPark<Err = ProducerError<usize>>,
     C: TrConsumerHook<T, Buff = B>,
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
     K: TrCancellationToken,
 {
     loop {

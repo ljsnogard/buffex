@@ -2,6 +2,9 @@ mod error_;
 mod hook_;
 mod ring_core_;
 
+#[cfg(test)]
+mod tests_;
+
 pub mod passive;
 pub mod reclaim;
 

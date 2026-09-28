@@ -296,7 +296,7 @@ where
     ///
     /// - See `TrBuffSegmMut::move_items_from_buff`
     #[inline]
-    pub fn move_items_from_buff(&mut self, src: &mut [MaybeUninit<T>]) -> usize {
+    pub fn move_items_from_buff(&mut self, src: &[MaybeUninit<T>]) -> usize {
         TrBuffSegmMut::move_items_from_buff(self, src)
     }
 }

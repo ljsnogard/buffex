@@ -1,6 +1,8 @@
 use core::{
+    borrow::BorrowMut,
     future::{Future, IntoFuture},
     marker::PhantomData,
+    mem::MaybeUninit,
     pin::Pin,
     ptr::{self, NonNull},
     sync::atomic::AtomicPtr,
@@ -9,7 +11,7 @@ use core::{
 
 use abs_buff::{
     Demand,
-    buffer::{TrAsBuffer, TrAsBufferMut},
+    // buffer::{TrAsBuffer, TrAsBufferMut},
     x_deps::abs_cancel,
 };
 use abs_cancel::{NonCancellableToken, TrMayCancel, TrCancellationToken};
@@ -29,7 +31,7 @@ use super::{
 #[derive(Debug)]
 pub struct Consumer<B, T>
 where
-    B: TrAsBuffer<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     ring_half_: RingHalf_,
     _unused_b_: PhantomData<fn() -> B>,
@@ -38,7 +40,7 @@ where
 
 impl<B, T> Consumer<B, T>
 where
-    B: TrAsBuffer<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     pub(super) const fn new() -> Self {
         Consumer {
@@ -61,7 +63,7 @@ where
 
 impl<B, T> TrConsumerHook<T> for Consumer<B, T>
 where
-    B: TrAsBuffer<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     type Buff = B;
 
@@ -87,7 +89,7 @@ where
 
 impl<B, T> TrPark for Consumer<B, T>
 where
-    B: TrAsBuffer<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     type ParkAsync<'f> = ConsumerParkAsync<'f, B, T> where Self: 'f;
     type Err = ConsumerError<usize>;
@@ -107,11 +109,11 @@ where
 
 pub struct ConsumerParkAsync<'a, B, T>(&'a mut Consumer<B, T>)
 where
-    B: TrAsBuffer<T>;
+    B: BorrowMut<[MaybeUninit<T>]>;
 
 impl<'a, B, T> ConsumerParkAsync<'a, B, T>
 where
-    B: TrAsBuffer<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     fn new_(
         consumer: &'a mut Consumer<B, T>,
@@ -124,7 +126,7 @@ where
 
 impl<'a, B, T> IntoFuture for ConsumerParkAsync<'a, B, T>
 where
-    B: TrAsBuffer<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     type IntoFuture = ConsumerParkFuture<'a, B, T, NonCancellableToken>;
     type Output = Option<ConsumerError<usize>>;
@@ -138,7 +140,7 @@ where
 
 impl<'a, B, T> TrMayCancel<'a> for ConsumerParkAsync<'a, B, T>
 where
-    B: TrAsBuffer<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     type MayCancelFuture<'f, C> = ConsumerParkFuture<'a, B, T, C>
     where
@@ -165,7 +167,7 @@ where
 /// cancellation 信号则返回 `Poll::Ready(Some(ConsumerError::Cancelled))`
 pub struct ConsumerParkFuture<'a, B, T, K>
 where
-    B: TrAsBuffer<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
     K: TrCancellationToken,
 {
     consumer_: &'a mut Consumer<B, T>,
@@ -175,7 +177,7 @@ where
 
 impl<'a, B, T, K> ConsumerParkFuture<'a, B, T, K>
 where
-    B: TrAsBuffer<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
     K: TrCancellationToken,
 {
     const fn new(
@@ -192,7 +194,7 @@ where
 
 impl<'a, B, T, K> Future for ConsumerParkFuture<'a, B, T, K>
 where
-    B: TrAsBuffer<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
     K: TrCancellationToken,
 {
     type Output = Option<ConsumerError<usize>>;
@@ -209,7 +211,7 @@ where
 
 pub struct Producer<B, T>
 where
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     ring_half_: RingHalf_,
     _unused_b_: PhantomData<fn() -> B>,
@@ -218,7 +220,7 @@ where
 
 impl<B, T> Producer<B, T>
 where
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     pub(super) const fn new() -> Self {
         Producer {
@@ -241,7 +243,7 @@ where
 
 impl<B, T> TrProducerHook<T> for Producer<B, T>
 where
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     type Buff = B;
 
@@ -267,7 +269,7 @@ where
 
 impl<B, T> TrPark for Producer<B, T>
 where
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     type ParkAsync<'f> = ProducerParkAsync<'f, B, T> where Self: 'f;
     type Err = ProducerError<usize>;
@@ -287,11 +289,11 @@ where
 
 pub struct ProducerParkAsync<'a, B, T>(&'a mut Producer<B, T>)
 where
-    B: TrAsBufferMut<T>;
+    B: BorrowMut<[MaybeUninit<T>]>;
 
 impl<'a, B, T> ProducerParkAsync<'a, B, T>
 where
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     fn new_(
         producer: &'a mut Producer<B, T>,
@@ -304,7 +306,7 @@ where
 
 impl<'a, B, T> IntoFuture for ProducerParkAsync<'a, B, T>
 where
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     type IntoFuture = ProducerParkFuture<'a, B, T, NonCancellableToken>;
     type Output = Option<ProducerError<usize>>;
@@ -318,7 +320,7 @@ where
 
 impl<'a, B, T> TrMayCancel<'a> for ProducerParkAsync<'a, B, T>
 where
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     type MayCancelFuture<'f, C> = ProducerParkFuture<'a, B, T, C>
     where
@@ -348,7 +350,7 @@ where
 /// cancellation 信号则返回 `Poll::Ready(Some(ConsumerError::Cancelled))`
 pub struct ProducerParkFuture<'a, B, T, K>
 where
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
     K: TrCancellationToken,
 {
     producer_: &'a mut Producer<B, T>,
@@ -358,7 +360,7 @@ where
 
 impl<'a, B, T, K> ProducerParkFuture<'a, B, T, K>
 where
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
     K: TrCancellationToken,
 {
     const fn new(producer: &'a mut Producer<B, T>, cancel: K) -> Self {
@@ -372,7 +374,7 @@ where
 
 impl<'a, B, T, K> Future for ProducerParkFuture<'a, B, T, K>
 where
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
     K: TrCancellationToken,
 {
     type Output = Option<ProducerError<usize>>;
@@ -389,7 +391,7 @@ trait TrAsRingHalf_ {
 
 impl<B, T> TrAsRingHalf_ for Consumer<B, T>
 where
-    B: TrAsBuffer<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     fn as_half_mut_(&mut self) -> &mut RingHalf_ {
         &mut self.ring_half_
@@ -398,7 +400,7 @@ where
 
 impl<B, T> TrAsRingHalf_ for Producer<B, T>
 where
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
 {
     fn as_half_mut_(&mut self) -> &mut RingHalf_ {
         &mut self.ring_half_
@@ -457,7 +459,7 @@ trait TrFutBorrowRingHalf_: Future {
 
 impl<'a, B, T, K> TrFutBorrowRingHalf_ for ConsumerParkFuture<'a, B, T, K>
 where
-    B: TrAsBuffer<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
     K: TrCancellationToken,
 {
     type Half = Consumer<B, T>;
@@ -485,7 +487,7 @@ where
 
 impl<'a, B, T, K> TrFutBorrowRingHalf_ for ProducerParkFuture<'a, B, T, K>
 where
-    B: TrAsBufferMut<T>,
+    B: BorrowMut<[MaybeUninit<T>]>,
     K: TrCancellationToken,
 {
     type Half = Producer<B, T>;
@@ -511,6 +513,8 @@ where
     }
 }
 
+/// 实现一个与具体运行时无关的手动唤醒，与 Cancellation Token 竞争信号
+/// 哪一个先到达
 fn poll_park_future_<F, E>(
     future: Pin<&mut F>,
     make_cancelled: impl FnOnce() -> E,
@@ -550,6 +554,9 @@ where
             Poll::Ready(Option::None)
         }
     };
-    this.half_mut().as_half_mut_().reset_demand_();
+    // 手动取消 half 与 demand 的绑定
+    if x.is_ready() {
+        this.half_mut().as_half_mut_().reset_demand_();
+    }
     x
 }

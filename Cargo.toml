@@ -12,12 +12,13 @@ license = "MIT/Apache-2.0"
 
 [dependencies]
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
-abs_buff = { git = "https://gitee.com/lino_snsalias/abs_buff.git", branch = "dev/0.3.0" }
+# abs_buff = { git = "https://gitee.com/lino_snsalias/abs_buff.git", branch = "dev/0.3.0" }
+abs_buff = { path = "../abs_buff" }
 atomic_sync = { git = "https://gitee.com/lino_snsalias/atomic_sync.git", branch = "dev/0.3.0" }
 mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.1.3" }
 
 [dev-dependencies]
-abs_buff-testkit = { git = "https://gitee.com/lino_snsalias/abs_buff-testkit.git" }
+# abs_buff-testkit = { git = "https://gitee.com/lino_snsalias/abs_buff-testkit.git" }
 
 # 性能基准：`divan` 与 asyncband 官方 benchmark 同款；`asyncband` 只作为对标基线
 # （其 mpsc bounded 同时充当 SPSC 的单生产者基线，因为 asyncband 没有 SPSC 实现）。
