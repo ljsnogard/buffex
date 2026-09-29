@@ -261,7 +261,7 @@ where
         };
         let min_demand = demand.min().copied().unwrap_or(1usize);
         let pos = state.io_pos();
-        if pos.data_size() < min_demand {
+        if pos.free_size() < min_demand {
             return;
         }
         let Option::Some(waker_ref) = &self.ring_half_.wake_slot_ else {
@@ -559,7 +559,9 @@ where
     };
     // 手动取消 half 与 demand 的绑定
     if x.is_ready() {
-        this.half_mut().as_half_mut_().reset_demand_();
+        let half_mut = this.half_mut().as_half_mut_();
+        half_mut.reset_demand_();
+        half_mut.wake_slot_ = Option::None;
     }
     x
 }

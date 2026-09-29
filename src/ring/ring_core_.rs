@@ -625,7 +625,7 @@ fn has_flag(state: usize, flag: usize) -> bool {
     state & flag != 0
 }
 
-#[gen_may_cancel_future(RingRead, pub)]
+#[gen_may_cancel_future(RingRead, pub, new(pub(super)))]
 async fn ring_read_async<'f, P, C, B, T, K>(
     ring: &'f Ring<P, C, B, T>,
     demand: &'f Demand<usize>,
@@ -665,7 +665,7 @@ where
     }
 }
 
-#[gen_may_cancel_future(RingWrite, pub)]
+#[gen_may_cancel_future(RingWrite, pub, new(pub(super)))]
 async fn ring_write_async<'f, P, C, B, T, K>(
     ring: &'f Ring<P, C, B, T>,
     demand: &'f Demand<usize>,
