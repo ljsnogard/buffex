@@ -19,8 +19,8 @@ extern crate std;
 // `alloc` 只是语言层面的 crate，最终是否需要分配器由链接方决定。
 extern crate alloc;
 
-pub mod channels;
-pub mod circular_buff;
+// pub mod channels;
+// pub mod circular_buff;
 pub mod ring;
 
 #[cfg(test)]
@@ -33,7 +33,4 @@ pub mod x_deps {
     pub use atomic_sync;
     pub use atomic_sync::x_deps::{abs_sync, atomex};
     pub use atomex::x_deps::funty;
-
-    pub use mm_ptr;
-    pub use mm_ptr::x_deps::abs_mm;
 }
