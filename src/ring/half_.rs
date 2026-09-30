@@ -56,7 +56,7 @@ impl<T> TrPark for Consumer<T> {
         let Option::Some(demand) = self.pending_demand_() else {
             return;
         };
-        let min_demand = demand.min().copied().unwrap_or(1usize);
+        let min_demand = demand.min().unwrap_or(1usize);
         let pos = state.io_pos();
         if pos.data_size() < min_demand {
             return;
@@ -201,7 +201,7 @@ impl<T> TrPark for Producer<T> {
         let Option::Some(demand) = self.pending_demand_() else {
             return;
         };
-        let min_demand = demand.min().copied().unwrap_or(1usize);
+        let min_demand = demand.min().unwrap_or(1usize);
         let pos = state.io_pos();
         if pos.free_size() < min_demand {
             return;

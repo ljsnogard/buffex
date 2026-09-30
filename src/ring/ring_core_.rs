@@ -227,8 +227,8 @@ where
         &self,
         demand: &Demand<usize>,
     ) -> Result<(usize, usize), ConsumerError<usize>> {
-        let min_len = demand.min().copied().unwrap_or(0);
-        let max_len = demand.max().copied().unwrap_or(usize::MAX);
+        let min_len = demand.min().unwrap_or(0);
+        let max_len = demand.max().unwrap_or(usize::MAX);
         let state = self.buf_stat_.value();
         let pos = IoPos::unpack(state, self.capacity());
         let ready = pos.data_size();
@@ -259,8 +259,8 @@ where
         &self,
         demand: &Demand<usize>,
     ) -> Result<(usize, usize), ProducerError<usize>> {
-        let min_len = demand.min().copied().unwrap_or(0);
-        let max_len = demand.max().copied().unwrap_or(usize::MAX);
+        let min_len = demand.min().unwrap_or(0);
+        let max_len = demand.max().unwrap_or(usize::MAX);
         let state = self.buf_stat_.value();
         let cap = self.capacity();
         let pos = IoPos::unpack(state, cap);

@@ -279,12 +279,12 @@ where
         if c == 0 {
             return Option::None;
         }
-        let available = Demand::less_than(c);
+        let available = Demand::no_more_than(c);
         let agreement = demand.compromise(&available)?;
         let max_len = agreement.max()?;
         // 子段只能覆盖当前物理段；跨段部分由下一次 take 处理。
         let cur = self.pieces.current_mut(self.offset_);
-        let take = core::cmp::min(*max_len, cur.len());
+        let take = core::cmp::min(max_len, cur.len());
         let slice = &mut cur[..take];
         let reclaim = ChildReclaim::new(Pin::new(&mut self.offset_));
         Option::Some(SegmMut::new(slice, reclaim))
@@ -441,11 +441,11 @@ where
         if c == 0 {
             return Option::None;
         }
-        let available = Demand::less_than(c);
+        let available = Demand::no_more_than(c);
         let agreement = demand.compromise(&available)?;
         let max_len = agreement.max()?;
         let cur = self.pieces.current(self.offset_);
-        let take = core::cmp::min(*max_len, cur.len());
+        let take = core::cmp::min(max_len, cur.len());
         let slice = &cur[..take];
         let reclaim = ChildReclaim::new(Pin::new(&mut self.offset_));
         Option::Some(SegmRef::new(slice, reclaim))
