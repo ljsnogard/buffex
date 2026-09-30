@@ -1,28 +1,7 @@
-use core::{borrow::BorrowMut, mem::MaybeUninit};
-
-use abs_buff::{
-    Demand,
-    x_deps::abs_cancel,
-};
+use abs_buff::{Demand, x_deps::abs_cancel};
 use abs_cancel::TrMayCancel;
 
-use super::ring_core_::RingState;
-
-pub trait TrConsumerHook<T> {
-    type Buff: BorrowMut<[MaybeUninit<T>]>;
-
-    fn init_once(&mut self, buff: &Self::Buff, state: &RingState);
-
-    fn handle_event(&self, buff: &Self::Buff, state: &RingState);
-}
-
-pub trait TrProducerHook<T> {
-    type Buff: BorrowMut<[MaybeUninit<T>]>;
-
-    fn init_once(&mut self, buf: &Self::Buff, state: &RingState);
-
-    fn handle_event(&self, buff: &Self::Buff, state: &RingState);
-}
+use crate::ring::ring_core_::RingState;
 
 pub trait TrPark {
     type ParkAsync<'f>: TrMayCancel<'f, MayCancelOutput = Option<Self::Err>>
@@ -30,6 +9,8 @@ pub trait TrPark {
         Self: 'f;
 
     type Err;
+
+    fn wake(&self, state: &RingState);
 
     fn park_async<'f>(
         &'f mut self,

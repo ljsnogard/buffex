@@ -1,13 +1,13 @@
 // to enable no hand-written poll
-#![allow(unused_features)]
-#![feature(async_fn_traits)]
+
+#![feature(drop_guard)]
 #![feature(impl_trait_in_assoc_type)]
-#![feature(impl_restriction)]
+// #![feature(impl_restriction)]
 #![feature(unboxed_closures)]
 #![feature(unsafe_cell_access)]
 
 #![no_std]
-#![cfg_attr(test, feature(try_trait_v2))]
+// #![cfg_attr(test, feature(try_trait_v2))]
 
 // We always pull in `std` during tests, because it's just easier
 // to write tests when you can assume you're on a capable platform

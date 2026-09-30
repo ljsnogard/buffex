@@ -50,7 +50,7 @@ use abs_buff::{
 };
 
 use crate::{
-    ring::{half_::*, reclaim::ReclSliceRef, *},
+    ring::{reclaim::ReclSliceRef, *},
     test_support_::dual_runtime_test_,
 };
 
@@ -61,27 +61,21 @@ use crate::{
 /// 测试用缓冲类型：`Box<[MaybeUninit<u8>]>`（元素 `u8`）。
 type TestBuff = Box<[MaybeUninit<u8>]>;
 
-/// 测试用生产端 hook 类型（被动）。
-type TestProducer = Producer<TestBuff, u8>;
-
-/// 测试用消费端 hook 类型（被动）。
-type TestConsumer = Consumer<TestBuff, u8>;
-
 /// 测试用 `Ring` 具体类型。
-type TestRing = Ring<TestProducer, TestConsumer, TestBuff, u8>;
+type TestRing = Ring<TestBuff, u8>;
 
 /// `Ring::split` 出的写端（借用 `Ring`）。
 type TestWriter<'f> =
-    RingWriter<&'f TestRing, TestProducer, TestConsumer, TestBuff, u8>;
+    RingWriter<&'f TestRing, TestBuff, u8>;
 
 /// `Ring::split` 出的读端（借用 `Ring`）。
 type TestReader<'f> =
-    RingReader<&'f TestRing, TestProducer, TestConsumer, TestBuff, u8>;
+    RingReader<&'f TestRing, TestBuff, u8>;
 
 /// 构造一个指定容量的测试环（容量须落在 `Ring` 允许的 `[2, MAX_CAPACITY]` 内）。
 fn new_ring_(capacity: usize) -> TestRing {
     let buff = Box::<[u8]>::new_uninit_slice(capacity);
-    Ring::new_unchecked(buff, Producer::new(), Consumer::new())
+    Ring::new_unchecked(buff)
 }
 
 /// 借出写段、把 `data` 位拷贝进环，drop 提交后返回实际写入的元素数。
@@ -202,7 +196,7 @@ impl TrCancellationToken for BudgetToken {
 async fn smoke_test_sync_() {
     const BUFF_SIZE: usize = 8;
     let buff = Box::<[u8]>::new_uninit_slice(BUFF_SIZE);
-    let mut ring = Ring::new_unchecked(buff, Producer::new(), Consumer::new());
+    let mut ring = Ring::new_unchecked(buff);
     {
         let w_demand = Demand::less_than(BUFF_SIZE);
         let w_x = ring.try_write(&w_demand);
@@ -239,7 +233,7 @@ dual_runtime_test_!(smoke_test_sync_);
 async fn smoke_test_async_() {
     const BUFF_SIZE: usize = 8;
     let buff = Box::<[u8]>::new_uninit_slice(BUFF_SIZE);
-    let mut ring = Ring::new_unchecked(buff, Producer::new(), Consumer::new());
+    let mut ring = Ring::new_unchecked(buff);
     {
         let w_demand = Demand::less_than(BUFF_SIZE);
         let w_x = ring.write_async(&w_demand).await;
@@ -399,11 +393,11 @@ dual_runtime_test_!(try_read_limits_count_by_max_);
 /// - 判定标准：容量 1 返回 `Err(1)`；容量 2 构造成功且 `capacity() == 2`。
 async fn try_new_rejects_too_small_capacity_() {
     let buff = Box::<[u8]>::new_uninit_slice(1);
-    let x: Result<TestRing, usize> = Ring::try_new(buff, Producer::new(), Consumer::new());
+    let x: Result<TestRing, usize> = Ring::try_new(buff);
     assert_eq!(x.err(), Some(1usize), "容量 1 应被拒绝");
 
     let buff = Box::<[u8]>::new_uninit_slice(2);
-    let x: Result<TestRing, usize> = Ring::try_new(buff, Producer::new(), Consumer::new());
+    let x: Result<TestRing, usize> = Ring::try_new(buff);
     let ring = x.expect("容量 2 应被接受");
     assert_eq!(ring.capacity(), 2);
 }
