@@ -2,7 +2,7 @@ use core::{
     borrow::{Borrow, BorrowMut},
     cell::UnsafeCell,
     marker::{PhantomData, PhantomPinned},
-    mem::{DropGuard, MaybeUninit},
+    mem::MaybeUninit,
     slice,
     sync::atomic::AtomicUsize,
 };
@@ -626,9 +626,6 @@ where
     B: BorrowMut<[MaybeUninit<T>]>,
     K: TrCancellationToken,
 {
-    let _ = DropGuard::new((), |_| {
-        ring.buf_stat_.clear_consumer_standby_();
-    });
     loop {
         if true {
             let x = ring.try_read_(demand);
@@ -642,12 +639,12 @@ where
         }
         if cancel.is_cancelled() {
             return SomeOf::new_right(ConsumerError::Cancelled);
-        } else {
-            ring.buf_stat_.set_consumer_standby_();
         }
-        let consumer = unsafe { ring.consumer_.as_mut_unchecked() };
+        // 「登记 → 发布 → 复检」三步在 park future 的首次 poll 里完成（见 half_.rs
+        // 顶部的协议说明）。等待槽自带自旋锁，因此这里只需要共享引用。
+        let consumer = unsafe { ring.consumer_.as_ref_unchecked() };
         let opt_err = consumer
-            .park_async(demand)
+            .park_async(demand, &ring.buf_stat_)
             .may_cancel_with(cancel.child_token())
             .await;
         if opt_err.as_ref().is_some_and(err_should_term_op_) {
@@ -669,9 +666,6 @@ where
     B: BorrowMut<[MaybeUninit<T>]>,
     K: TrCancellationToken,
 {
-    let _ = DropGuard::new((), |_| {
-        ring.buf_stat_.clear_producer_standby_();
-    });
     loop {
         if true {
             let x = ring.try_write_(demand);
@@ -684,12 +678,11 @@ where
         }
         if cancel.is_cancelled() {
             return SomeOf::new_right(ProducerError::Cancelled);
-        } else {
-            ring.buf_stat_.set_producer_standby_();
         }
-        let producer = unsafe { ring.producer_.as_mut_unchecked() };
+        // 同 `ring_read_async`：协议三步在 park future 的首次 poll 里完成。
+        let producer = unsafe { ring.producer_.as_ref_unchecked() };
         let opt_err = producer
-            .park_async(demand)
+            .park_async(demand, &ring.buf_stat_)
             .may_cancel_with(cancel.child_token())
             .await;
         if opt_err.as_ref().is_some_and(err_should_term_op_) {
@@ -705,7 +698,7 @@ pub struct RingState {
 }
 
 impl RingState {
-    const fn new(capacity: usize) -> Self {
+    pub(super) const fn new(capacity: usize) -> Self {
         RingState {
             atm_flag_: AtomicFlags::new(AtomicUsize::new(0usize)),
             capacity_: capacity,
@@ -750,7 +743,45 @@ impl RingState {
         has_flag(state, PRODUCER_CLOSED)
     }
 
-    fn set_consumer_standby_(&self) -> bool {
+    // ------------------------------------------------------------------
+    // 等待槽的「兴趣位」与判据
+    //
+    // 兴趣位（STNDBY）的语义是「当前有一个已登记的等待者」，由等待者发布、由认领方
+    // （对端唤醒或等待者撤回）清除；它同时是唤醒路径的廉价快照判断。具体的「判定 +
+    // 认领 + 取走」由 `half_` 里的等待槽自旋锁串起来。
+    // ------------------------------------------------------------------
+
+    /// 兴趣位当前是否置位（供 `half_` 的单测断言协议中间状态）。
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn is_consumer_standby_(&self) -> bool {
+        has_flag(self.atm_flag_.value(), CONSUMER_STNDBY)
+    }
+
+    /// 见 `is_consumer_standby_`。
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn is_producer_standby_(&self) -> bool {
+        has_flag(self.atm_flag_.value(), PRODUCER_STNDBY)
+    }
+
+    /// 读端现在是否已能满足 `demand`：判据与 `Ring::try_read_internal_` 一致
+    /// （下限缺省为 1：没有显式下限时，只要有 1 个可读就够）。
+    #[inline]
+    pub(super) fn can_consume_(&self, demand: &Demand<usize>) -> bool {
+        self.data_size() >= demand.min().unwrap_or(1usize)
+    }
+
+    /// 写端现在是否已能满足 `demand`：判据与 `Ring::try_write_internal_` 一致。
+    #[inline]
+    pub(super) fn can_produce_(&self, demand: &Demand<usize>) -> bool {
+        self.free_size() >= demand.min().unwrap_or(1usize)
+    }
+
+    /// 等待者发布读端兴趣位：CAS `0 → 1`（保留位置位）。
+    ///
+    /// 返回 `false` 表示兴趣位已经是 1 —— 正常协议下不该发生，由调用方处理成「重试」。
+    pub(super) fn try_publish_consumer_standby_(&self) -> bool {
         let expect = |s| !has_flag(s, CONSUMER_STNDBY);
         let desire = |s| s | CONSUMER_STNDBY;
         self.atm_flag_
@@ -758,7 +789,8 @@ impl RingState {
             .is_succ()
     }
 
-    fn clear_consumer_standby_(&self) -> bool {
+    /// 认领 / 撤回读端兴趣位：CAS `1 → 0`。抢到的一方负责取走登记。
+    pub(super) fn try_claim_consumer_standby_(&self) -> bool {
         let expect = |s| has_flag(s, CONSUMER_STNDBY);
         let desire = |s| s & !CONSUMER_STNDBY;
         self.atm_flag_
@@ -766,7 +798,8 @@ impl RingState {
             .is_succ()
     }
 
-    fn set_producer_standby_(&self) -> bool {
+    /// 等待者发布写端兴趣位。语义同 [`Self::try_publish_consumer_standby_`]。
+    pub(super) fn try_publish_producer_standby_(&self) -> bool {
         let expect = |s| !has_flag(s, PRODUCER_STNDBY);
         let desire = |s| s | PRODUCER_STNDBY;
         self.atm_flag_
@@ -774,7 +807,8 @@ impl RingState {
             .is_succ()
     }
 
-    fn clear_producer_standby_(&self) -> bool {
+    /// 认领 / 撤回写端兴趣位。语义同 [`Self::try_claim_consumer_standby_`]。
+    pub(super) fn try_claim_producer_standby_(&self) -> bool {
         let expect = |s| has_flag(s, PRODUCER_STNDBY);
         let desire = |s| s & !PRODUCER_STNDBY;
         self.atm_flag_
