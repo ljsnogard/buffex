@@ -80,7 +80,9 @@ impl<T> TrPark for Consumer<T> {
 // passive::ConsumerParkAsync
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-pub struct ConsumerParkAsync<'a, T>(&'a mut Consumer<T>);
+/// `park_async` 返回的适配器。它在构造时就把本次等待的 `Demand` 绑定到 `RingHalf_` 上，
+/// 因此在转换成 [`ConsumerParkFuture`] 之前被 drop 时也必须释放绑定（见下面的 `Drop`）。
+pub struct ConsumerParkAsync<'a, T>(Option<&'a mut Consumer<T>>);
 
 impl<'a, T> ConsumerParkAsync<'a, T> {
     fn new_(
@@ -88,7 +90,21 @@ impl<'a, T> ConsumerParkAsync<'a, T> {
         demand: &'a Demand<usize>,
     ) -> Self {
         consumer.ring_half_.init_demand_(demand);
-        ConsumerParkAsync(consumer)
+        ConsumerParkAsync(Option::Some(consumer))
+    }
+
+    /// 取出内部借用；适配器在一次 `park_async` 里只允许转换一次。
+    fn take_consumer_(&mut self) -> &'a mut Consumer<T> {
+        self.0.take().expect("park adapter already converted")
+    }
+}
+
+impl<'a, T> Drop for ConsumerParkAsync<'a, T> {
+    fn drop(&mut self) {
+        // 未转换成 future 就被丢弃：绑定还挂在 half 上，必须在这里释放。
+        if let Option::Some(consumer) = self.0.as_mut() {
+            consumer.as_half_mut_().release_();
+        }
     }
 }
 
@@ -96,8 +112,8 @@ impl<'a, T> IntoFuture for ConsumerParkAsync<'a, T> {
     type IntoFuture = ConsumerParkFuture<'a, T, NonCancellableToken>;
     type Output = Option<ConsumerError<usize>>;
 
-    fn into_future(self) -> Self::IntoFuture {
-        let consumer = self.0;
+    fn into_future(mut self) -> Self::IntoFuture {
+        let consumer = self.take_consumer_();
         let cancel = NonCancellableToken::new();
         ConsumerParkFuture::new_(consumer, cancel)
     }
@@ -112,11 +128,11 @@ impl<'a, T> TrMayCancel<'a> for ConsumerParkAsync<'a, T> {
 
     type MayCancelOutput = Option<ConsumerError<usize>>;
 
-    fn may_cancel_with<C>(self, cancel: C) -> Self::MayCancelFuture<'a, C>
+    fn may_cancel_with<C>(mut self, cancel: C) -> Self::MayCancelFuture<'a, C>
     where
         C: 'a + TrCancellationToken,
     {
-        let consumer = self.0;
+        let consumer = self.take_consumer_();
         ConsumerParkFuture::new_(consumer, cancel)
     }
 }
@@ -225,7 +241,9 @@ impl<T> TrPark for Producer<T> {
 // passive::ProducerParkAsync
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-pub struct ProducerParkAsync<'a, T>(&'a mut Producer<T>);
+/// `park_async` 返回的适配器。同 [`ConsumerParkAsync`]：构造时已绑定 `Demand`，
+/// 未转换成 [`ProducerParkFuture`] 就被 drop 时也必须释放绑定。
+pub struct ProducerParkAsync<'a, T>(Option<&'a mut Producer<T>>);
 
 impl<'a, T> ProducerParkAsync<'a, T> {
     fn new_(
@@ -233,7 +251,21 @@ impl<'a, T> ProducerParkAsync<'a, T> {
         demand: &'a Demand<usize>,
     ) -> Self {
         producer.ring_half_.init_demand_(demand);
-        ProducerParkAsync(producer)
+        ProducerParkAsync(Option::Some(producer))
+    }
+
+    /// 取出内部借用；适配器在一次 `park_async` 里只允许转换一次。
+    fn take_producer_(&mut self) -> &'a mut Producer<T> {
+        self.0.take().expect("park adapter already converted")
+    }
+}
+
+impl<'a, T> Drop for ProducerParkAsync<'a, T> {
+    fn drop(&mut self) {
+        // 未转换成 future 就被丢弃：绑定还挂在 half 上，必须在这里释放。
+        if let Option::Some(producer) = self.0.as_mut() {
+            producer.as_half_mut_().release_();
+        }
     }
 }
 
@@ -241,8 +273,8 @@ impl<'a, T> IntoFuture for ProducerParkAsync<'a, T> {
     type IntoFuture = ProducerParkFuture<'a, T, NonCancellableToken>;
     type Output = Option<ProducerError<usize>>;
 
-    fn into_future(self) -> Self::IntoFuture {
-        let producer = self.0;
+    fn into_future(mut self) -> Self::IntoFuture {
+        let producer = self.take_producer_();
         let cancel = NonCancellableToken::new();
         ProducerParkFuture::new(producer, cancel)
     }
@@ -258,13 +290,13 @@ impl<'a, T> TrMayCancel<'a> for ProducerParkAsync<'a, T> {
     type MayCancelOutput = Option<ProducerError<usize>>;
 
     fn may_cancel_with<C>(
-        self,
+        mut self,
         cancel: C,
     ) -> Self::MayCancelFuture<'a, C>
     where
         C: 'a + TrCancellationToken
     {
-        let producer = self.0;
+        let producer = self.take_producer_();
         ProducerParkFuture::new(producer, cancel)
     }
 }
@@ -353,6 +385,22 @@ impl RingHalf_ {
     #[inline]
     fn reset_demand_(&self) -> bool {
         self.opt_demand_.try_reset().is_ok()
+    }
+
+    /// 解除与当前等待者的绑定：清空唤醒槽位并释放 demand 的占用。
+    ///
+    /// park future 无论是**正常结束**（被唤醒 / 取消，poll 收尾时调用）还是**中途被
+    /// drop**（`select` 落败、外层 future 被丢弃，`Drop` 里调用）都必须调用它：
+    ///
+    /// * 不清空 `wake_slot_`，下一次 park 的首次 poll 会把残留槽位误判成「已经注册
+    ///   过」，于是直接 `Ready(None)`，`ring_*_async` 的循环在**一次 poll 内**同步空转；
+    /// * 不释放 `opt_demand_`，下一次 park 的 `init_demand_` 会静默失败（残留的旧
+    ///   demand 继续生效），对端 `wake()` 还会按过时的下限判定，并可能解引用已经
+    ///   释放的 `Demand`。
+    #[inline]
+    fn release_(&mut self) {
+        self.reset_demand_();
+        self.wake_slot_ = Option::None;
     }
 }
 
@@ -471,9 +519,107 @@ where
     };
     // 手动取消 half 与 demand 的绑定
     if x.is_ready() {
-        let half_mut = this.half_mut().as_half_mut_();
-        half_mut.reset_demand_();
-        half_mut.wake_slot_ = Option::None;
+        this.half_mut().as_half_mut_().release_();
     }
     x
+}
+
+impl<'a, T, K> Drop for ConsumerParkFuture<'a, T, K>
+where
+    K: TrCancellationToken,
+{
+    fn drop(&mut self) {
+        // 挂起状态下被丢弃（取消 / `select` 落败）时 poll 的收尾逻辑不会执行，
+        // 必须在这里释放绑定，否则残留状态会污染下一次 park。
+        self.consumer_.as_half_mut_().release_();
+    }
+}
+
+impl<'a, T, K> Drop for ProducerParkFuture<'a, T, K>
+where
+    K: TrCancellationToken,
+{
+    fn drop(&mut self) {
+        // 同 `ConsumerParkFuture`：挂起中被丢弃也要释放绑定。
+        self.producer_.as_half_mut_().release_();
+    }
+}
+
+#[cfg(test)]
+mod tests_ {
+    use super::*;
+
+    /// 校验 park future 中途被 drop 时释放对 `RingHalf_` 的占用。
+    /// - 测试目标：park future 完成注册（首次 poll 挂起）后被丢弃（取消 / `select`
+    ///   落败）时，必须清空 `wake_slot_` 并释放 `opt_demand_`。否则下一次 park 的首次
+    ///   poll 会把残留槽位误判成「已经注册过」而立即 `Ready(None)`（同步空转），且对端
+    ///   `wake()` 可能解引用已经释放的 `Demand`。
+    /// - 测试手段：读端与写端各构造一个 park future，用空 waker poll 一次确认它挂起，
+    ///   随后 drop；再各丢弃一个**未转换成 future** 的 `park_async` 适配器（它在构造时
+    ///   就已经完成了 demand 绑定）。
+    /// - 判定标准：上述 drop 之后，两侧的 `wake_slot_` 都为空、`pending_demand_` 都为
+    ///   `None`。
+    #[test]
+    fn dropped_park_future_releases_half_binding_() {
+        let demand = Demand::at_least(1);
+
+        // -- 读端 --
+        let mut consumer = Consumer::<u8>::new();
+        {
+            let mut park = std::boxed::Box::pin(
+                consumer.park_async(&demand).into_future(),
+            );
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                park.as_mut().poll(&mut cx).is_pending(),
+                "首次 park 应挂起（非取消令牌的 cancellation 永不就绪）"
+            );
+        } // 此处 drop：必须释放绑定
+        assert!(
+            consumer.ring_half_.wake_slot_.is_none(),
+            "读端 park future drop 后应清空唤醒槽位"
+        );
+        assert!(
+            consumer.pending_demand_().is_none(),
+            "读端 park future drop 后应释放 demand 绑定"
+        );
+
+        // -- 写端 --
+        let mut producer = Producer::<u8>::new();
+        {
+            let mut park = std::boxed::Box::pin(
+                producer.park_async(&demand).into_future(),
+            );
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                park.as_mut().poll(&mut cx).is_pending(),
+                "首次 park 应挂起（非取消令牌的 cancellation 永不就绪）"
+            );
+        }
+        assert!(
+            producer.ring_half_.wake_slot_.is_none(),
+            "写端 park future drop 后应清空唤醒槽位"
+        );
+        assert!(
+            producer.pending_demand_().is_none(),
+            "写端 park future drop 后应释放 demand 绑定"
+        );
+
+        // -- 适配器未转换成 future 就被 drop --
+        // `park_async` 在构造适配器时已调用 `init_demand_`，此时绑定就已经建立，
+        // 因此丢弃适配器也必须释放它。
+        let mut consumer_ = Consumer::<u8>::new();
+        drop(consumer_.park_async(&demand));
+        assert!(
+            consumer_.pending_demand_().is_none(),
+            "未转换就被 drop 的读端适配器应释放 demand 绑定"
+        );
+
+        let mut producer_ = Producer::<u8>::new();
+        drop(producer_.park_async(&demand));
+        assert!(
+            producer_.pending_demand_().is_none(),
+            "未转换就被 drop 的写端适配器应释放 demand 绑定"
+        );
+    }
 }

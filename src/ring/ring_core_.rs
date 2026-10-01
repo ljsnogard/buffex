@@ -227,27 +227,29 @@ where
         &self,
         demand: &Demand<usize>,
     ) -> Result<(usize, usize), ConsumerError<usize>> {
+        let cap = self.capacity();
         let min_len = demand.min().unwrap_or(0);
+        if min_len > cap {
+            return Result::Err(ConsumerError::Unsatisfiable);
+        }
+        let s = self.buf_stat_.value();
+        if has_flag(s, CONSUMER_CLOSED) {
+            return Result::Err(ConsumerError::Closing);
+        }
         let max_len = demand.max().unwrap_or(usize::MAX);
-        let state = self.buf_stat_.value();
-        let pos = IoPos::unpack(state, self.capacity());
+        let pos = IoPos::unpack(s, cap);
         let ready = pos.data_size();
         if ready == 0 {
-            if has_flag(state, PRODUCER_CLOSED)
-                || has_flag(state, CONSUMER_CLOSED)
-            {
+            if has_flag(s, PRODUCER_CLOSED) {
                 return Err(ConsumerError::Closing); // EOF：写端已关且读空
             }
             return Err(ConsumerError::Drained(pos.rp));
         }
-        if ready < min_len
-            && !has_flag(state, PRODUCER_CLOSED)
-            && !has_flag(state, CONSUMER_CLOSED)
-        {
+        if ready < min_len {
             return Err(ConsumerError::Drained(pos.rp)); // 不足下限且未关闭：等待更多
         }
         let take = core::cmp::min(max_len, ready);
-        debug_assert!(take > 0);
+        debug_assert!(take > 0, "[Ring::try_read_internal_] take({})", take);
         Ok((pos.rp, take))
     }
 
@@ -259,20 +261,23 @@ where
         &self,
         demand: &Demand<usize>,
     ) -> Result<(usize, usize), ProducerError<usize>> {
-        let min_len = demand.min().unwrap_or(0);
-        let max_len = demand.max().unwrap_or(usize::MAX);
-        let state = self.buf_stat_.value();
         let cap = self.capacity();
-        let pos = IoPos::unpack(state, cap);
+        let min_len = demand.min().unwrap_or(0);
+        if min_len > cap {
+            return Result::Err(ProducerError::Unsatisfiable);
+        }
+        let s = self.buf_stat_.value();
+        if has_flag(s, PRODUCER_CLOSED) || has_flag(s, CONSUMER_CLOSED) {
+            return Result::Err(ProducerError::Closing);
+        }
+        let max_len = demand.max().unwrap_or(usize::MAX);
+        let pos = IoPos::unpack(s, cap);
         let free = pos.free_size();
         if free == 0 || free < min_len {
-            if has_flag(state, PRODUCER_CLOSED) {
-                return Err(ProducerError::Closing);
-            }
-            return Err(ProducerError::Stuffed(pos.wp));
+            return Result::Err(ProducerError::Stuffed(pos.wp));
         }
         let take = core::cmp::min(max_len, free);
-        debug_assert!(take > 0 && take >= min_len);
+        debug_assert!(take > 0, "[Ring::try_write_internal_] take({})", take);
         Ok((pos.wp, take))
     }
 
