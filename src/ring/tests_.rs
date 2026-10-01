@@ -37,7 +37,10 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
+    thread,
+    time::Duration,
     vec,
     vec::Vec,
 };
@@ -842,3 +845,206 @@ async fn writer_woken_only_when_enough_free_space_() {
 }
 
 dual_runtime_test_!(writer_woken_only_when_enough_free_space_);
+
+
+// ---------------------------------------------------------------------------
+// 多线程压力用例：SPSC 唤醒协议在**真并行**下是否丢唤醒
+// ---------------------------------------------------------------------------
+//
+// 背景（详见 dev-notes/ring-20261001-0225.md）：`wake_slot_` 的读只由 STNDBY 标志
+// 「近似」保护，而标志的发布发生在等待者注册 waker **之前**，并且在整个
+// `ring_*_async` 期间不会清除。于是存在两个窗口：
+//
+// * 条件检查之后、标志发布之前，对端提交 → 对端看不到标志 → 不唤醒；
+// * 标志发布之后、waker 注册之前，对端提交 → 对端看到标志、但槽位还是空的 → 不唤醒。
+//
+// 两者都会让等待者睡死。单线程运行时（`join!` 逐个 poll 两个 future）在这两个窗口
+// 内不会切换任务，因此抓不到；本节的用例把两端放到**两个线程**上真并行跑，并用
+// 容量 2 的环让两端严格轮流「等满一轮 → 搬一轮」，从而把每一次唤醒都变成一次性的：
+// 丢掉任何一次唤醒，两端会同时停在 park 上（死锁），由兜底超时暴露。
+
+/// 压测环的容量：取 `Ring` 允许的最小值（2），让两端每一轮都必然走到等待 / 唤醒。
+const STRESS_CAPACITY: usize = 2;
+
+/// 每轮搬移的元素数：等于容量，于是写端每轮写满、读端每轮取空，严格交替。
+const STRESS_CHUNK: usize = STRESS_CAPACITY;
+
+/// 每次尝试里每个方向的轮数。
+const STRESS_ROUNDS: usize = 2_000;
+
+/// 独立尝试的次数：每次都换一个新环、重新起两端。
+///
+/// 实测缺陷的命中点既有「第一次 park 与对端首次提交相撞」的启动窗口，也有稳定态里
+/// 千分之一量级的偶发相撞；多次尝试同时覆盖两者。
+const STRESS_ATTEMPTS: usize = 8;
+
+/// 单次尝试的兜底超时：正确实现下 `STRESS_ROUNDS` 轮远快于此；触发即「丢了唤醒」。
+const STRESS_DEADLINE: Duration = Duration::from_secs(10);
+
+/// 压测用的两半：`Ring` 由 `Arc` 共享，`split_unchecked` 之后只有两半各持一个。
+type StressWriter = RingWriter<Arc<TestRing>, TestBuff, u8>;
+type StressReader = RingReader<Arc<TestRing>, TestBuff, u8>;
+
+/// 用 `Arc<Ring>` 拆出一对可跨线程 / 跨任务移动的读写半部。
+fn split_shared_ring_(capacity: usize) -> (StressWriter, StressReader) {
+    let ring = Arc::new(new_ring_(capacity));
+    // SAFETY: `split_unchecked` 要求环被智能指针独占持有、且不存在 weak 升级。
+    // `ring` 被 move 进来后由内部 clone 一份给写端；返回之后测试内不再保留其它
+    // `Arc`，也没有 `Weak`，两个半部各持唯一的一份。
+    unsafe { Ring::split_unchecked(ring) }
+}
+
+/// 压测写端：`rounds` 轮「借满 `STRESS_CHUNK` 个写段 → 填充 → 提交（drop）」。
+async fn stress_write_loop_(mut tx: StressWriter, rounds: usize, progress: Arc<AtomicUsize>) {
+    let payload = [0xA5u8; STRESS_CHUNK];
+    for _ in 0..rounds {
+        let demand = Demand::at_least(STRESS_CHUNK);
+        let some = tx.write_async(&demand).await;
+        let mut segm = some.pick_left().expect("写端应能借出写段");
+        assert_eq!(
+            segm.move_items_from_as_buff(&payload),
+            STRESS_CHUNK,
+            "写端应恰好搬入一轮的量"
+        );
+        drop(segm); // 提交：推进 wp，并在读端待机时唤醒它
+        progress.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 压测读端：`rounds` 轮「借满 `STRESS_CHUNK` 个读段 → 取走 → 提交（drop）」。
+async fn stress_read_loop_(mut rx: StressReader, rounds: usize, progress: Arc<AtomicUsize>) {
+    for _ in 0..rounds {
+        let demand = Demand::at_least(STRESS_CHUNK);
+        let some = rx.read_async(&demand).await;
+        let mut segm = some.pick_left().expect("读端应能借出读段");
+        let got = take_segm_bytes_(&mut segm, STRESS_CHUNK).await;
+        assert_eq!(got.len(), STRESS_CHUNK, "读端应恰好取走一轮的量");
+        drop(segm); // 提交：推进 rp，并在写端待机时唤醒它
+        progress.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 把两个方向分别放到两个 OS 线程上跑，并用 `recv_timeout` 兜底等待。
+///
+/// 两个闭包各自负责「建运行时 + `block_on` 本方向的循环」；结束信号由 `Drop` 守卫发出，
+/// 因此某一端 panic（断言失败）时主线程也能立刻失败，而不必等满超时。
+fn run_stress_on_two_threads_(
+    runtime: &'static str,
+    attempt: usize,
+    write: impl FnOnce() + Send + 'static,
+    read: impl FnOnce() + Send + 'static,
+    done_w: Arc<AtomicUsize>,
+    done_r: Arc<AtomicUsize>,
+) {
+    /// 离开作用域（含 unwind）时向主线程报告「本端已结束」。
+    struct DoneGuard_(mpsc::Sender<()>);
+
+    impl Drop for DoneGuard_ {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    let (sig_tx, sig_rx) = mpsc::channel::<()>();
+
+    let w_sig = DoneGuard_(sig_tx.clone());
+    let w = thread::spawn(move || {
+        let _guard = w_sig;
+        write();
+    });
+
+    let r_sig = DoneGuard_(sig_tx);
+    let r = thread::spawn(move || {
+        let _guard = r_sig;
+        read();
+    });
+
+    let mut finished = 0usize;
+    while finished < 2 {
+        if sig_rx.recv_timeout(STRESS_DEADLINE).is_err() {
+            panic!(
+                "{runtime} 多线程 ping-pong 第 {attempt}/{STRESS_ATTEMPTS} 次尝试在 \
+                 {STRESS_DEADLINE:?} 内未完成：写端 {}/{} 轮、读端 {}/{} 轮。\
+                 两端同时停在 park 上说明丢了唤醒\
+                 （见 dev-notes/ring-20261001-0225.md）。",
+                done_w.load(Ordering::Relaxed),
+                STRESS_ROUNDS,
+                done_r.load(Ordering::Relaxed),
+                STRESS_ROUNDS,
+            );
+        }
+        finished += 1;
+    }
+
+    w.join().expect("写端线程不应 panic");
+    r.join().expect("读端线程不应 panic");
+}
+
+/// 多线程压力用例（tokio）：SPSC ping-pong 在真并行下不得丢唤醒。
+/// - 测试目标：读 / 写两端在**两个线程**上并行推进 `STRESS_ROUNDS` 轮「等满一轮再搬
+///   一轮」。任何一次「本应发生的唤醒」被丢掉，两端都会同时停在 park 上，且没有后续事件
+///   能再唤醒它们（死锁）。
+/// - 测试手段：容量 2 的环经 `Arc` + `split_unchecked` 拆成两半，各交给一个 OS 线程，
+///   线程内用 tokio 的 `current_thread` 运行时 `block_on` 驱动；主线程用
+///   `mpsc::recv_timeout` 兜底。
+///   这里刻意**不用** `#[tokio::test(flavor = "multi_thread")]` + `tokio::spawn`：spawn
+///   要求 future 满足 `'static`，而 `RingReader::read_async` 的返回类型是 GAT 投影，
+///   rustc 目前证不出这一点（issue #100013），换成 `BoxFuture<'static, _>` 同样如此；
+///   单任务里的 `join!` 更不行——它逐个 poll 两个 future，制造不出真并行。
+/// - 判定标准：每次尝试的 `STRESS_ROUNDS` 轮全部完成，`STRESS_ATTEMPTS` 次都通过；超时
+///   失败时打印两端各自完成的轮数，用来区分是「写端等空间」还是「读端等数据」被卡住。
+#[test]
+fn wakeup_stress_tokio_() {
+    for attempt in 1..=STRESS_ATTEMPTS {
+        let (tx, rx) = split_shared_ring_(STRESS_CAPACITY);
+        let done_w = Arc::new(AtomicUsize::new(0));
+        let done_r = Arc::new(AtomicUsize::new(0));
+
+        let dw = Arc::clone(&done_w);
+        let write = move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("创建 tokio current_thread 运行时");
+            rt.block_on(stress_write_loop_(tx, STRESS_ROUNDS, dw));
+        };
+
+        let dr = Arc::clone(&done_r);
+        let read = move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("创建 tokio current_thread 运行时");
+            rt.block_on(stress_read_loop_(rx, STRESS_ROUNDS, dr));
+        };
+
+        run_stress_on_two_threads_("tokio", attempt, write, read, done_w, done_r);
+    }
+}
+
+/// 多线程压力用例（compio）：同 [`wakeup_stress_tokio_`]，只是换成 compio 运行时。
+/// - 测试手段：compio 是 thread-per-core、没有多线程 worker 池，所以「多线程」就是一个
+///   线程一个 `compio::runtime::Runtime`，各自 `block_on` 一个方向（compio 文档里的用法）；
+///   兜底方式与判定标准同 tokio 版本。
+#[test]
+fn wakeup_stress_compio_() {
+    for attempt in 1..=STRESS_ATTEMPTS {
+        let (tx, rx) = split_shared_ring_(STRESS_CAPACITY);
+        let done_w = Arc::new(AtomicUsize::new(0));
+        let done_r = Arc::new(AtomicUsize::new(0));
+
+        let dw = Arc::clone(&done_w);
+        let write = move || {
+            let rt = compio::runtime::Runtime::new().expect("创建 compio 运行时");
+            rt.block_on(stress_write_loop_(tx, STRESS_ROUNDS, dw));
+        };
+
+        let dr = Arc::clone(&done_r);
+        let read = move || {
+            let rt = compio::runtime::Runtime::new().expect("创建 compio 运行时");
+            rt.block_on(stress_read_loop_(rx, STRESS_ROUNDS, dr));
+        };
+
+        run_stress_on_two_threads_("compio", attempt, write, read, done_w, done_r);
+    }
+}

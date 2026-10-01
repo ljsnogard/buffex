@@ -3,9 +3,6 @@ mod half_;
 mod hook_;
 mod ring_core_;
 
-#[cfg(test)]
-mod tests_;
-
 pub mod reclaim;
 
 pub use error_::{ConsumerError, ProducerError};
@@ -16,3 +13,6 @@ pub use ring_core_::{
     RingSegmRef, RingSegmMut,
     RingReadAsync, RingWriteAsync,
 };
+
+#[cfg(test)]
+mod tests_;
