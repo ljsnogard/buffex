@@ -25,7 +25,14 @@
 //! **一次 poll 内同步空转**（不让出也不返回，表现为任务挂死）；本节末尾的两个回归用例以
 //! 「查询预算令牌」把空转截断成**有界失败**。
 //!
-//! `Ring` 目前没有对外的 `close`，故不含 EOF 用例。
+//! # 关闭（EOF）
+//!
+//! `Ring::close_producer` / `close_consumer`（以及两个半部的 `close`）把状态字里的
+//! `PRODUCER_CLOSED` / `CONSUMER_CLOSED` 置起来并唤醒对端，于是「设备结束 / 收尾」不再
+//! 需要调用方自己造通知：环里还有数据就照常交付，取空之后读侧拿 `Closing`、写侧一律
+//! `Closing`。副作用是 `try_read_internal_` 的「EOF 例外」必须兑现——写端已关闭时即使
+//! 不足 `Demand` 下限也要交付现有部分，否则「已关闭 ⇒ `can_consume_` 为真」会让 park
+//! 循环在一次 poll 内同步空转；本条以查询预算令牌把空转截断成**有界失败**。
 
 use core::{
     future::{self, IntoFuture},
@@ -846,6 +853,201 @@ async fn writer_woken_only_when_enough_free_space_() {
 
 dual_runtime_test_!(writer_woken_only_when_enough_free_space_);
 
+
+// ---------------------------------------------------------------------------
+// 关闭（EOF）：close_producer / close_consumer 与对端唤醒
+// ---------------------------------------------------------------------------
+
+/// 空环上 park 的消费者，在对端 `close` 之后必须立刻醒并拿到 `Closing`。
+/// - 测试目标：`RingWriter::close`（置 `PRODUCER_CLOSED`）能唤醒**已登记**的消费者等待，
+///   而不是让它在「不会再有任何数据」的环上永久挂起。
+/// - 测试手段：容量 8 的空环拆成两半；`join!` 里先 poll「以 `at_least(1)` 读」的 future
+///   （保证它先 park），再 poll 关闭写端的那一侧。
+/// - 判定标准：读等待返回 `ConsumerError::Closing`（既不是 `Drained`，也不挂起）；
+///   写端状态为「生产端已关闭」。
+async fn close_producer_wakes_parked_consumer_() {
+    let mut ring = new_ring_(8);
+    let (tx, mut rx) = Ring::split(&mut ring);
+
+    let read = async {
+        let demand = Demand::at_least(1);
+        let some = rx.read_async(&demand).await;
+        assert!(
+            matches!(some.pick_right(), Some(ConsumerError::Closing)),
+            "生产端关闭后，空环上的读等待应报 Closing"
+        );
+    };
+    let close = async {
+        tx.close(); // 读半部 park 在同一个环上，close 必须把它唤醒
+    };
+    futures_util::join!(read, close);
+
+    assert!(
+        tx.ring_state().is_producer_closed(),
+        "close 之后状态字应带 PRODUCER_CLOSED"
+    );
+}
+
+dual_runtime_test_!(close_producer_wakes_parked_consumer_);
+
+/// 关闭生产端不会吞掉环里已提交的数据：先交付完，取空之后才是 `Closing`。
+/// - 测试目标：EOF 的交付顺序（数据优先、`Closing` 最后）。
+/// - 测试手段：容量 8 写入 3 个元素 → `close` → 用读端取回 3 个 → 再读一次。
+/// - 判定标准：第一次取回 `[5, 6, 7]`；第二次返回 `ConsumerError::Closing`。
+async fn close_producer_delivers_remaining_then_closing_() {
+    let mut ring = new_ring_(8);
+    let (mut tx, mut rx) = Ring::split(&mut ring);
+    {
+        let demand = Demand::at_least(3);
+        let mut segm = tx.try_write(&demand).pick_left().expect("应能借出写段");
+        assert_eq!(segm.move_items_from_as_buff(&[5u8, 6, 7]), 3);
+    }
+    tx.close();
+
+    let demand = Demand::at_least(1);
+    assert_eq!(
+        rx_read_(&mut rx, &demand, 3).await,
+        vec![5u8, 6, 7],
+        "关闭前已提交的数据必须照常交付"
+    );
+
+    let demand = Demand::at_least(1);
+    let some = rx.read_async(&demand).await;
+    assert!(
+        matches!(some.pick_right(), Some(ConsumerError::Closing)),
+        "取空之后才应报 Closing"
+    );
+}
+
+dual_runtime_test_!(close_producer_delivers_remaining_then_closing_);
+
+/// 满环上 park 的生产者，在消费端 `close` 之后必须立刻醒并拿到 `Closing`。
+/// - 测试目标：`RingReader::close`（置 `CONSUMER_CLOSED`）能唤醒**已登记**的生产者等待。
+/// - 测试手段：容量 4 写满 → `join!` 里先 poll「以 `at_least(1)` 写」的 future（保证它
+///   先 park）→ 再 poll 关闭读端的那一侧。
+/// - 判定标准：写等待返回 `ProducerError::Closing`（不是 `Stuffed`、也不挂起）。
+async fn close_consumer_wakes_parked_producer_() {
+    let mut ring = new_ring_(4);
+    let (mut tx, rx) = Ring::split(&mut ring);
+    {
+        let demand = Demand::at_least(4);
+        let mut segm = tx.try_write(&demand).pick_left().expect("应能借出写段");
+        assert_eq!(segm.move_items_from_as_buff(&[1u8, 2, 3, 4]), 4);
+    }
+
+    let write = async {
+        let demand = Demand::at_least(1);
+        let some = tx.write_async(&demand).await;
+        assert!(
+            matches!(some.pick_right(), Some(ProducerError::Closing)),
+            "消费端关闭后，满环上的写等待应报 Closing"
+        );
+    };
+    let close = async {
+        rx.close();
+    };
+    futures_util::join!(write, close);
+
+    assert!(
+        rx.ring_state().is_consumer_closed(),
+        "close 之后状态字应带 CONSUMER_CLOSED"
+    );
+}
+
+dual_runtime_test_!(close_consumer_wakes_parked_producer_);
+
+/// `close` 幂等，且关闭之后的读写入口一致地报 `Closing`。
+/// - 测试目标：重复关闭不 panic、不重复唤醒；关闭之后的语义与 `try_*_internal_` 的分支一致。
+/// - 测试手段：空环上连续 `close` 写端两次，再连续 `close` 读端两次；期间用 `try_write`
+///   与 `read_async` 各探一次。
+/// - 判定标准：`is_producer_closed` / `is_consumer_closed` 均为真；`try_write` 返回
+///   `ProducerError::Closing`（不是 `Stuffed`）；读端在空环上返回 `ConsumerError::Closing`。
+async fn close_is_idempotent_() {
+    let mut ring = new_ring_(8);
+    let (mut tx, mut rx) = Ring::split(&mut ring);
+
+    tx.close();
+    tx.close();
+    assert!(tx.ring_state().is_producer_closed(), "重复 close 不应改变状态");
+
+    let demand = Demand::at_least(1);
+    assert!(
+        matches!(
+            tx.try_write(&demand).pick_right(),
+            Some(ProducerError::Closing)
+        ),
+        "生产端关闭后写入口应报 Closing，而不是 Stuffed"
+    );
+
+    let demand = Demand::at_least(1);
+    assert!(
+        matches!(
+            rx.read_async(&demand).await.pick_right(),
+            Some(ConsumerError::Closing)
+        ),
+        "生产端关闭且环为空时读入口应报 Closing"
+    );
+
+    rx.close();
+    rx.close();
+    assert!(rx.ring_state().is_consumer_closed(), "重复 close 不应改变状态");
+}
+
+dual_runtime_test_!(close_is_idempotent_);
+
+/// 生产端关闭后，`Demand` 下限不足时也必须交付现有部分（EOF 例外）。
+/// - 测试目标：钉住 `try_read_internal_` 的「EOF 例外」——写端已关闭时不再按 `Demand`
+///   下限卡住，而是返回现有数据；并保证异步入口在「已关闭 + 环空」时立刻给 `Closing`，
+///   而不是在「`can_consume_` 为真」的唤醒上同步空转。
+/// - 测试手段：容量 8 写入 2 个元素；未关闭时以 `at_least(5)` 调 `try_read`；关闭生产端
+///   后再以 `at_least(5)` 调 `try_read` 并取走这 2 个；最后以 `at_least(5)` 调
+///   `read_async`，用预算 64 次的查询令牌把潜在空转截断成有界失败。
+/// - 判定标准：未关闭时 `Drained`；关闭后 `try_read` 交出恰好 2 个元素、内容为 `[1, 2]`；
+///   取空后的 `read_async` 返回 `Closing`（不是 `Cancelled`——那说明它在空转）。
+async fn eof_exception_returns_partial_under_min_demand_() {
+    let mut ring = new_ring_(8);
+    let (mut tx, mut rx) = Ring::split(&mut ring);
+    {
+        let demand = Demand::at_least(2);
+        let mut segm = tx.try_write(&demand).pick_left().expect("应能借出写段");
+        assert_eq!(segm.move_items_from_as_buff(&[1u8, 2]), 2);
+    }
+
+    // 未关闭：不足下限 ⇒ Drained，不交出这 2 个元素。
+    let demand = Demand::at_least(5);
+    assert!(
+        matches!(
+            rx.try_read(&demand).pick_right(),
+            Some(ConsumerError::Drained(_))
+        ),
+        "未关闭时不足下限应返回 Drained"
+    );
+
+    tx.close();
+
+    // 已关闭：交付现有部分（不足下限）。
+    let demand = Demand::at_least(5);
+    let mut segm = rx
+        .try_read(&demand)
+        .pick_left()
+        .expect("EOF 例外应交付现有部分");
+    assert_eq!(segm.least_count(), 2, "应交付现有的 2 个元素");
+    assert_eq!(take_segm_bytes_(&mut segm, 2).await, vec![1u8, 2]);
+    drop(segm); // 提交：环被取空
+
+    // 已关闭 + 环空 ⇒ 立刻 Closing；预算令牌保证「万一空转」表现为有界失败。
+    let demand = Demand::at_least(5);
+    let some = rx
+        .read_async(&demand)
+        .may_cancel_with(BudgetToken::new(64))
+        .await;
+    assert!(
+        matches!(some.pick_right(), Some(ConsumerError::Closing)),
+        "取空 + 已关闭应报 Closing（返回 Cancelled 说明在同步空转）"
+    );
+}
+
+dual_runtime_test_!(eof_exception_returns_partial_under_min_demand_);
 
 // ---------------------------------------------------------------------------
 // 多线程压力用例：SPSC 唤醒协议在**真并行**下的回归验收

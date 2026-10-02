@@ -198,8 +198,10 @@ impl<T> TrPark for Consumer<T> {
 
     fn wake(&self, state: &RingState) {
         // 锁内完成「按登记里的下限判定 → 认领 → 取走」；真正唤醒放到锁外。
+        // 「生产端已关闭」也算可唤醒：等待者醒来后会拿到 `Closing`，而不是永久睡下去
+        // （判据必须与 `RingState::can_consume_` 保持一致，否则会漏唤醒）。
         let Option::Some(reg) = self.ring_half_.take_for_wake_(
-            |min_demand| state.data_size() >= min_demand,
+            |min_demand| state.data_size() >= min_demand || state.is_producer_closed(),
             || state.try_claim_consumer_standby_(),
         ) else {
             return;
@@ -391,8 +393,9 @@ impl<T> TrPark for Producer<T> {
     type Err = ProducerError<usize>;
 
     fn wake(&self, state: &RingState) {
+        // 见 `Consumer::wake`：判据必须与 `RingState::can_produce_` 一致。
         let Option::Some(reg) = self.ring_half_.take_for_wake_(
-            |min_demand| state.free_size() >= min_demand,
+            |min_demand| state.free_size() >= min_demand || state.is_consumer_closed(),
             || state.try_claim_producer_standby_(),
         ) else {
             return;

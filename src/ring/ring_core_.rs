@@ -142,6 +142,34 @@ where
         self.buf_stat_.is_consumer_closed()
     }
 
+    /// 关闭生产端（EOF）：此后不再有新数据，并唤醒**已经 park 的消费者**。
+    ///
+    /// 幂等：已关闭时直接返回（只有抢到置位的一方负责唤醒）。
+    ///
+    /// 关闭之后的读取语义：
+    ///
+    /// * 环里还有已提交数据 → 照常交付（即使不足 `Demand` 下限，见
+    ///   [`Ring::try_read_internal_`] 的「EOF 例外」）；
+    /// * 环已取空 → [`ConsumerError::Closing`]；
+    /// * 正在 park 的消费者会被唤醒去重新判定，拿到 `Closing` 而不是永久挂起。
+    ///
+    /// 生产者一侧的对应入口是 [`RingWriter::close`]（语义相同）。
+    #[inline]
+    pub fn close_producer(&self) {
+        self.close_producer_()
+    }
+
+    /// 关闭消费端：此后不再有消费者，并唤醒**已经 park 的生产者**。
+    ///
+    /// 幂等。关闭之后 `try_write` / `write_async` 一律返回
+    /// [`ProducerError::Closing`]；正在 park 的生产者会被唤醒去重新判定。
+    ///
+    /// 消费者一侧的对应入口是 [`RingReader::close`]（语义相同）。
+    #[inline]
+    pub fn close_consumer(&self) {
+        self.close_consumer_()
+    }
+
     // ------------------------------------------------------------------
     // 同步快速读写
     // ------------------------------------------------------------------
@@ -246,7 +274,12 @@ where
             return Err(ConsumerError::Drained(pos.rp));
         }
         if ready < min_len {
-            return Err(ConsumerError::Drained(pos.rp)); // 不足下限且未关闭：等待更多
+            // EOF 例外：写端已关闭（不会再有数据）时交付现有部分，即使不足下限。
+            // 少了这条，「已关闭 ⇒ can_consume_ 为真」会让 park 循环在一次 poll 内
+            // 反复醒来又睡下（同步空转），而不是把 Closing 交给调用方。
+            if !has_flag(s, PRODUCER_CLOSED) {
+                return Err(ConsumerError::Drained(pos.rp)); // 不足下限且未关闭：等待更多
+            }
         }
         let take = core::cmp::min(max_len, ready);
         debug_assert!(take > 0, "[Ring::try_read_internal_] take({})", take);
@@ -313,6 +346,34 @@ where
             producer.wake(&self.buf_stat_);
         }
         pos.data_size()
+    }
+
+    /// 关闭生产端：置 `PRODUCER_CLOSED`，并唤醒等待中的消费者。
+    ///
+    /// 唤醒走的是与 [`Ring::advance_write`] 完全相同的一套协议：先看兴趣位快照，
+    /// 再让 [`Consumer::wake`] 在锁内做「判定 → 认领 → 取走」，唤醒放在锁外。
+    /// 判定面之所以能通过，是因为 [`RingState::can_consume_`] 与 `Consumer::wake`
+    /// 都把「生产端已关闭」视作可唤醒条件（关闭即「条件永久不可满足」）。
+    fn close_producer_(&self) {
+        // 只有抢到「置位」的一方负责唤醒；重复 close 直接返回。
+        if !self.buf_stat_.try_set_producer_closed_() {
+            return;
+        }
+        if has_flag(self.buf_stat_.value(), CONSUMER_STNDBY) {
+            let consumer = unsafe { self.consumer_.as_ref_unchecked() };
+            consumer.wake(&self.buf_stat_);
+        }
+    }
+
+    /// 关闭消费端：置 `CONSUMER_CLOSED`，并唤醒等待中的生产者。见 [`Ring::close_producer_`]。
+    fn close_consumer_(&self) {
+        if !self.buf_stat_.try_set_consumer_closed_() {
+            return;
+        }
+        if has_flag(self.buf_stat_.value(), PRODUCER_STNDBY) {
+            let producer = unsafe { self.producer_.as_ref_unchecked() };
+            producer.wake(&self.buf_stat_);
+        }
     }
 
     fn update_pos_<F>(&self, f: F) -> usize
@@ -767,15 +828,40 @@ impl RingState {
 
     /// 读端现在是否已能满足 `demand`：判据与 `Ring::try_read_internal_` 一致
     /// （下限缺省为 1：没有显式下限时，只要有 1 个可读就够）。
+    ///
+    /// 「生产端已关闭」也算可满足：关闭意味着条件**永久**不可能再被满足，等待者必须
+    /// 被唤醒去拿 `Closing`，否则会永久挂起（`wake` 侧的判据必须与这里保持一致）。
     #[inline]
     pub(super) fn can_consume_(&self, demand: &Demand<usize>) -> bool {
-        self.data_size() >= demand.min().unwrap_or(1usize)
+        self.data_size() >= demand.min().unwrap_or(1usize) || self.is_producer_closed()
     }
 
     /// 写端现在是否已能满足 `demand`：判据与 `Ring::try_write_internal_` 一致。
+    ///
+    /// 同 [`Self::can_consume_`]：「消费端已关闭」也算可满足。
     #[inline]
     pub(super) fn can_produce_(&self, demand: &Demand<usize>) -> bool {
-        self.free_size() >= demand.min().unwrap_or(1usize)
+        self.free_size() >= demand.min().unwrap_or(1usize) || self.is_consumer_closed()
+    }
+
+    /// 置位 `PRODUCER_CLOSED`（CAS `0 → 1`）；返回是否**由本次调用**置位。
+    ///
+    /// 调用方（[`Ring::close_producer_`]）据此决定谁负责唤醒对端，重复关闭是幂等的。
+    pub(super) fn try_set_producer_closed_(&self) -> bool {
+        let expect = |s| !has_flag(s, PRODUCER_CLOSED);
+        let desire = |s| s | PRODUCER_CLOSED;
+        self.atm_flag_
+            .try_spin_compare_exchange_weak(expect, desire)
+            .is_succ()
+    }
+
+    /// 置位 `CONSUMER_CLOSED`。语义同 [`Self::try_set_producer_closed_`]。
+    pub(super) fn try_set_consumer_closed_(&self) -> bool {
+        let expect = |s| !has_flag(s, CONSUMER_CLOSED);
+        let desire = |s| s | CONSUMER_CLOSED;
+        self.atm_flag_
+            .try_spin_compare_exchange_weak(expect, desire)
+            .is_succ()
     }
 
     /// 等待者发布读端兴趣位：CAS `0 → 1`（保留位置位）。
@@ -867,6 +953,14 @@ where
     #[inline]
     pub fn consumer_state(&self) -> Option<(usize, bool)> {
         self.ring_ref_.borrow().consumer_state()
+    }
+
+    /// 关闭消费端：此后不再消费，并唤醒等待中的生产者（见 [`Ring::close_consumer`]）。
+    ///
+    /// 收 `&self`：只动状态字、不碰数据区，正是「读半部也能宣告自己不再消费」所需要的。
+    #[inline]
+    pub fn close(&self) {
+        self.ring_ref_.borrow().close_consumer_()
     }
 }
 
@@ -972,6 +1066,15 @@ where
     pub fn producer_state(&self) -> Option<(usize, bool)> {
         let ring = &self.ring_ref_.borrow();
         Ring::producer_state(ring)
+    }
+
+    /// 关闭生产端（EOF）：此后不再有新数据，并唤醒等待中的消费者
+    /// （见 [`Ring::close_producer`]）。
+    ///
+    /// 收 `&self`：只动状态字、不碰数据区。
+    #[inline]
+    pub fn close(&self) {
+        self.ring_ref_.borrow().close_producer_()
     }
 }
 
