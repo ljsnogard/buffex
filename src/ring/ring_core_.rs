@@ -154,8 +154,12 @@ where
     /// * 正在 park 的消费者会被唤醒去重新判定，拿到 `Closing` 而不是永久挂起。
     ///
     /// 生产者一侧的对应入口是 [`RingWriter::close`]（语义相同）。
+    ///
+    /// 收 `&mut self`：关闭是**不可逆**的状态迁移，关闭权归环的独占持有者。半部里的
+    /// [`RingWriter`] / [`RingReader`] 各代表环的一端，它们的 `close` 同样收 `&mut self`
+    /// ——即「谁独占拥有那一端的半部，谁才有权关闭它」。
     #[inline]
-    pub fn close_producer(&self) {
+    pub fn close_producer(&mut self) {
         self.close_producer_()
     }
 
@@ -165,8 +169,10 @@ where
     /// [`ProducerError::Closing`]；正在 park 的生产者会被唤醒去重新判定。
     ///
     /// 消费者一侧的对应入口是 [`RingReader::close`]（语义相同）。
+    ///
+    /// 收 `&mut self`：理由同 [`Ring::close_producer`]。
     #[inline]
-    pub fn close_consumer(&self) {
+    pub fn close_consumer(&mut self) {
         self.close_consumer_()
     }
 
@@ -971,9 +977,11 @@ where
 
     /// 关闭消费端：此后不再消费，并唤醒等待中的生产者（见 [`Ring::close_consumer`]）。
     ///
-    /// 收 `&self`：只动状态字、不碰数据区，正是「读半部也能宣告自己不再消费」所需要的。
+    /// 收 `&mut self`：关闭权归**独占持有本半部**的一方。关闭本身只动状态字、不碰数据区，
+    /// 但它是不可逆的状态迁移，因此不允许再从共享句柄（`&Ring`）旁路触发——那样会在
+    /// 本条环仍有活段 / 活半部时并发地改变契约。
     #[inline]
-    pub fn close(&self) {
+    pub fn close(&mut self) {
         self.ring_ref_.borrow().close_consumer_()
     }
 }
@@ -1085,9 +1093,9 @@ where
     /// 关闭生产端（EOF）：此后不再有新数据，并唤醒等待中的消费者
     /// （见 [`Ring::close_producer`]）。
     ///
-    /// 收 `&self`：只动状态字、不碰数据区。
+    /// 收 `&mut self`：理由同 [`RingReader::close`]——关闭权归独占持有本半部的一方。
     #[inline]
-    pub fn close(&self) {
+    pub fn close(&mut self) {
         self.ring_ref_.borrow().close_producer_()
     }
 }

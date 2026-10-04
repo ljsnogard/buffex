@@ -1034,7 +1034,7 @@ dual_runtime_test_!(writer_woken_only_when_enough_free_space_);
 ///   写端状态为「生产端已关闭」。
 async fn close_producer_wakes_parked_consumer_() {
     let mut ring = new_ring_(8);
-    let (tx, mut rx) = Ring::split(&mut ring);
+    let (mut tx, mut rx) = Ring::split(&mut ring);
 
     let read = async {
         let demand = Demand::at_least(1);
@@ -1095,7 +1095,7 @@ dual_runtime_test_!(close_producer_delivers_remaining_then_closing_);
 /// - 判定标准：写等待返回 `ProducerError::Closing`（不是 `Stuffed`、也不挂起）。
 async fn close_consumer_wakes_parked_producer_() {
     let mut ring = new_ring_(4);
-    let (mut tx, rx) = Ring::split(&mut ring);
+    let (mut tx, mut rx) = Ring::split(&mut ring);
     {
         let demand = Demand::at_least(4);
         let mut segm = tx.try_write(&demand).pick_left().expect("应能借出写段");

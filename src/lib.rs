@@ -3,7 +3,6 @@
 #![feature(impl_trait_in_assoc_type)]
 // #![feature(impl_restriction)]
 #![feature(unboxed_closures)]
-#![feature(unsafe_cell_access)]
 
 #![no_std]
 // #![cfg_attr(test, feature(try_trait_v2))]
