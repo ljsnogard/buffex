@@ -54,7 +54,7 @@ use std::{
 
 use abs_buff::{
     Demand,
-    buffer::{TrBuffSegmMut, TrReclaim},
+    buffer::{TrBuffSegmMut, TrConsumerState, TrProducerState, TrReclaim},
     x_deps::abs_cancel::{CancelledToken, TrMayCancel, TrCancellationToken},
 };
 
@@ -81,7 +81,8 @@ type TestWriter<'f> =
 type TestReader<'f> =
     RingReader<&'f TestRing, TestBuff, u8>;
 
-/// 构造一个指定容量的测试环（容量须落在 `Ring` 允许的 `[2, MAX_CAPACITY]` 内）。
+/// 构造一个指定容量的测试环（容量须落在 `Ring` 允许的
+/// `[MIN_CAPACITY, MAX_CAPACITY]` 内，见 [`Ring::check_buffer_size`]）。
 fn new_ring_(capacity: usize) -> TestRing {
     let buff = Box::<[u8]>::new_uninit_slice(capacity);
     Ring::new_unchecked(buff)
@@ -397,14 +398,21 @@ async fn try_read_limits_count_by_max_() {
 
 dual_runtime_test_!(try_read_limits_count_by_max_);
 
-/// 构造入口拒绝小于最小容量的缓冲区。
-/// - 测试目标：`Ring::try_new` 的容量校验（`MIN_CAPACITY == 2`）。
-/// - 测试手段：分别以容量 1 和容量 2 的 `Box<[MaybeUninit<u8>]>` 调用 `try_new`。
-/// - 判定标准：容量 1 返回 `Err(1)`；容量 2 构造成功且 `capacity() == 2`。
-async fn try_new_rejects_too_small_capacity_() {
+/// 构造入口的容量边界：**接受最小容量 1**，只拒绝不可用的容量 0。
+/// - 测试目标：`Ring::try_new` 的容量校验（`MIN_CAPACITY == 1`）。
+/// - 测试手段：分别以容量 0、1、2 的 `Box<[MaybeUninit<u8>]>` 调用 `try_new`。
+/// - 判定标准：容量 0 返回 `Err(0)`（零长缓冲上任何读写都不可满足）；容量 1 构造成功
+///   且 `capacity() == 1`（位置编码用 `REVERSION` 位区分空 / 满，不需要空出一格）；
+///   容量 2 照旧被接受。
+async fn try_new_accepts_min_capacity_one_() {
+    let buff = Box::<[u8]>::new_uninit_slice(0);
+    let x: Result<TestRing, usize> = Ring::try_new(buff);
+    assert_eq!(x.err(), Some(0usize), "容量 0 应被拒绝");
+
     let buff = Box::<[u8]>::new_uninit_slice(1);
     let x: Result<TestRing, usize> = Ring::try_new(buff);
-    assert_eq!(x.err(), Some(1usize), "容量 1 应被拒绝");
+    let ring = x.expect("容量 1 应被接受");
+    assert_eq!(ring.capacity(), 1, "最小容量的环容量就是 1");
 
     let buff = Box::<[u8]>::new_uninit_slice(2);
     let x: Result<TestRing, usize> = Ring::try_new(buff);
@@ -412,7 +420,166 @@ async fn try_new_rejects_too_small_capacity_() {
     assert_eq!(ring.capacity(), 2);
 }
 
-dual_runtime_test_!(try_new_rejects_too_small_capacity_);
+dual_runtime_test_!(try_new_accepts_min_capacity_one_);
+
+// ---------------------------------------------------------------------------
+// 最小容量（1 格）的完整验收
+//
+// 容量 1 是位置编码（REVERSION 位区分空 / 满）允许的下限：`rp == wp == 0` 恒成立，
+// 一切由 `rv` 承担；且**不存在实际绕行**——每次读写都走「跨末端」分支。下面四条把
+// 这条边界钉住：往返、重新可写、关闭语义、park / 唤醒。
+// ---------------------------------------------------------------------------
+
+/// 容量 1 的环上写满 → 读空 → 再写，状态视图与数据都正确。
+/// - 测试手段：容量 1 的环依次写入 42、读走 1 个、再写入 7、再读走 1 个；每步查
+///   `consumer_state` / `producer_state`，并核对取回的字节。
+/// - 判定标准：写满后读端看到 `(1, false)`、写端看到 `(0, false)`；读空后回到
+///   `(0, false)`；**再写入必须仍然成功**（这正是 REVERSION 位在容量 1 下翻转的证据）；
+///   两次取回的字节分别为 42 与 7。
+async fn capacity_one_roundtrip_() {
+    let mut ring = new_ring_(1usize);
+    assert_eq!(ring.capacity(), 1usize);
+
+    let demand = Demand::at_least(1);
+    assert_eq!(fill_bytes_(&mut ring, &demand, &[42u8]).await, 1usize);
+    assert_eq!(
+        ring.consumer_state(),
+        Option::Some((1usize, false)),
+        "写满 1 格后读端应看到 1"
+    );
+    assert_eq!(
+        ring.producer_state(),
+        Option::Some((0usize, false)),
+        "写满 1 格后写端应看到 0 格可写"
+    );
+
+    assert_eq!(take_bytes_(&mut ring, &demand, 1usize).await, vec![42u8]);
+    assert_eq!(
+        ring.consumer_state(),
+        Option::Some((0usize, false)),
+        "读空后读端应看到 0"
+    );
+
+    // 关键一步：容量 1 下写位置没有别的取值可用，只能靠 REVERSION 位区分「空 → 满」。
+    assert_eq!(fill_bytes_(&mut ring, &demand, &[7u8]).await, 1usize);
+    assert_eq!(
+        ring.consumer_state(),
+        Option::Some((1usize, false)),
+        "再次写入后应当又能读到 1 个"
+    );
+    assert_eq!(take_bytes_(&mut ring, &demand, 1usize).await, vec![7u8]);
+}
+
+dual_runtime_test_!(capacity_one_roundtrip_);
+
+/// 容量 1 下 `Demand` 的上下界仍被正确夹取（可用空间 1 格）。
+/// - 测试手段：容量 1 的环上分别用 `at_least(1)`、`no_more_than(2)`、`exactly(1)`
+///   借写段，检查借出的段长；写满后再用 `at_least(2)` 借写段。
+/// - 判定标准：前三种都能借出长度 1 的段；写满后 `at_least(2)` 得不到写段
+///   （`Unsatisfiable`——下限超过容量，属于调用方错误而非「暂时写不下」）。
+async fn capacity_one_respects_demand_bounds_() {
+    let mut ring = new_ring_(1usize);
+
+    for demand in [
+        Demand::at_least(1),
+        Demand::no_more_than(2),
+        Demand::exactly(1),
+    ] {
+        {
+            let mut segm = ring
+                .try_write(&demand)
+                .pick_left()
+                .expect("空环上这些 demand 都应能借出写段");
+            assert_eq!(segm.least_count(), 1usize, "容量 1 的环一次只借得出 1 格");
+            assert_eq!(segm.move_items_from_as_buff(&[1u8]), 1usize);
+        }
+        // 每次写完都读空，保证下一次借写段时环是空的。
+        let take = Demand::exactly(1);
+        assert_eq!(take_bytes_(&mut ring, &take, 1usize).await, vec![1u8]);
+    }
+
+    // 写满后：下限 2 超过容量 ⇒ `Unsatisfiable`，而不是「暂时写不下」的 `Stuffed`。
+    let _ = fill_bytes_(&mut ring, &Demand::at_least(1), &[2u8]).await;
+    let demand = Demand::at_least(2);
+    let mut outcome = ring.try_write(&demand);
+    assert!(
+        outcome.as_mut().pick_left().is_none(),
+        "环已满且 demand 下限为 2（超过容量）时不应借出写段"
+    );
+    let err = outcome
+        .pick_right()
+        .expect("借不出写段时必须给出错误");
+    assert_eq!(
+        err,
+        ProducerError::Unsatisfiable,
+        "下限超过容量应报 Unsatisfiable"
+    );
+}
+
+dual_runtime_test_!(capacity_one_respects_demand_bounds_);
+
+/// 容量 1 下「关闭生产端」的读侧语义：先交出缓存中的那 1 格，再报 EOF。
+/// - 测试手段：容量 1 的环写入 1 格后 `close_producer()`；随后用同步与异步两个入口
+///   各读一次（异步读到旧数据的那次用查询预算令牌截断潜在空转）。
+/// - 判定标准：关闭后**仍能读走缓存中的 1 格**；读空后再读得到 `Closing`（EOF），
+///   即「关闭 ⇒ 交出剩余」的 EOF 例外在容量 1 下同样成立。
+async fn capacity_one_close_producer_yields_eof_() {
+    let mut ring = new_ring_(1usize);
+    let demand = Demand::at_least(1);
+    assert_eq!(fill_bytes_(&mut ring, &demand, &[9u8]).await, 1usize);
+
+    ring.close_producer();
+    assert_eq!(
+        take_bytes_(&mut ring, &demand, 1usize).await,
+        vec![9u8],
+        "关闭生产端后应仍能读走缓存中的那一格"
+    );
+    assert!(
+        ring.try_read(&demand).pick_left().is_none(),
+        "读空且生产端已关闭 ⇒ 读侧应报 EOF"
+    );
+
+    // 异步入口同样立刻收尾（用查询预算令牌把潜在空转截断成有界失败）。
+    let token = BudgetToken::new(64);
+    let mut outcome = ring.read_async(&demand).may_cancel_with(token).await;
+    assert!(outcome.as_mut().pick_left().is_none());
+    assert_eq!(
+        outcome.pick_right().expect("必须给出错误"),
+        ConsumerError::Closing
+    );
+}
+
+dual_runtime_test_!(capacity_one_close_producer_yields_eof_);
+
+/// 容量 1 下「读端 park、写端提交」的唤醒路径（跨 `split` 出来的两个半部）。
+/// - 测试手段：容量 1 的环 `split` 成写端 / 读端；读端先 park 在 `read_async` 上，
+///   让出一次执行权后写端写入 1 格并提交。
+/// - 判定标准：读端被唤醒并拿到长度 1 的段、取到的字节正是写入值。
+async fn capacity_one_park_then_write_() {
+    let mut ring = new_ring_(1usize);
+    let (mut tx, mut rx) = Ring::split(&mut ring);
+
+    let reader = async {
+        let demand = Demand::at_least(1);
+        let mut outcome = rx.read_async(&demand).await;
+        let segm = outcome
+            .as_mut()
+            .pick_left()
+            .expect("写端提交后读端应被唤醒并拿到段");
+        assert_eq!(segm.least_count(), 1usize, "容量 1 的环只可能有 1 格可读");
+        assert_eq!(take_segm_bytes_(segm, 1usize).await, vec![5u8]);
+    };
+    let writer = async {
+        // 先让读端 park，再写入：这样这条用例验的才是「唤醒」而不是「同步拿到」。
+        futures_lite::future::yield_now().await;
+        let demand = Demand::at_least(1);
+        assert_eq!(tx_write_(&mut tx, &demand, &[5u8]).await, 1usize);
+    };
+
+    futures_util::join!(reader, writer);
+}
+
+dual_runtime_test_!(capacity_one_park_then_write_);
 
 // ---------------------------------------------------------------------------
 // 跨末端环绕

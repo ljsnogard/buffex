@@ -549,7 +549,21 @@ pub(super) const POS_BITS: u32 = (usize::BITS - RSV_BITS) / 2;
 /// 位置掩码。
 pub(super) const POS_MASK: usize = (1usize << POS_BITS) - 1;
 
-pub(super) const MIN_CAPACITY: usize = 2;
+/// 环形缓冲的最小容量。
+///
+/// **1 是下限**，而不是 2：当前位置编码用 `REVERSION` 位区分空 / 满（见 [`IoPos`]），
+/// 容量**全部可用**，不再依赖「专门空出一格」来区分空与满，因此 1 格也能正确工作。
+///
+/// 容量 1 的语义边界（值得写下来，因为它没有绕行路径）：
+///
+/// * `rp` 与 `wp` 只可能为 0，`wp == rp` 恒成立，一切由 `REVERSION` 决定——
+///   写入后置位（满，`data_size == 1`），读出后清除（空，`data_size == 0`）；
+/// * **不存在实际的跨末端绕行**：`rp + amount >= capacity` 在 `amount == 1` 时即
+///   越过末端，因此每次读写都会走「跨末端」分支（`create_*_segm_` 的
+///   `first == take` 情形），借出的段永远是单片的 1 格。
+///
+/// 容量 0 仍然被拒：零长度缓冲上任何读写都不可满足，构造出来只会是个陷阱。
+pub(super) const MIN_CAPACITY: usize = 1;
 /// 环形缓冲的最大容量（与 `ring_buffer` 的 `MAX_CAPACITY` 同量级）。
 pub(super) const MAX_CAPACITY: usize = POS_MASK;
 
